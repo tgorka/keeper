@@ -412,9 +412,11 @@ gix-pack = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-fi
 # rejected alternative was ~1.2 MB of SheetJS + mammoth in the JS bundle, paid
 # for by every user who never opens a spreadsheet.
 # ---------------------------------------------------------------------------
-# OOXML container reading. `default-features = false` because zip 4's defaults
-# pull aes-crypto, bzip2, deflate64, lzma, ppmd, xz and zstd — seven
-# compression stacks for a format that only ever uses two.
+# OOXML container reading. `default-features = false` because zip 9's defaults
+# pull aes-crypto, bzip2, deflate64, lzma, ppmd, xz and zstd (plus the `time`
+# date backend) — seven compression stacks for a format that only ever uses
+# two. `aes-crypto` in particular stays off: keeper never opens an encrypted
+# part, and the WinZip AES reader is what RUSTSEC-2026-0545 was about.
 #
 # The feature is `deflate-flate2`, NOT `deflate`. They are not synonyms: plain
 # `deflate` means `deflate-zopfli` + `deflate-flate2-zlib-rs`, which adds the
@@ -424,16 +426,20 @@ gix-pack = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-fi
 # nothing. `deflate-flate2` is inflate through the flate2 already in the lock.
 # STORED entries need no feature at all.
 #
-# The crate itself is already compiled in every keeper build
-# (tauri-plugin-updater depends on it), so no new package enters Cargo.lock —
-# only zip's own dependency line gains `flate2`, itself already in the lock via
-# reqwest. MIT — passes `cargo deny check`.
+# zip 9 (not 4): 9.x is the only line carrying the fixes for RUSTSEC-2026-0545
+# and RUSTSEC-2026-0548 (>= 9.0.5), and the extraction fixes behind
+# RUSTSEC-2026-0367/-0368/-0369/-0429. 9.x keeps the 4.x feature names this
+# line relies on and the read API `keeper_core::document` uses. It adds
+# `typed-path`, `zeroize` and `constant_time_eq` as unconditional dependencies,
+# all permissive. tauri-plugin-updater 2.10.1 still pulls zip 4.6.1, but only
+# for `cfg(target_os = "windows")`; see docs/constraints-and-limitations.md.
+# MIT — passes `cargo deny check`.
 #
 # It does NOT bound decompression for us: `ZipFile` is a `Read` that will
 # happily inflate a 40 kB bomb into gigabytes. `keeper_core::document` caps both
 # the per-part and the total inflated size and treats the cap as a named
 # refusal. See that module's `read_part`.
-zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.7", default-features = false, features = ["deflate-flate2"] }
 # OOXML part parsing — a pull parser, so a part is walked in constant memory
 # rather than built into a DOM whose size the document controls. Already
 # compiled in every keeper build (plist -> tauri-utils), so no new package

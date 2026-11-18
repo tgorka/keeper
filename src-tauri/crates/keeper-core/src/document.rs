@@ -5,10 +5,9 @@
 //!
 //! DOCX, PPTX and XLSX are a ZIP of XML. Rendering them in the webview would
 //! have meant roughly 1.2 MB of SheetJS plus mammoth shipped to every user,
-//! including the ones who never open a spreadsheet. Both crates this module
-//! needs — `zip` and `quick-xml` — are already compiled in every keeper build
-//! for unrelated reasons, so parsing here costs no new package and no bundle
-//! bytes. The webview receives a bounded view model, never a document.
+//! including the ones who never open a spreadsheet. The two crates this module
+//! needs — `zip` and `quick-xml` — are native code and add no bundle bytes.
+//! The webview receives a bounded view model, never a document.
 //!
 //! It is also the only place the work is testable. The Tauri shell does not
 //! build on a Linux developer machine (AD-55, AD-56, and the same reasoning
@@ -630,7 +629,9 @@ fn has_part<R: io::Read + io::Seek>(archive: &mut zip::ZipArchive<R>, name: &str
 ///    therefore only ever used to refuse *early*, never to trust.
 /// 2. `Read::take` at [`OOXML_MAX_PART_BYTES`] plus one, so exceeding the cap is
 ///    detectable rather than silently producing a truncated part that parses
-///    into a plausible-looking half document.
+///    into a plausible-looking half document. zip 9 also fails a read that
+///    passes the part's declared size, so for a part that lies low this guard
+///    is the backstop behind zip's own check rather than the first to fire.
 /// 3. The document-wide [`Budget`], because a bomb does not have to be one part.
 fn read_part<R: io::Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
@@ -1014,10 +1015,13 @@ fn read_pptx<R: io::Read + io::Seek>(
 /// slide 10 before slide 2, so a deck of more than nine slides renders shuffled.
 /// That is the whole reason this is a function and not an inline filter.
 fn slide_part_names<R: io::Read + io::Seek>(archive: &zip::ZipArchive<R>) -> Vec<String> {
+    // zip 9 decodes each name on demand and yields a `Result`; a name that
+    // fails to decode is not valid UTF-8, so it cannot be a slide part anyway.
     let mut named: Vec<(u32, String)> = archive
         .file_names()
+        .filter_map(Result::ok)
         .filter(|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
-        .filter_map(|name| slide_number(name).map(|number| (number, name.to_owned())))
+        .filter_map(|name| slide_number(&name).map(|number| (number, name.into_owned())))
         .collect();
     named.sort_unstable();
     named.into_iter().map(|(_, name)| name).collect()

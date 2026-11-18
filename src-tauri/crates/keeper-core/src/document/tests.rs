@@ -49,7 +49,7 @@ fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, contents) in parts {
             writer.start_file(*name, options).expect("start part");
@@ -58,6 +58,33 @@ fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
         writer.finish().expect("finish zip");
     }
     buffer.into_inner()
+}
+
+/// Grow a container to exactly `size` bytes with one STORED part nothing asks for.
+///
+/// Padding has to go INSIDE the archive: zip 9, like the ZIP specification,
+/// looks for the end-of-central-directory record only in the last 64 KiB, so
+/// megabytes appended after it make the container unreadable rather than large.
+fn padded_to(container: &[u8], size: usize) -> Vec<u8> {
+    let with_padding = |padding: usize| {
+        let mut writer = zip::ZipWriter::new_append(std::io::Cursor::new(container.to_vec()))
+            .expect("reopen container");
+        let options: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("padding.bin", options)
+            .expect("start padding");
+        writer.write_all(&vec![0; padding]).expect("write padding");
+        writer.finish().expect("finish padded zip").into_inner()
+    };
+    let overhead = with_padding(0).len();
+    let padded = with_padding(size - overhead);
+    assert_eq!(
+        padded.len(),
+        size,
+        "the padding must land exactly on the size"
+    );
+    padded
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +399,13 @@ fn a_decompression_bomb_is_refused_before_it_is_inflated() {
 /// Without this test the previous one would pass against a `read_part` that had
 /// no real cap at all, which is precisely the false confidence a bomb test is
 /// supposed to eliminate.
+///
+/// zip 9 enforces the declared size itself: reading past it fails inside
+/// `zip` (zip-rs/zip2#1022, zip 9.0.1), earlier than keeper's own
+/// produced-bytes guard can fire. The property held is the same — the lie does
+/// not get past the cheap check, the part is refused WHILE inflating, and
+/// nothing renders — so this asserts the refusal is not the declared-size one
+/// and that it names the lie.
 #[test]
 fn a_bomb_that_lies_about_its_size_is_refused_while_inflating() {
     let scratch = Scratch::new("liar");
@@ -382,8 +416,12 @@ fn a_bomb_that_lies_about_its_size_is_refused_while_inflating() {
 
     let detail = vm.detail.expect("a sentence");
     assert!(
-        detail.contains("inflates past"),
-        "the refusal must come from the guard that counts produced bytes, got {detail:?}"
+        !detail.contains("declares"),
+        "the forged size must have fooled the cheap check, got {detail:?}"
+    );
+    assert!(
+        detail.contains("larger than its declared uncompressed size"),
+        "the refusal must come from counting produced bytes, got {detail:?}"
     );
     assert!(vm.words.is_none());
 }
@@ -503,11 +541,12 @@ fn entity_expansion_is_refused() {
 #[test]
 fn a_container_over_the_cap_is_refused_with_its_size() {
     let scratch = Scratch::new("toobig");
-    // A valid container, then padded past the cap. The padding lands after the
-    // central directory, which `zip` tolerates — so this genuinely exercises
-    // the size gate rather than a parse failure.
-    let mut container = docx_of(&[("Normal", "small")]);
-    container.resize((OOXML_MAX_BYTES + 1) as usize, 0);
+    // A valid container, padded past the cap with a part no reader opens — so
+    // this genuinely exercises the size gate rather than a parse failure.
+    let container = padded_to(
+        &docx_of(&[("Normal", "small")]),
+        (OOXML_MAX_BYTES + 1) as usize,
+    );
     let path = scratch.file("huge.docx", &container);
 
     let vm = open_document(&path).expect("open");
@@ -529,8 +568,10 @@ fn a_container_over_the_cap_is_refused_with_its_size() {
 #[test]
 fn a_container_at_the_cap_is_read() {
     let scratch = Scratch::new("atcap");
-    let mut container = docx_of(&[("Normal", "just inside")]);
-    container.resize(OOXML_MAX_BYTES as usize, 0);
+    let container = padded_to(
+        &docx_of(&[("Normal", "just inside")]),
+        OOXML_MAX_BYTES as usize,
+    );
     let path = scratch.file("big.docx", &container);
 
     let vm = open_document(&path).expect("open");

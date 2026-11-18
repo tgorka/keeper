@@ -77,8 +77,10 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   dependency and `CoreRsaPrivateSigningKey` generate/sign fixtures under `cfg(test)`.
   Follow-up: upgrade `openidconnect` when it adopts a fixed RSA implementation;
   reassess before introducing private-key signing/decryption in production.
-- **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` and
-  `keeper -> tauri-plugin-updater 2.10.1` require `zip 4.6.1`; fixes require 9.0.0.
+- **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` reads OOXML through
+  `zip 9.7.0` (moved from 4.6.1 on 2026-11-18, which also cleared RUSTSEC-2026-0545
+  and -0548). The waivers remain for `keeper -> tauri-plugin-updater 2.10.1 -> zip 4.6.1`,
+  a `cfg(target_os = "windows")` dependency; fixes require 9.0.0.
   The document reader only reads named, size-bounded OOXML parts, never extracts
   entries or applies archive permissions. The updater's ZIP extraction is Windows-only:
   the Unix SUID/SGID and permission-setting paths are not used. Its download path
@@ -86,14 +88,18 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   archive bytes cannot reach it through keeper's update flow. The extraction API
   remains reachable for signed Windows releases; compromise of the trusted release
   publisher is a residual risk, not a claim that the dependency is fixed.
-  Follow-up: upgrade `tauri-plugin-updater` when it supports `zip >=9`, then upgrade
-  keeper's direct ZIP dependency and remove all three waivers.
+  The updater declares its `zip 4` with no compression feature; it used to inflate
+  Deflate only because keeper-core's `deflate-flate2` unified onto the same `zip 4`.
+  With `createUpdaterArtifacts: true` (not `"v1Compatible"`) Windows updates are bare
+  installers rather than ZIPs, so that path does not run today.
+  Follow-up: upgrade `tauri-plugin-updater` to a release on `zip >=9` (2.14.1 requires
+  `zip ^9` on Windows), then remove all three waivers.
 - **ZIP / RUSTSEC-2026-0429** (waived 2026-11-11, **expires 2026-12-31**, owner decision
-  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4` (the newest published
-  updater, 3.0.0-alpha.3, still requires `zip ^4`); the fix is only in `zip >=9`. The
-  affected `ZipArchive::extract` symlink path is the same exposure as above: the document
-  reader never extracts, and the updater extracts on Windows only, minisign-verified
-  releases only. Follow-up: the same updater upgrade to `zip >=9`, then remove.
+  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4`; the fix is only in
+  `zip >=9`. The affected `ZipArchive::extract` symlink path is the same exposure as
+  above: the document reader never extracts, and the updater extracts on Windows only,
+  minisign-verified releases only. Follow-up: the same updater upgrade to `zip >=9`,
+  then remove.
 - **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **expires 2026-12-31**, owner decision
   2026-11-11): `matrix-sdk-sqlite 0.19.1 -> rusqlite ^0.40.2 -> libsqlite3-sys ^0.38`.
   `libsqlite3-sys` is `links = "sqlite3"`, so the whole graph (keeper-core, keeper-sync,
