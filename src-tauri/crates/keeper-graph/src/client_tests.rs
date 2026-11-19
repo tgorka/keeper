@@ -731,7 +731,7 @@ fn every_graph_table_is_covered_by_one_unit_through_a_mapped_column() {
     }
 }
 
-/// G-14 (115.6): the state and the ledger are two units. The state unit
+/// Story 115.6: the state and the ledger are two units. The state unit
 /// covers no ledger table and the ledger unit no state table, so a replica
 /// holding only the state holds no event.
 #[test]

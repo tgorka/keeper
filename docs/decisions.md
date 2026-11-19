@@ -2203,5 +2203,5 @@ one small change each, and keeper builds both from copies under `tools/`, wired 
   `cargo tree -i rusqlite --edges normal,build` shows one `rusqlite` (0.41.x).
 - **Revisit triggers:** either upstream release above; a second change needed inside either copy,
   which would make it a fork rather than a pinned patch.
-- **Status / owner:** decided by the coordinator within the owner's ruling (story 115.6),
-  2026-11-19. Owner is the architect.
+- **Status / owner:** decided within the owner's choice of the newest Syncular release (story
+  115.6), 2026-11-19. Owner is the architect.
