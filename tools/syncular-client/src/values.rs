@@ -1,0 +1,1260 @@
+//! Value conversions at the client's edges: driver JSON (`{"$bytes": hex}`
+//! convention) ↔ the §2.4 row-codec values ↔ SQLite storage, plus the §11.2
+//! canonical scope JSON (contractual across implementations).
+
+use std::collections::HashMap;
+
+use serde_json::{Map, Value};
+use ssp2::primitives::{RawJson, Reader, Writer};
+use ssp2::segment::{
+    decode_row, encode_row, encode_sparse_row, Column, ColumnType, ColumnValue, Row, SparseRow,
+    SparseSlot,
+};
+
+use crate::schema::TableSchema;
+use crate::TransportError;
+
+/// §5.11 client-side encryption keys (`keyId → 32-byte key`) plus optional
+/// key selection. Empty ⇒ E2EE off. `key_id_for` defaults to per-table
+/// (`keyId = table`). Always present on the client; the crypto is compiled
+/// only under the `e2ee` feature.
+#[derive(Clone, Default)]
+pub struct EncryptionConfig {
+    pub keys: HashMap<String, Vec<u8>>,
+    /// Portable per-table selector: the named non-encrypted string column in
+    /// each plaintext row contains the key id used for new envelopes.
+    pub key_id_columns: HashMap<String, String>,
+}
+
+/// §5.11 sealed state of a delivered row: the `keyId` of its first
+/// undecryptable envelope (`_sync_sealed_key`) and its encrypted envelopes as
+/// a JSON object of column name to hex envelope (`_sync_sealed`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRow {
+    pub key_id: String,
+    pub envelopes: String,
+}
+
+/// Manual Debug so a stray `{config:?}` log line stays free of key material:
+/// key entries render as `id → <N bytes>`.
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Redacted(usize);
+        impl std::fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "<{} bytes>", self.0)
+            }
+        }
+        let keys: std::collections::BTreeMap<&String, Redacted> = self
+            .keys
+            .iter()
+            .map(|(id, key)| (id, Redacted(key.len())))
+            .collect();
+        f.debug_struct("EncryptionConfig")
+            .field("keys", &keys)
+            .field("key_id_columns", &self.key_id_columns)
+            .finish()
+    }
+}
+
+impl Drop for EncryptionConfig {
+    fn drop(&mut self) {
+        // Best-effort native key hygiene: replacement, preflight entry, and
+        // client shutdown overwrite every owned key buffer before release.
+        for key in self.keys.values_mut() {
+            key.fill(0);
+        }
+    }
+}
+
+impl EncryptionConfig {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// §5.11 portable key selection: configured row column, then table name.
+    /// Encode-seam failures carry `client.encrypt_failed` (never the apply-
+    /// seam `client.decrypt_failed`). The caller supplies the presence set
+    /// first with the stored local row merged into an absent selector.
+    pub fn key_id_for(&self, table: &TableSchema, row: &Row) -> Result<String, String> {
+        let Some(column_name) = self.key_id_columns.get(&table.name) else {
+            return Ok(table.name.clone());
+        };
+        let Some(index) = table
+            .columns
+            .iter()
+            .position(|column| &column.name == column_name)
+        else {
+            return Err(format!(
+                "client.encrypt_failed: encryption key-id column {column_name:?} is not present on table {:?}",
+                table.name
+            ));
+        };
+        if table
+            .encrypted_columns
+            .iter()
+            .any(|column| column.index == index)
+        {
+            return Err(format!(
+                "client.encrypt_failed: encryption key-id column {column_name:?} on table {:?} must not be encrypted",
+                table.name
+            ));
+        }
+        match row.get(index).and_then(|value| value.as_ref()) {
+            Some(ColumnValue::String(key_id)) if !key_id.is_empty() => Ok(key_id.clone()),
+            _ => Err(format!(
+                "client.encrypt_failed: encryption key-id column {column_name:?} on table {:?} must contain a non-empty string",
+                table.name
+            )),
+        }
+    }
+}
+
+/// The pinned snake→camel conversion. The Rust
+/// copy of the typegen/TS-client algorithm, kept in lockstep by shared test
+/// vectors. Leading/trailing `_` runs are preserved; middle segments split
+/// on `_` (doubled underscores drop); no acronym awareness.
+pub fn snake_to_camel(name: &str) -> String {
+    let is_mappable = {
+        let bare = name.trim_start_matches('_');
+        !bare.is_empty()
+            && bare.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if !is_mappable {
+        return name.to_owned();
+    }
+    let lead_len = name.len() - name.trim_start_matches('_').len();
+    let (lead, bare) = name.split_at(lead_len);
+    let trail_len = bare.len() - bare.trim_end_matches('_').len();
+    let (middle, trail) = bare.split_at(bare.len() - trail_len);
+    let mut segments = middle.split('_').filter(|s| !s.is_empty());
+    let Some(first) = segments.next() else {
+        return name.to_owned();
+    };
+    let mut out = String::with_capacity(name.len());
+    out.push_str(lead);
+    out.push_str(first);
+    for segment in segments {
+        let mut chars = segment.chars();
+        if let Some(head) = chars.next() {
+            out.push(head.to_ascii_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out.push_str(trail);
+    out
+}
+
+/// §5 mutate key normalization: accept BOTH casings for upsert value keys —
+/// the SQL-truth snake_case and the generated row types' camelCase. A camel
+/// key renames to its column's SQL name when that is unambiguous (the alias
+/// equals no other column's exact name, and no two columns share it). A
+/// column given in both casings is an error. Unknown keys fail loud, matching
+/// the TypeScript core; silently dropping an app field would corrupt a
+/// full-row mutation while appearing successful.
+pub fn normalize_values_casing(
+    table: &TableSchema,
+    mut values: Map<String, Value>,
+) -> Result<Map<String, Value>, String> {
+    for column in &table.columns {
+        let camel = snake_to_camel(&column.name);
+        if camel == column.name {
+            continue;
+        }
+        // Exact names always win; an alias colliding with another column's
+        // real name (or with another column's alias) is not an alias.
+        if table.columns.iter().any(|c| c.name == camel) {
+            continue;
+        }
+        if table
+            .columns
+            .iter()
+            .filter(|c| snake_to_camel(&c.name) == camel)
+            .count()
+            > 1
+        {
+            continue;
+        }
+        if let Some(value) = values.remove(&camel) {
+            if values.contains_key(&column.name) {
+                return Err(format!(
+                    "sync.invalid_request: table {:?}: column {:?} appears twice in mutation values (as both snake_case and camelCase) — pass it once",
+                    table.name, column.name
+                ));
+            }
+            values.insert(column.name.clone(), value);
+        }
+    }
+    for key in values.keys() {
+        let Some(index) = table.columns.iter().position(|column| column.name == *key) else {
+            if key.starts_with("_sync_") {
+                return Err(format!(
+                    "sync.invalid_request: table {:?}: {:?} is an internal sync column and cannot appear in mutation values",
+                    table.name, key
+                ));
+            }
+            return Err(format!(
+                "sync.invalid_request: table {:?}: unknown column {:?} in mutation values (snake_case and camelCase keys are accepted)",
+                table.name, key
+            ));
+        };
+        if table.server_owned_columns.contains(&index) {
+            return Err(format!(
+                "sync.invalid_request: table {:?}: a server-owned column is not a mutation value (§6.7): {:?}",
+                table.name, key
+            ));
+        }
+    }
+    Ok(values)
+}
+
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+        out.push(char::from(b"0123456789abcdef"[usize::from(b & 15)]));
+    }
+    out
+}
+
+pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("odd-length hex string".to_owned());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let nibble = |byte| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => u8::MAX,
+    };
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
+        // Preserve the prior radix parser's accepted +digit pair as well as
+        // uppercase input. Canonical encoders continue to emit lowercase hex.
+        let high = if pair[0] == b'+' { 0 } else { nibble(pair[0]) };
+        let low = nibble(pair[1]);
+        if high == u8::MAX || low == u8::MAX {
+            return Err(if std::str::from_utf8(pair).is_err() {
+                "non-ASCII hex".to_owned()
+            } else {
+                "bad hex: invalid digit found in string".to_owned()
+            });
+        }
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+/// Driver JSON value → row-codec value for one column. `null`/absent maps to
+/// NULL; bytes travel as `{"$bytes": "<hex>"}`.
+pub fn json_to_column_value(
+    column: &Column,
+    value: Option<&Value>,
+) -> Result<Option<ColumnValue>, String> {
+    let value = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let fail = |expected: &str| {
+        Err(format!(
+            "column {:?}: expected {expected}, got {value}",
+            column.name
+        ))
+    };
+    match column.ty {
+        ColumnType::String => match value.as_str() {
+            Some(s) => Ok(Some(ColumnValue::String(s.to_owned()))),
+            None => fail("a string"),
+        },
+        ColumnType::Integer => match value.as_i64() {
+            Some(i)
+                if (-ssp2::primitives::I64_SAFE_MAX..=ssp2::primitives::I64_SAFE_MAX)
+                    .contains(&i) =>
+            {
+                Ok(Some(ColumnValue::Integer(i)))
+            }
+            _ => fail("an integer within the JavaScript safe-integer range"),
+        },
+        ColumnType::Float => match value.as_f64() {
+            Some(f) => Ok(Some(ColumnValue::Float(f))),
+            None => fail("a number"),
+        },
+        ColumnType::Boolean => match value.as_bool() {
+            Some(b) => Ok(Some(ColumnValue::Boolean(b))),
+            None => fail("a boolean"),
+        },
+        // `json` columns stay raw strings at the driver boundary (§2.4).
+        ColumnType::Json => match value.as_str() {
+            Some(s) => Ok(Some(ColumnValue::Json(RawJson(s.to_owned())))),
+            None => fail("a raw JSON string"),
+        },
+        // `blob_ref` (tag 7) also stays a raw string at the boundary (§5.9.1).
+        ColumnType::BlobRef => match value.as_str() {
+            Some(s) => Ok(Some(ColumnValue::BlobRef(RawJson(s.to_owned())))),
+            None => fail("a raw BlobRef JSON string"),
+        },
+        ColumnType::Bytes => match value.get("$bytes").and_then(Value::as_str) {
+            Some(hex) => Ok(Some(ColumnValue::Bytes(hex_to_bytes(hex)?))),
+            None => fail("a {\"$bytes\": hex} object"),
+        },
+        // §5.10: crdt bytes cross the boundary as {"$bytes": hex}, like bytes.
+        ColumnType::Crdt => match value.get("$bytes").and_then(Value::as_str) {
+            Some(hex) => Ok(Some(ColumnValue::Crdt(hex_to_bytes(hex)?))),
+            None => fail("a {\"$bytes\": hex} object"),
+        },
+    }
+}
+
+/// Row-codec value → driver JSON value.
+pub fn column_value_to_json(value: &Option<ColumnValue>) -> Value {
+    match value {
+        None => Value::Null,
+        Some(ColumnValue::String(s)) => Value::from(s.clone()),
+        Some(ColumnValue::Integer(i)) => Value::from(*i),
+        Some(ColumnValue::Float(f)) => {
+            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
+        }
+        Some(ColumnValue::Boolean(b)) => Value::from(*b),
+        Some(ColumnValue::Json(raw)) => Value::from(raw.0.clone()),
+        Some(ColumnValue::BlobRef(raw)) => Value::from(raw.0.clone()),
+        Some(ColumnValue::Bytes(bytes)) => {
+            let mut map = Map::new();
+            map.insert("$bytes".to_owned(), Value::from(bytes_to_hex(bytes)));
+            Value::Object(map)
+        }
+        Some(ColumnValue::Crdt(bytes)) => {
+            let mut map = Map::new();
+            map.insert("$bytes".to_owned(), Value::from(bytes_to_hex(bytes)));
+            Value::Object(map)
+        }
+    }
+}
+
+/// Turn an app-facing value map into a full-row map: every column present,
+/// a missing nullable column filled with NULL, a missing non-nullable column
+/// a loud error (§6.1 full-row payloads, §6.7 `mutate` marks every column).
+pub fn full_row_values(
+    table: &TableSchema,
+    mut values: Map<String, Value>,
+) -> Result<Map<String, Value>, String> {
+    for column in &table.columns {
+        if values.contains_key(&column.name) {
+            continue;
+        }
+        if !column.nullable {
+            return Err(format!(
+                "sync.invalid_request: table {:?}: column {:?} is not nullable (§6.1 full-row payloads)",
+                table.name, column.name
+            ));
+        }
+        values.insert(column.name.clone(), Value::Null);
+    }
+    Ok(values)
+}
+
+/// §7.1: exactly one `$bytes` key holding an even-length hexadecimal string.
+/// Uppercase digits are accepted; encoders emit lowercase.
+pub(crate) fn is_canonical_bytes_envelope(value: &Value) -> bool {
+    value
+        .as_object()
+        .filter(|map| map.len() == 1)
+        .and_then(|map| map.get("$bytes"))
+        .and_then(Value::as_str)
+        .is_some_and(|hex| {
+            hex.len().is_multiple_of(2) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// §7.1: a `bytes`/`crdt` column crosses the authoring boundary only as exactly
+/// one `$bytes` key holding an even-length hexadecimal string. The shared
+/// decoder keeps its tolerance for persisted payloads (§7.4.4 replay), so the
+/// canonical rule is enforced at the encode seams instead. `None` for every
+/// other column type and for a canonical envelope.
+fn author_bytes_envelope_error(column: &Column, value: &Value) -> Option<String> {
+    // An explicit `null` stays with `json_to_column_value`: a nullable column
+    // accepts it and a non-nullable one is classified by the required-column
+    // check, not by the envelope rule.
+    if value.is_null() || !matches!(column.ty, ColumnType::Bytes | ColumnType::Crdt) {
+        return None;
+    }
+    if is_canonical_bytes_envelope(value) {
+        return None;
+    }
+    Some(format!(
+        "sync.invalid_request: column {:?}: expected exactly {{\"$bytes\": hex}} with an even number of hexadecimal digits, got {value}",
+        column.name
+    ))
+}
+
+/// Encode one full row (driver JSON values keyed by column name) with the
+/// generated row codec (§2.4, §6.1). §5.11: encrypted columns are encrypted
+/// here — the encode-at-send seam — before the codec serializes them as
+/// ciphertext-envelope `bytes` using `wire_columns`.
+pub fn encode_row_json(
+    table: &TableSchema,
+    row_id: &str,
+    values: &Map<String, Value>,
+    encryption: &EncryptionConfig,
+) -> Result<Vec<u8>, String> {
+    // Build the row from the LOCAL (declared-type) columns.
+    let mut row: Row = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        if let Some(raw) = values.get(&column.name) {
+            if let Some(error) = author_bytes_envelope_error(column, raw) {
+                return Err(error);
+            }
+        }
+        // §6.1/§7.1: a caller value the codec rejects is an invalid request,
+        // never an internal authoring failure; the dynamic cause stays in
+        // `details.legacyCause` at the `ClientError` boundary.
+        let value = json_to_column_value(column, values.get(&column.name))
+            .map_err(|error| format!("sync.invalid_request: {error}"))?;
+        if value.is_none() && !column.nullable {
+            return Err(format!(
+                "sync.invalid_request: table {:?}: column {:?} is not nullable (§6.1 full-row payloads)",
+                table.name, column.name
+            ));
+        }
+        row.push(value);
+    }
+    if table.has_encrypted_columns() {
+        encrypt_row(table, row_id, &mut row, encryption)?;
+    }
+    // Serialize with the WIRE columns (encrypted columns are `bytes`).
+    let mut w = Writer::new();
+    encode_row(&mut w, &table.wire_columns, &row);
+    Ok(w.into_bytes())
+}
+
+/// Encode one SPARSE push payload (§2.4, §6.1): the keys of `values` ARE the
+/// presence set — a column with no key stays absent. §5.11: only present
+/// encrypted columns are encrypted, and key resolution runs only then;
+/// absent selector slots fall back to `fallback` (the stored local row).
+/// Serialized with the `wire_columns` table.
+pub fn encode_sparse_row_json(
+    table: &TableSchema,
+    row_id: &str,
+    values: &Map<String, Value>,
+    encryption: &EncryptionConfig,
+    fallback: Option<&Row>,
+) -> Result<Vec<u8>, String> {
+    let mut row: SparseRow = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        let Some(raw) = values.get(&column.name) else {
+            row.push(SparseSlot::Absent);
+            continue;
+        };
+        if let Some(error) = author_bytes_envelope_error(column, raw) {
+            return Err(error);
+        }
+        // §2.4/§7.1: the push admission values the server rejects. A float
+        // read from JSON is always finite.
+        let refused = match (column.ty, raw) {
+            (ColumnType::String, Value::String(text)) => text.contains('\0'),
+            (ColumnType::Json, Value::String(text)) => {
+                ssp2::primitives::parse_json_document(text, "json value").is_err()
+            }
+            (ColumnType::BlobRef, Value::String(text)) => {
+                ssp2::blob_ref::validate_blob_ref(text).is_err()
+            }
+            _ => false,
+        };
+        if refused {
+            return Err(format!(
+                "sync.invalid_request: column {:?}: the value is not a push admission value (§2.4)",
+                column.name
+            ));
+        }
+        let value = json_to_column_value(column, Some(raw))
+            .map_err(|error| format!("sync.invalid_request: {error}"))?;
+        if value.is_none() && !column.nullable {
+            return Err(format!(
+                "sync.invalid_request: table {:?}: column {:?} is not nullable (§6.1)",
+                table.name, column.name
+            ));
+        }
+        row.push(value.map_or(SparseSlot::Null, SparseSlot::Value));
+    }
+    if table.has_encrypted_columns() {
+        encrypt_sparse_row(table, row_id, &mut row, encryption, fallback)?;
+    }
+    Ok(encode_sparse_row(&table.wire_columns, table.pk_index, &row))
+}
+
+/// Decode one row-codec payload; trailing bytes are a decode error. §5.11:
+/// encrypted columns are decrypted here — the apply seam — back to their
+/// declared-type plaintext value for the local mirror, or the row lands
+/// sealed under a key the keyring lacks.
+pub fn decode_row_bytes(
+    table: &TableSchema,
+    payload: &[u8],
+    encryption: &EncryptionConfig,
+) -> Result<(Row, Option<SealedRow>), TransportError> {
+    let mut r = Reader::new(payload);
+    // Decode with the WIRE columns (encrypted columns arrive as `bytes`).
+    let mut row = decode_row(&mut r, &table.wire_columns)
+        .map_err(|e| TransportError::new("sync.invalid_request", e.to_string()))?;
+    if !r.is_empty() {
+        return Err(TransportError::new(
+            "sync.invalid_request",
+            "row payload has trailing bytes",
+        ));
+    }
+    let sealed = if table.has_encrypted_columns() {
+        decrypt_row(table, &mut row, encryption)?
+    } else {
+        None
+    };
+    Ok((row, sealed))
+}
+
+/// §5.11: decrypt the encrypted columns of an already-decoded segment row
+/// (rows segments decode via their own column table, so decryption is a
+/// post-decode pass over the positional values).
+pub fn decrypt_segment_row(
+    table: &TableSchema,
+    row: &mut Row,
+    encryption: &EncryptionConfig,
+) -> Result<Option<SealedRow>, TransportError> {
+    decrypt_row(table, row, encryption)
+}
+
+// -- §5.11 encrypt/decrypt seam (feature-gated) ------------------------------
+
+#[cfg(feature = "e2ee")]
+fn encrypt_row(
+    table: &TableSchema,
+    _row_id: &str,
+    row: &mut Row,
+    encryption: &EncryptionConfig,
+) -> Result<(), String> {
+    use rand_core::RngCore;
+    use ssp2::crypto::{encrypt_value, NONCE_LENGTH};
+    for enc in &table.encrypted_columns {
+        let Some(value) = row.get(enc.index).and_then(|v| v.as_ref()) else {
+            continue; // NULL stays NULL (§5.11)
+        };
+        let plain = column_value_to_plain(value)?;
+        let key_id = encryption.key_id_for(table, row)?;
+        let key = encryption
+            .keys
+            .get(&key_id)
+            .ok_or_else(|| format!("client.encrypt_failed: no key for keyId {key_id:?}"))?;
+        let mut nonce = [0u8; NONCE_LENGTH];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let envelope = encrypt_value(&plain, &key_id, key, nonce)?;
+        row[enc.index] = Some(ColumnValue::Bytes(envelope));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "e2ee")]
+fn encrypt_sparse_row(
+    table: &TableSchema,
+    _row_id: &str,
+    row: &mut SparseRow,
+    encryption: &EncryptionConfig,
+    fallback: Option<&Row>,
+) -> Result<(), String> {
+    use rand_core::RngCore;
+    use ssp2::crypto::{encrypt_value, NONCE_LENGTH};
+    // Sparse semantics: absent and NULL columns are never re-encrypted, so
+    // a patch presenting no encrypted value needs no key (§5.11).
+    let has_present_encrypted = table
+        .encrypted_columns
+        .iter()
+        .any(|enc| matches!(row.get(enc.index), Some(SparseSlot::Value(_))));
+    if !has_present_encrypted {
+        return Ok(());
+    }
+    // Densify absent columns to NULL for key-id selection only; an absent
+    // selector falls back to the stored local row. Absent ≠ NULL (§6.1):
+    // only an ABSENT slot reads the fallback, a present NULL never does.
+    let mut dense: Row = row
+        .iter()
+        .map(|slot| match slot {
+            SparseSlot::Value(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    if let Some(selector) = encryption.key_id_columns.get(&table.name) {
+        if let Some(index) = table
+            .columns
+            .iter()
+            .position(|column| &column.name == selector)
+        {
+            if matches!(row.get(index), None | Some(SparseSlot::Absent)) {
+                let stored: Option<&str> = match fallback
+                    .and_then(|row| row.get(index))
+                    .and_then(|value| value.as_ref())
+                {
+                    Some(ColumnValue::String(key_id)) => Some(key_id),
+                    _ => None,
+                };
+                if let Some(key_id) = stored.filter(|key_id| !key_id.is_empty()) {
+                    dense[index] = Some(ColumnValue::String(key_id.to_owned()));
+                }
+            }
+        }
+    }
+    let key_id = encryption.key_id_for(table, &dense)?;
+    for enc in &table.encrypted_columns {
+        let Some(SparseSlot::Value(value)) = row.get(enc.index) else {
+            continue; // absent or NULL stays untouched (§5.11)
+        };
+        let plain = column_value_to_plain(value)?;
+        let key = encryption
+            .keys
+            .get(&key_id)
+            .ok_or_else(|| format!("client.encrypt_failed: no key for keyId {key_id:?}"))?;
+        let mut nonce = [0u8; NONCE_LENGTH];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let envelope = encrypt_value(&plain, &key_id, key, nonce)?;
+        row[enc.index] = SparseSlot::Value(ColumnValue::Bytes(envelope));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "e2ee"))]
+fn encrypt_sparse_row(
+    table: &TableSchema,
+    _row_id: &str,
+    row: &mut SparseRow,
+    _encryption: &EncryptionConfig,
+    _fallback: Option<&Row>,
+) -> Result<(), String> {
+    if !table
+        .encrypted_columns
+        .iter()
+        .any(|enc| matches!(row.get(enc.index), Some(SparseSlot::Value(_))))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "table {:?} has encrypted columns but this build lacks the e2ee feature (§5.11)",
+        table.name
+    ))
+}
+
+/// §5.11 apply seam: under an unknown `keyId` the row comes back sealed:
+/// every encrypted column NULL plus its [`SealedRow`]. Every other failure is
+/// `client.decrypt_failed`.
+#[cfg(feature = "e2ee")]
+fn decrypt_row(
+    table: &TableSchema,
+    row: &mut Row,
+    encryption: &EncryptionConfig,
+) -> Result<Option<SealedRow>, TransportError> {
+    use ssp2::crypto::{decrypt_value, DeclaredType, DecryptValueError};
+    let failed = |message: String| TransportError::new("client.decrypt_failed", message);
+    let mut missing = None;
+    let mut envelopes = Map::new();
+    for enc in &table.encrypted_columns {
+        let Some(value) = row.get(enc.index).and_then(|v| v.as_ref()) else {
+            continue;
+        };
+        let ColumnValue::Bytes(envelope) = value else {
+            return Err(failed(format!(
+                "encrypted column at index {} is not bytes",
+                enc.index
+            )));
+        };
+        let declared = DeclaredType::from_name(&enc.declared_type)
+            .ok_or_else(|| failed(format!("unknown declaredType {:?}", enc.declared_type)))?;
+        envelopes.insert(
+            table.columns[enc.index].name.clone(),
+            Value::from(bytes_to_hex(envelope)),
+        );
+        let keys = &encryption.keys;
+        match decrypt_value(declared, envelope, |id| keys.get(id).cloned()) {
+            Ok(plain) => row[enc.index] = Some(plain_to_column_value(plain)),
+            Err(DecryptValueError::KeyMissing { key_id }) => {
+                missing.get_or_insert(key_id);
+            }
+            Err(DecryptValueError::Failed(error)) => return Err(failed(error.0)),
+        }
+    }
+    let Some(key_id) = missing else {
+        return Ok(None);
+    };
+    for enc in &table.encrypted_columns {
+        row[enc.index] = None;
+    }
+    Ok(Some(SealedRow {
+        key_id,
+        envelopes: Value::Object(envelopes).to_string(),
+    }))
+}
+
+/// §5.11 reveal: decrypt a sealed row's stored `_sync_sealed` envelopes into
+/// a row that holds only its encrypted columns; `None` while the keyring
+/// still lacks one of their keys.
+#[cfg(feature = "e2ee")]
+pub fn reveal_sealed_row(
+    table: &TableSchema,
+    envelopes: &str,
+    encryption: &EncryptionConfig,
+) -> Result<Option<Row>, TransportError> {
+    let corrupt = || TransportError::new("client.decrypt_failed", "sealed envelopes are corrupt");
+    let stored: Map<String, Value> = serde_json::from_str(envelopes).map_err(|_| corrupt())?;
+    let mut row: Row = vec![None; table.columns.len()];
+    for enc in &table.encrypted_columns {
+        if let Some(encoded) = stored.get(&table.columns[enc.index].name) {
+            let bytes = encoded
+                .as_str()
+                .and_then(|encoded| hex_to_bytes(encoded).ok())
+                .ok_or_else(corrupt)?;
+            row[enc.index] = Some(ColumnValue::Bytes(bytes));
+        }
+    }
+    Ok(decrypt_row(table, &mut row, encryption)?
+        .is_none()
+        .then_some(row))
+}
+
+/// Without the `e2ee` feature, a schema with encrypted columns is a
+/// misconfiguration — fail loud rather than ship plaintext.
+#[cfg(not(feature = "e2ee"))]
+fn encrypt_row(
+    table: &TableSchema,
+    _row_id: &str,
+    _row: &mut Row,
+    _encryption: &EncryptionConfig,
+) -> Result<(), String> {
+    Err(format!(
+        "table {:?} has encrypted columns but this build lacks the e2ee feature (§5.11)",
+        table.name
+    ))
+}
+
+#[cfg(not(feature = "e2ee"))]
+pub fn reveal_sealed_row(
+    table: &TableSchema,
+    _envelopes: &str,
+    encryption: &EncryptionConfig,
+) -> Result<Option<Row>, TransportError> {
+    decrypt_row(table, &mut Vec::new(), encryption).map(|_| None)
+}
+
+#[cfg(not(feature = "e2ee"))]
+fn decrypt_row(
+    table: &TableSchema,
+    _row: &mut Row,
+    _encryption: &EncryptionConfig,
+) -> Result<Option<SealedRow>, TransportError> {
+    Err(TransportError::new(
+        "client.decrypt_failed",
+        format!(
+            "table {:?} has encrypted columns but this build lacks the e2ee feature (§5.11)",
+            table.name
+        ),
+    ))
+}
+
+#[cfg(feature = "e2ee")]
+fn column_value_to_plain(value: &ColumnValue) -> Result<ssp2::crypto::PlainValue, String> {
+    use ssp2::crypto::PlainValue;
+    Ok(match value {
+        ColumnValue::String(s) => PlainValue::String(s.clone()),
+        ColumnValue::Integer(i) => PlainValue::Integer(*i),
+        ColumnValue::Float(f) => PlainValue::Float(*f),
+        ColumnValue::Boolean(b) => PlainValue::Boolean(*b),
+        ColumnValue::Json(j) => PlainValue::Json(j.0.clone()),
+        ColumnValue::BlobRef(j) => PlainValue::BlobRef(j.0.clone()),
+        ColumnValue::Bytes(b) => PlainValue::Bytes(b.clone()),
+        ColumnValue::Crdt(_) => return Err("crdt columns cannot be encrypted (§5.11)".to_owned()),
+    })
+}
+
+#[cfg(feature = "e2ee")]
+fn plain_to_column_value(value: ssp2::crypto::PlainValue) -> ColumnValue {
+    use ssp2::crypto::PlainValue;
+    match value {
+        PlainValue::String(s) => ColumnValue::String(s),
+        PlainValue::Integer(i) => ColumnValue::Integer(i),
+        PlainValue::Float(f) => ColumnValue::Float(f),
+        PlainValue::Boolean(b) => ColumnValue::Boolean(b),
+        PlainValue::Json(s) => ColumnValue::Json(RawJson(s)),
+        PlainValue::BlobRef(s) => ColumnValue::BlobRef(RawJson(s)),
+        PlainValue::Bytes(b) => ColumnValue::Bytes(b),
+    }
+}
+
+/// Render a primary-key value as the wire `rowId` string.
+pub fn render_row_id(value: &Option<ColumnValue>) -> Result<String, String> {
+    match value {
+        Some(ColumnValue::String(s)) => Ok(s.clone()),
+        Some(ColumnValue::Integer(i)) => Ok(i.to_string()),
+        Some(ColumnValue::Float(f)) => Ok(f.to_string()),
+        Some(ColumnValue::Boolean(b)) => Ok(b.to_string()),
+        Some(ColumnValue::Json(raw)) => Ok(raw.0.clone()),
+        Some(ColumnValue::BlobRef(_)) => Err("blob_ref column cannot be a rowId".to_owned()),
+        Some(ColumnValue::Bytes(_)) => Err("bytes column cannot be a rowId".to_owned()),
+        Some(ColumnValue::Crdt(_)) => Err("crdt column cannot be a rowId".to_owned()),
+        None => Err("primary key value is missing".to_owned()),
+    }
+}
+
+/// Driver JSON value → wire `rowId` string (for optimistic upserts).
+pub fn render_row_id_json(value: Option<&Value>) -> Result<String, String> {
+    match value {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Number(n)) => Ok(n.to_string()),
+        Some(Value::Bool(b)) => Ok(b.to_string()),
+        _ => Err("sync.invalid_request: primary key value is missing or not renderable".to_owned()),
+    }
+}
+
+/// Scope map as a driver JSON object (`variable → list of values`, §3.2).
+pub fn scope_map_to_json(scopes: &[(String, Vec<String>)]) -> Value {
+    let mut map = Map::new();
+    for (key, values) in scopes {
+        map.insert(
+            key.clone(),
+            Value::Array(values.iter().map(|v| Value::from(v.clone())).collect()),
+        );
+    }
+    Value::Object(map)
+}
+
+/// Driver JSON object → scope map, preserving key order.
+pub fn json_to_scope_map(value: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "scope map must be an object".to_owned())?;
+    let mut out = Vec::with_capacity(object.len());
+    for (key, values) in object {
+        let list = values
+            .as_array()
+            .ok_or_else(|| format!("scope values for {key:?} must be a list (§0)"))?;
+        let mut strings = Vec::with_capacity(list.len());
+        for v in list {
+            strings.push(
+                v.as_str()
+                    .ok_or_else(|| format!("scope value for {key:?} is not a string"))?
+                    .to_owned(),
+            );
+        }
+        out.push((key.clone(), strings));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use serde_json::{json, Map, Value};
+    use ssp2::segment::{Column, ColumnType, ColumnValue, Row};
+
+    use super::{
+        bytes_to_hex, hex_to_bytes, normalize_values_casing, snake_to_camel, EncryptionConfig,
+    };
+    use crate::schema::{EncryptedColumn, TableSchema};
+
+    #[test]
+    fn authored_integer_cells_respect_the_wire_safe_range() {
+        let column = Column {
+            name: "n".into(),
+            ty: ColumnType::Integer,
+            nullable: false,
+        };
+        for value in [
+            9007199254740992_i64,
+            9007199254740993,
+            i64::MAX,
+            -9007199254740992,
+            i64::MIN,
+        ] {
+            assert!(super::json_to_column_value(&column, Some(&json!(value))).is_err());
+        }
+        for value in [-9007199254740991_i64, 0, 9007199254740991] {
+            assert!(super::json_to_column_value(&column, Some(&json!(value))).is_ok());
+        }
+    }
+
+    #[test]
+    fn byte_envelopes_preserve_canonical_hex_for_every_byte() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let expected: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(bytes_to_hex(&bytes), expected);
+        assert_eq!(hex_to_bytes(&expected).expect("decode"), bytes);
+        assert_eq!(bytes_to_hex(&[]), "");
+        assert_eq!(bytes_to_hex(&[0, 15, 16, 255]), "000f10ff");
+        let large = bytes.repeat(8192);
+        assert_eq!(bytes_to_hex(&large), expected.repeat(8192));
+        assert_eq!(
+            hex_to_bytes(&bytes_to_hex(&large)).expect("large decode"),
+            large
+        );
+    }
+
+    #[test]
+    fn byte_decoder_preserves_radix_parser_inputs_and_errors() {
+        for first in 0_u8..=127 {
+            for second in 0_u8..=127 {
+                let pair = [first, second];
+                let input = std::str::from_utf8(&pair).unwrap();
+                let expected = u8::from_str_radix(input, 16)
+                    .map(|byte| vec![byte])
+                    .map_err(|error| format!("bad hex: {error}"));
+                assert_eq!(hex_to_bytes(input), expected, "ASCII pair {pair:?}");
+            }
+        }
+        assert_eq!(hex_to_bytes("+fA0+100"), Ok(vec![15, 160, 1, 0]));
+        for input in [
+            "", "0", "abc", "é", "雪", "😀", "0é0", "é00", "00é", "00😀", "😀00", "\0\0",
+        ] {
+            let expected = if !input.len().is_multiple_of(2) {
+                Err("odd-length hex string".to_owned())
+            } else {
+                input
+                    .as_bytes()
+                    .chunks(2)
+                    .map(|pair| {
+                        let text =
+                            std::str::from_utf8(pair).map_err(|_| "non-ASCII hex".to_owned())?;
+                        u8::from_str_radix(text, 16).map_err(|error| format!("bad hex: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            assert_eq!(hex_to_bytes(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn snake_to_camel_pinned_vectors() {
+        for (input, expected) in [
+            ("created_at", "createdAt"),
+            ("col_2", "col2"),
+            ("user_id", "userId"),
+            ("_internal", "_internal"),
+            ("__foo_bar", "__fooBar"),
+            ("row_", "row_"),
+            ("id_url", "idUrl"),
+            ("api_key", "apiKey"),
+            ("title", "title"),
+            ("alreadyCamel", "alreadyCamel"),
+            ("a__b", "aB"),
+            ("_lead_and_trail_", "_leadAndTrail_"),
+            ("count(*)", "count(*)"),
+        ] {
+            assert_eq!(snake_to_camel(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn portable_key_selector_reads_a_non_encrypted_string_column() {
+        let columns = vec![
+            Column {
+                name: "id".to_owned(),
+                ty: ColumnType::String,
+                nullable: false,
+            },
+            Column {
+                name: "encryption_key_id".to_owned(),
+                ty: ColumnType::String,
+                nullable: false,
+            },
+            Column {
+                name: "note".to_owned(),
+                ty: ColumnType::String,
+                nullable: false,
+            },
+        ];
+        let table = TableSchema {
+            name: "patients".to_owned(),
+            columns: columns.clone(),
+            wire_columns: columns,
+            primary_key: "id".to_owned(),
+            pk_index: 0,
+            scope_variables: Vec::new(),
+            indexes: Vec::new(),
+            fts_indexes: Vec::new(),
+            encrypted_columns: vec![EncryptedColumn {
+                index: 2,
+                declared_type: "string".to_owned(),
+            }],
+            server_owned_columns: Vec::new(),
+            generation: None,
+        };
+        let mut config = EncryptionConfig::default();
+        config
+            .key_id_columns
+            .insert("patients".to_owned(), "encryption_key_id".to_owned());
+        let row: Row = vec![
+            Some(ColumnValue::String("patient-1".to_owned())),
+            Some(ColumnValue::String("practice-key-v1".to_owned())),
+            Some(ColumnValue::String("Identity".to_owned())),
+        ];
+        assert_eq!(
+            config.key_id_for(&table, &row).expect("selects key"),
+            "practice-key-v1"
+        );
+    }
+
+    #[test]
+    fn debug_render_redacts_key_material() {
+        let mut config = EncryptionConfig::default();
+        config
+            .keys
+            .insert("practice-key-v1".to_owned(), vec![0xAB; 32]);
+        config
+            .key_id_columns
+            .insert("patients".to_owned(), "encryption_key_id".to_owned());
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("practice-key-v1"), "{rendered}");
+        assert!(rendered.contains("<32 bytes>"), "{rendered}");
+        assert!(rendered.contains("encryption_key_id"), "{rendered}");
+        // Raw byte values never appear (0xAB renders as 171 under derive).
+        assert!(!rendered.contains("171"), "{rendered}");
+        assert!(!rendered.contains("0xAB"), "{rendered}");
+    }
+
+    fn table(names: &[&str]) -> TableSchema {
+        let columns: Vec<Column> = names
+            .iter()
+            .map(|n| Column {
+                name: (*n).to_owned(),
+                ty: ColumnType::String,
+                nullable: true,
+            })
+            .collect();
+        TableSchema {
+            name: "t".to_owned(),
+            columns: columns.clone(),
+            wire_columns: columns,
+            primary_key: "id".to_owned(),
+            pk_index: 0,
+            scope_variables: Vec::new(),
+            indexes: Vec::new(),
+            fts_indexes: Vec::new(),
+            encrypted_columns: Vec::new(),
+            server_owned_columns: Vec::new(),
+            generation: None,
+        }
+    }
+
+    fn map(entries: &[(&str, &str)]) -> Map<String, Value> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect()
+    }
+
+    #[test]
+    fn camel_keys_normalize_to_sql_names() {
+        let t = table(&["id", "list_id", "updated_at_ms"]);
+        let out = normalize_values_casing(
+            &t,
+            map(&[("id", "x"), ("listId", "l"), ("updatedAtMs", "9")]),
+        )
+        .expect("normalizes");
+        assert_eq!(out.get("list_id"), Some(&json!("l")));
+        assert_eq!(out.get("updated_at_ms"), Some(&json!("9")));
+        assert!(!out.contains_key("listId"));
+    }
+
+    #[test]
+    fn snake_keys_pass_through() {
+        let t = table(&["id", "list_id"]);
+        let out = normalize_values_casing(&t, map(&[("id", "x"), ("list_id", "l")])).expect("ok");
+        assert_eq!(out.get("list_id"), Some(&json!("l")));
+    }
+
+    #[test]
+    fn both_casings_for_one_column_is_an_error() {
+        let t = table(&["id", "list_id"]);
+        let err = normalize_values_casing(&t, map(&[("list_id", "a"), ("listId", "b")]))
+            .expect_err("rejects");
+        assert!(err.contains("both snake_case and camelCase"), "{err}");
+    }
+
+    #[test]
+    fn an_alias_colliding_with_a_real_column_never_steals_it() {
+        // `col_2` camel-maps to `col2`, which IS a column: exact wins, no rename.
+        let t = table(&["id", "col_2", "col2"]);
+        let out = normalize_values_casing(&t, map(&[("id", "x"), ("col2", "v")])).expect("ok");
+        assert_eq!(out.get("col2"), Some(&json!("v")));
+        assert!(!out.contains_key("col_2"));
+    }
+
+    #[test]
+    fn unknown_and_internal_columns_fail_loud() {
+        let t = table(&["id", "title"]);
+        let unknown = normalize_values_casing(&t, map(&[("id", "x"), ("typo", "v")]))
+            .expect_err("unknown field");
+        assert!(unknown.contains("unknown column"), "{unknown}");
+        let internal = normalize_values_casing(&t, map(&[("id", "x"), ("_sync_version", "1")]))
+            .expect_err("internal field");
+        assert!(internal.contains("internal sync column"), "{internal}");
+    }
+
+    #[test]
+    fn a_server_owned_column_is_not_a_mutation_value() {
+        let mut t = table(&["id", "title", "approved_by"]);
+        t.server_owned_columns = vec![2];
+        for key in ["approved_by", "approvedBy"] {
+            let err = normalize_values_casing(&t, map(&[("id", "x"), (key, "v")]))
+                .expect_err("server-owned key refused");
+            assert!(
+                err.starts_with("sync.invalid_request:")
+                    && err.contains("a server-owned column is not a mutation value (§6.7)"),
+                "{err}"
+            );
+        }
+        normalize_values_casing(&t, map(&[("id", "x"), ("title", "v")]))
+            .expect("authored columns pass");
+    }
+}
+
+#[cfg(test)]
+mod sparse_key_tests {
+    use ssp2::segment::{Column, ColumnType, ColumnValue, Row};
+
+    use super::EncryptionConfig;
+    use crate::schema::{EncryptedColumn, TableSchema};
+
+    #[cfg(feature = "e2ee")]
+    use super::encode_sparse_row_json;
+    #[cfg(feature = "e2ee")]
+    use serde_json::{json, Map, Value};
+
+    fn keyed_table() -> TableSchema {
+        let columns = vec![
+            Column {
+                name: "id".to_owned(),
+                ty: ColumnType::String,
+                nullable: false,
+            },
+            Column {
+                name: "encryption_key_id".to_owned(),
+                ty: ColumnType::String,
+                nullable: true,
+            },
+            Column {
+                name: "note".to_owned(),
+                ty: ColumnType::String,
+                nullable: true,
+            },
+        ];
+        let wire_columns = vec![
+            Column {
+                name: "id".to_owned(),
+                ty: ColumnType::String,
+                nullable: false,
+            },
+            Column {
+                name: "encryption_key_id".to_owned(),
+                ty: ColumnType::String,
+                nullable: true,
+            },
+            Column {
+                name: "note".to_owned(),
+                ty: ColumnType::Bytes,
+                nullable: true,
+            },
+        ];
+        TableSchema {
+            name: "t".to_owned(),
+            columns,
+            wire_columns,
+            primary_key: "id".to_owned(),
+            pk_index: 0,
+            scope_variables: Vec::new(),
+            indexes: Vec::new(),
+            fts_indexes: Vec::new(),
+            encrypted_columns: vec![EncryptedColumn {
+                index: 2,
+                declared_type: "string".to_owned(),
+            }],
+            server_owned_columns: Vec::new(),
+            generation: None,
+        }
+    }
+
+    fn keyed_config() -> EncryptionConfig {
+        let mut config = EncryptionConfig::default();
+        config.keys.insert("k1".to_owned(), vec![0x2A; 32]);
+        config
+            .key_id_columns
+            .insert("t".to_owned(), "encryption_key_id".to_owned());
+        config
+    }
+
+    #[cfg(feature = "e2ee")]
+    fn values(entries: &[(&str, Value)]) -> Map<String, Value> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn key_selection_failures_carry_the_encode_seam_code() {
+        let table = keyed_table();
+        let config = keyed_config();
+        // Absent selector: absent is not NULL and never densifies into one.
+        let row: Row = vec![
+            Some(ColumnValue::String("r1".to_owned())),
+            None,
+            Some(ColumnValue::String("hi".to_owned())),
+        ];
+        let error = config.key_id_for(&table, &row).expect_err("rejects");
+        assert!(error.starts_with("client.encrypt_failed"), "{error}");
+        assert!(!error.starts_with("client.decrypt_failed"), "{error}");
+    }
+
+    #[cfg(feature = "e2ee")]
+    #[test]
+    fn sparse_patch_without_an_encrypted_slot_needs_no_key() {
+        let table = keyed_table();
+        // No keys at all: resolution must be skipped, not failed.
+        let config = EncryptionConfig::default();
+        let payload =
+            encode_sparse_row_json(&table, "r1", &values(&[("id", json!("r1"))]), &config, None)
+                .expect("encodes without key resolution");
+        assert!(!payload.is_empty());
+    }
+
+    #[cfg(feature = "e2ee")]
+    #[test]
+    fn sparse_patch_falls_back_to_the_stored_key_id() {
+        let table = keyed_table();
+        let config = keyed_config();
+        // The patch presents an encrypted column but not the selector.
+        let sparse = values(&[("id", json!("r1")), ("note", json!("hi"))]);
+        let error = encode_sparse_row_json(&table, "r1", &sparse, &config, None)
+            .expect_err("absent selector with no fallback fails");
+        assert!(error.contains("client.encrypt_failed"), "{error}");
+        let fallback: Row = vec![
+            Some(ColumnValue::String("r1".to_owned())),
+            Some(ColumnValue::String("k1".to_owned())),
+            None,
+        ];
+        encode_sparse_row_json(&table, "r1", &sparse, &config, Some(&fallback))
+            .expect("stored key id encrypts the patch");
+    }
+
+    #[cfg(feature = "e2ee")]
+    #[test]
+    fn sparse_patch_keeps_a_present_null_selector() {
+        let table = keyed_table();
+        let config = keyed_config();
+        // The patch presents the selector explicitly as NULL alongside an
+        // encrypted column. Absent is not NULL: the stored row must not
+        // rescue a present NULL, and a NULL key id is unusable.
+        let sparse = values(&[
+            ("id", json!("r1")),
+            ("encryption_key_id", json!(null)),
+            ("note", json!("hi")),
+        ]);
+        let fallback: Row = vec![
+            Some(ColumnValue::String("r1".to_owned())),
+            Some(ColumnValue::String("k1".to_owned())),
+            None,
+        ];
+        let error = encode_sparse_row_json(&table, "r1", &sparse, &config, Some(&fallback))
+            .expect_err("a present NULL selector must not read the stored fallback");
+        assert!(error.contains("client.encrypt_failed"), "{error}");
+    }
+}

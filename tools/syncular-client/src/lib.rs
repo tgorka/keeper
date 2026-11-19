@@ -1,0 +1,109 @@
+//! # syncular-client — Syncular v2 Rust client core (POC stage 2)
+//!
+//! A clean-room client implementation of the SPEC.md client-behavior
+//! contract on rusqlite local storage, consuming the committed `ssp2`
+//! codec as its wire layer. Built without reading the v1 Rust tree or the
+//! v2 TypeScript client — the conformance catalog (packages/conformance)
+//! is the proof that both cores implement one written protocol.
+//!
+//! Blocking hosts drive `sync()` / `sync_until_idle()`. Mailbox hosts prepare
+//! a round on the owner, run `PreparedSyncRound::exchange` on an I/O executor,
+//! and apply the result on the owner. A host without a blocking executor drives
+//! the same round through `PreparedSyncRound::next_operation` /
+//! `PreparedSyncRound::submit` / `PreparedSyncRound::finish`, performing every
+//! request with its own async I/O. An upload continuation repeats that
+//! exchange/apply cycle before the captured metadata request. The owner can
+//! serve local commands throughout; it queues inbound realtime traffic until
+//! the round completes. Scheduling is host policy (§8.4).
+
+pub mod api;
+#[cfg(feature = "bench-internals")]
+mod bench;
+pub mod client;
+/// §5.10.5 native CRDT helpers (the `crdt-yjs` feature) — the Rust face of the
+/// Yjs binding, mirroring `@syncular/crdt-yjs`. Off by default (dependency-lean).
+#[cfg(feature = "crdt-yjs")]
+pub mod crdt;
+/// Shared blocking HTTP/WebSocket host transport for Rust-backed bindings.
+/// The network stack is feature-gated; its no-network shape remains available
+/// in dependency-lean builds so host code needs only one transport type.
+pub mod native_transport;
+mod progress;
+mod round;
+pub use progress::{
+    ProgressObserver, ProgressPhase, ProgressState, ProgressSubscription, SyncProgress,
+    SyncProgressListener,
+};
+pub use round::{
+    AppliedSyncRound, CompletedSyncRound, PreparedSyncRound, RoundOperation, RoundReply,
+};
+/// RFC 0005 previous-version context: the persisted schema descriptor, the
+/// bounded capture, and the sibling container FILE beside the replica.
+pub mod previous_version;
+pub mod query_guard;
+pub mod realtime_round;
+pub mod remote;
+pub mod schema;
+pub mod transport;
+pub mod values;
+
+/// Browser-worker crash recovery for the installed OPFS VFS.
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod wasm_vfs;
+
+/// Wall-clock milliseconds since the Unix epoch, the one clock this crate
+/// reads for every timestamp it records. `wasm32-unknown-unknown` runs in a JS
+/// host where `SystemTime::now()` panics, so that target reads the host clock.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) fn wall_clock_ms() -> i64 {
+    js_sys::Date::now() as i64
+}
+
+/// Wall-clock milliseconds since the Unix epoch, the one clock this crate
+/// reads for every timestamp it records. A host clock set before 1970 is a
+/// broken host, not a value to clamp.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates Unix epoch")
+        .as_millis() as i64
+}
+
+pub use api::{
+    creation_time_bucket, last, AppliedServerCommit, AppliedServerCommitSource,
+    AuthorityReadDeclaration, ClientChangeBatch, ClientDiagnosticsHost, ClientDiagnosticsLease,
+    ClientDiagnosticsReplica, ClientDiagnosticsSchema, ClientDiagnosticsSnapshot,
+    ClientDiagnosticsStorage, ClientError, ClientLimits, CommandEffects, CommitDelivery,
+    CommitOperation, CommitOperationOutcome, CommitOutcome, CommitOutcomeQuery,
+    CommitOutcomeResolution, CommitOutcomeStatus, ConflictRecord, CoverageSnapshot,
+    CurrentBaseProof, CurrentBaseProofReason, DiagnosticLastChange, DiagnosticLastRound,
+    DiagnosticQueryFailure, DiagnosticRoundCounters, DiagnosticUnits, EchoRecord, FetchedBlob,
+    LocalDataPurgeInput, LocalDataPurgeResult, LocalDataPurgeTarget, LocalDataRebootstrapInput,
+    LocalDataRebootstrapResult, Mutation, PendingCommit, PresencePeer, QueryOwner,
+    QueryReadFailure, QueryRow, QuerySnapshot, QueryValue, RealtimePolicy, RealtimeState,
+    RejectionRecord, ResolveCommitOutcomeInput, RetainedCommitRow, RetainedUniqueConflict,
+    RowState, SchemaFloor, SnapshotRead, SyncIntent, SyncOutcome, SyncReport, SyncStatusSnapshot,
+    TableChange, TimeBucketUnit, TransportCauseKind, UnitCatchup, UnitRecord, UnitRestriction,
+    UnitScopes, UnitStatus, WindowBase, WindowChange, WindowCoverage, WindowState, WindowUnitRef,
+    CLIENT_DIAGNOSTICS_VERSION, LOCAL_AUTHORITY_UNCONFIGURED_CODE, MAX_DIAGNOSTIC_QUERY_FAILURES,
+    REALTIME_LOST_CODE, REALTIME_UNAVAILABLE_CODE,
+};
+pub use client::{
+    CurrentBasePreparation, FileQuerySnapshotReader, SnapshotReadRequest, SnapshotStatement,
+    SyncClient, SECURITY_PREFLIGHT_REQUIRED_CODE,
+};
+pub use schema::{compile_schema, parse_schema_json, ClientSchema};
+pub use transport::{
+    BlobDownload, BlobUploadGrant, SegmentFetch, SegmentRequest, Transport, TransportError,
+};
+
+// Re-export the SSP2 stream scanner (§8.7 round-response reassembly) so the
+// native transports (FFI + Tauri plugin) reach it through their existing
+// `syncular-client` dependency, without each adding a direct `ssp2` path dep.
+pub use realtime_round::{RealtimeRound, RoundInbound, REALTIME_TAG_DELTA, REALTIME_TAG_ROUND};
+pub use remote::{
+    PreparedRemoteCommit, RemoteBytes, RemoteClientError, RemoteCommandResult, RemoteCommitInput,
+    RemoteCommitResult, RemoteQueryResult, SyncRemoteClient,
+};
+pub use ssp2::{MessageStreamScanner, ScannedMessage};

@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "f1a485dbe0eac63f714e1da08e03fff14b66053f",
+    "dirty": true
+  },
+  "path_in_vcs": "rust/crates/client"
+}
