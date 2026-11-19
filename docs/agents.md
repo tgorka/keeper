@@ -8,10 +8,14 @@ each database your device may open, and shows, writes and decides through those 
 `ARCHITECTURE-KEEPER-HQ.md` (AD-417…AD-433); the decisions are D-37 and, for what it replaced,
 D-31 and D-32 in `docs/decisions.md`.
 
-**Two databases.** keeper-hq serves `tgdrive` and `neuradrive`, named after the drives whose
-readers they mirror (AD-433). Each is its own syncular instance on its own Postgres schema and
-role. A session lives in exactly one of them, and nothing crosses into the other: not a message,
-a delegation, an invitation or an attachment. An agent that serves both keeps one memory in each.
+**Domains.** keeper-hq serves the domains its configuration lists (AD-433, story 114.1). Each is
+one syncular database, named after the drive whose readers it mirrors, with its own syncular
+instance on its own Postgres schema and login role. A device keeps one replica, and opens one
+socket, for each domain its pairing opens, and the server refuses it any other. A session lives in
+exactly one of them, and nothing crosses into another: not a message, a delegation, an invitation
+or an attachment. An agent that serves several keeps one memory in each.
+
+The deployment the records below were run against lists two:
 
 | database | people | agents |
 | --- | --- | --- |
@@ -240,7 +244,7 @@ section. What keeper sends the server, and when, is the *Agents server* row of `
 
 The Agents window reads Rust's local database sessions, not Matrix rooms. Sessions from every
 database this device holds share one list. Each row and the opened session's header name the
-database; identical session ids in two databases remain separate conversations. Rows show the
+database; identical session ids in different databases remain separate conversations. Rows show the
 agent, last activity and Rust's attention state. **Active**, **Archived** and **All** change only
 which rows are shown, never their order or the underlying subscription.
 
@@ -1256,7 +1260,7 @@ managed: `hq1-` followed by the unpadded base64url SHA-256 of the whole key
 `<database>/<kind>/<item id>` — 47 ASCII bytes for every item. Not the key itself: APNs refuses
 a collapse id over 64 bytes (`BadCollapseId`), and a valid key passes that easily (a database
 name may be 63 bytes and an item id 1024, and the id need not be ASCII). Not a truncation of it,
-nor the item id alone: two items sharing a prefix, or one id in two databases or of two kinds,
+nor the item id alone: two items sharing a prefix, or one id in different databases or of two kinds,
 would collapse into one notification. A digest of the full key is fixed-length, the same for
 every delivery of the item, distinct across namespaces, and computed from ids alone. Sygnal's APNs
 pushkin sends no collapse id, so this needs a gateway that sets one from the push's
@@ -1479,8 +1483,8 @@ behavior still needs the hesperia/kalypso device check; Chrome's mock blob URL i
 **The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
 outbox pins (`keeper_replica::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
 `blob_cache_max_bytes`): ten of the largest files a message may carry, so a session's recent files
-open again without a download, while a phone holding both databases spends at most half a
-gigabyte on them. Past the cap, the least recently opened body the outbox does not pin is evicted
+open again without a download, while a phone spends at most that on them for each database it
+holds. Past the cap, the least recently opened body the outbox does not pin is evicted
 first — referenced or not; the next open downloads it again. A body the outbox pins (staged, or
 named by a commit the server has not taken) is never evicted, even when the pinned bodies alone
 pass the cap. When each body was last opened is kept beside the replica
