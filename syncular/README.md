@@ -124,23 +124,27 @@ waits while no map has been applied since the server started (`starting`), while
 applied (`reconciling`), after it failed to apply (`failed`) or when it was restored older than the
 last applied one (`stale_restore`), and is refused meanwhile with `hq.map_closed`; conversations
 and their attachments do not wait. Only `open` admits: a reader takes a barrier state it does not
-know as closed. `hq.map_closed` is answered with 503 on the admin route; for a graph command it is
-a commit refusal with no HTTP status. `accounts.vectors.json` lists every code the accounts
-contract adds.
+know as closed. `hq.map_closed` is answered with 503 on an HTTP route — a first enrolment, a
+pairing redemption; for a graph command it is a commit refusal with no HTTP status. The admin
+route's own refusal while the map cannot be read stays `hq.admin.map_unreadable`.
+`accounts.vectors.json` lists every code the accounts contract adds.
 
 **The operator's admin path.** Every change is one request `{request_id, expected_revision,
 command, confirm?}`; its fields are closed, and `hq.admin.malformed` answers one that does not
 parse. The server checks the request id first: the first request it applies binds the id to the
 request's digest, the SHA-256 of the RFC 8785 (JCS) bytes of the request as the contract
 serialises it after parsing — every required field present, `serving_agents` and `accept` among
-them (`[]` for none), an optional field without a value absent and never `null`. The same id and
-digest again gets the recorded answer with no second effect, and the same id with another digest
-is refused `hq.admin.request_reused`. Only then does it check the revision, so a retry after a lost
-answer gets the recorded answer, not a stale revision: a request whose `expected_revision` is not
-the map's revision is refused `hq.admin.stale_revision`. The revision is the `seq` of the map's
-last history event, 0 before the first, and `seq` is one sequence for the whole map, not one per
-domain. An answer of `confirmation_required`, `unreconciled` or a refusal applies nothing and binds
-nothing.
+them (`[]` for none), an optional field without a value absent and never `null`. An optional
+request field given as `null` is refused `hq.admin.malformed`, because the canonical form never
+has `null`. `expected_revision`, and every integer in this contract, stays within ±(2^53−1), the
+integers JCS and a JavaScript reader hold exactly; the server refuses a request carrying a larger
+one `hq.admin.malformed`. The same id and digest again gets the recorded answer with no second
+effect, and the same id with another digest is refused `hq.admin.request_reused`. Only then does
+it check the revision, so a retry after a lost answer gets the recorded answer, not a stale
+revision: a request whose `expected_revision` is not the map's revision is refused
+`hq.admin.stale_revision`. The revision is the `seq` of the map's last history event, 0 before the
+first, and `seq` is one sequence for the whole map, not one per domain. An answer of
+`confirmation_required`, `unreconciled` or a refusal applies nothing and binds nothing.
 
 ## Scopes
 

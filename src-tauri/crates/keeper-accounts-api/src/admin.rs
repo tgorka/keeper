@@ -10,7 +10,9 @@
 //!    id to the request's digest — the SHA-256 of the RFC 8785 (JCS) bytes of
 //!    the request as this contract serialises it after parsing (an optional
 //!    field without a value absent, never `null`; `serving_agents` and
-//!    `accept` always present). The same id and digest again is answered
+//!    `accept` always present). An optional field given as `null` does not
+//!    parse and is refused ([`Refusal::Malformed`]): the canonical form never
+//!    has one. The same id and digest again is answered
 //!    from that record with no second effect; the same id with another
 //!    digest is refused ([`Refusal::RequestReused`]). This lookup comes
 //!    before the revision check, so a retry after a lost answer gets the
@@ -24,20 +26,34 @@
 //! nothing and binds nothing. Every applied request is one event of the map's
 //! history, attributed to the operator, in the request's own transaction.
 //!
-//! [`Refusal::MapClosed`] is answered with 503 on the admin route only; for a
-//! graph command it is a commit refusal with no HTTP status.
+//! [`Refusal::MapClosed`] is answered with 503 on an HTTP route — first
+//! enrolment, pairing redemption; for a graph command it is a commit refusal
+//! with no HTTP status. The admin route's own refusal while the map cannot be
+//! read stays [`Refusal::MapUnreadable`].
+//!
+//! `expected_revision`, and every integer in this contract, stays within
+//! ±(2^53−1), the integers JCS and a JavaScript reader hold exactly; the
+//! server refuses a request carrying a larger one ([`Refusal::Malformed`]).
 //!
 //! A request's fields are closed: a parser refuses one it does not know. An
 //! answer's are open: a reader ignores one it does not know, and reads a
 //! [`Barrier`] state it does not know as closed.
 //!
+//! [`Refusal::Malformed`]: crate::refusal::Refusal::Malformed
 //! [`Refusal::RequestReused`]: crate::refusal::Refusal::RequestReused
 //! [`Refusal::StaleRevision`]: crate::refusal::Refusal::StaleRevision
 //! [`Refusal::MapClosed`]: crate::refusal::Refusal::MapClosed
+//! [`Refusal::MapUnreadable`]: crate::refusal::Refusal::MapUnreadable
 
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{DomainKind, FilesWrites, Role};
+
+/// The largest integer this contract carries, 2^53−1: the largest JCS and a
+/// JavaScript reader hold exactly. A request integer beyond ±this does not
+/// parse.
+pub const MAX_EXACT_INTEGER: u64 = (1 << 53) - 1;
 
 /// One change to the map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,13 +63,18 @@ pub struct AdminRequest {
     /// answer reuses it with the same payload.
     pub request_id: String,
     /// The map's revision the operator last saw ([`MapView::revision`]).
+    #[serde(deserialize_with = "exact_u64")]
     pub expected_revision: u64,
     pub command: AdminCommand,
     /// The operator's confirmation of exactly the entries a
     /// [`AdminAnswer::ConfirmationRequired`] listed for this command. The
     /// server applies the change only when the entries it finds now are these;
     /// otherwise it answers with the new list and changes nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub confirm: Option<Vec<Unopenable>>,
 }
 
@@ -66,7 +87,11 @@ pub enum AdminCommand {
         actor_id: String,
         display_name: String,
         /// The person's own domain, once it is deployed and listed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
         personal_domain: Option<String>,
         /// The agents that serve this person; always present, `[]` for none.
         serving_agents: Vec<String>,
@@ -79,7 +104,11 @@ pub enum AdminCommand {
         kind: DomainKind,
         display_name: String,
         /// The person a `personal` domain belongs to.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
         personal_of: Option<String>,
     },
     /// A person becomes a member of a domain, or a member's role changes.
@@ -88,11 +117,19 @@ pub enum AdminCommand {
     SetMembership {
         domain: String,
         actor_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
         role: Option<Role>,
         /// When the membership ends, UTC milliseconds; absent for one that
         /// does not. The same value as [`MembershipRecord::expires_at_ms`].
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_exact_i64",
+            skip_serializing_if = "Option::is_none"
+        )]
         expires_at_ms: Option<i64>,
     },
     /// A person leaves a domain: their credentials there are revoked and their
@@ -184,8 +221,24 @@ pub enum Barrier {
     /// The general domain was restored from a copy older than the last
     /// applied map.
     StaleRestore,
-    /// A state this contract does not have, as the server named it.
-    Other(String),
+    /// A state this contract does not have, as the server named it. Only
+    /// parsing makes one, and never from a known state's name.
+    Other(UnknownBarrier),
+}
+
+/// The name of a barrier state this contract does not have. Its field is
+/// private, so no code outside parsing can make one, and parsing never
+/// gives one a known state's name: an [`Barrier::Other`] can never
+/// serialise as a state that reads differently.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnknownBarrier(String);
+
+impl UnknownBarrier {
+    /// The state's name as the server sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Barrier {
@@ -198,7 +251,7 @@ impl Barrier {
             Self::Reconciling => "reconciling",
             Self::Failed => "failed",
             Self::StaleRestore => "stale_restore",
-            Self::Other(name) => name,
+            Self::Other(name) => name.as_str(),
         }
     }
 
@@ -216,7 +269,7 @@ impl Barrier {
             "reconciling" => Self::Reconciling,
             "failed" => Self::Failed,
             "stale_restore" => Self::StaleRestore,
-            _ => Self::Other(name),
+            _ => Self::Other(UnknownBarrier(name)),
         }
     }
 }
@@ -276,7 +329,7 @@ pub struct PersonRecord {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personal_domain: Option<String>,
-    #[serde(default)]
+    /// Always present, `[]` for none, as on [`AdminCommand::AddPerson`].
     pub serving_agents: Vec<String>,
     /// Server-only: never synced, never told to a device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,4 +347,55 @@ pub struct MembershipRecord {
     pub granted_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
+}
+
+/// A request integer within [`MAX_EXACT_INTEGER`].
+fn exact_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_EXACT_INTEGER {
+        return Err(D::Error::custom("integer beyond 2^53-1"));
+    }
+    Ok(value)
+}
+
+/// An optional request field: absent is `None`, a value is `Some`, and
+/// `null` does not parse, since the canonical form never has it.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// [`present`] for an integer within ±[`MAX_EXACT_INTEGER`].
+fn present_exact_i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    let value = i64::deserialize(deserializer)?;
+    if value.unsigned_abs() > MAX_EXACT_INTEGER {
+        return Err(D::Error::custom("integer beyond 2^53-1"));
+    }
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Barrier, UnknownBarrier};
+
+    const KNOWN: [&str; 5] = ["open", "starting", "reconciling", "failed", "stale_restore"];
+
+    #[test]
+    fn an_unknown_barrier_never_carries_a_known_state_s_name() {
+        for name in KNOWN {
+            let state = Barrier::from_wire(name.to_owned());
+            assert!(!matches!(state, Barrier::Other(_)), "{name}");
+            assert_eq!(state.as_str(), name);
+        }
+        for name in ["paused", "Open", "OPEN", "open ", ""] {
+            let state = Barrier::from_wire(name.to_owned());
+            assert_eq!(state, Barrier::Other(UnknownBarrier(name.to_owned())));
+            assert!(!state.is_open(), "{name:?}");
+            let wire = serde_json::to_value(&state).expect("serialise");
+            let back: Barrier = serde_json::from_value(wire).expect("parse");
+            assert_eq!(back, state, "{name:?}");
+            assert!(!KNOWN.contains(&state.as_str()), "{name:?}");
+        }
+    }
 }
