@@ -4608,6 +4608,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-accounts-api"
+version = "0.11.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "keeper-agent"
 version = "0.11.0"
 dependencies = [

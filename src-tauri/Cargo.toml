@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper-paths", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-cli", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit", "crates/keeper-graph"]
+members = ["crates/keeper-core", "crates/keeper-paths", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-cli", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit", "crates/keeper-graph", "crates/keeper-accounts-api"]
 
 [workspace.package]
 version = "0.11.0"

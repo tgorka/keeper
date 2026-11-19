@@ -19,8 +19,9 @@ keeper ships no server URL).
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
 | `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
-| `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
+| `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
+| `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
 
 Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -79,6 +80,71 @@ server serves schemas 3 through 7 beside it with `kg_proposals` and `kg_reviews`
 with or before the server release that first accepts a review or a reversal event: a version-2
 worker refuses a `review` operation (fails closed) until it is upgraded.
 
+## Domains and the map
+
+A domain is one audience: a database of this contract, its schema, its drive and its graph, named
+alike. Each has a kind — `general` (the organisation's one general domain, `makidrive`),
+`personal` (one person's) or `group` (a group's) — and each person is a member of some of them,
+with one of `vocabulary.json`'s `roles` — `reader`, `editor`, `reviewer`, `owner` — or none. The
+same four roles name a person's standing in every module of a domain; what each admits is that
+module's rule. `keeper-accounts-api` is keeper's copy of these types (story 114.2).
+
+**The map is server-only.** Which domains exist, who is in each and with which role, which agents
+serve whom and which sign-in subject is which person are the server's own tables in the general
+domain's schema. They are not a table of this contract, a scope or a replica's: no row of them
+reaches any device or agent instance. They change only on the operator's admin path, whose one
+client is the operator's tool and whose one guard is the operator's token; a device credential —
+an owner's included —, an agent instance, the service client and the import token change nothing
+there, by any route, a Syncular commit or a command included. Every accepted change is an event of
+the map's history attributed to the operator, written in the request's own transaction.
+
+**What a person sees of a domain they are not in: nothing.** The owner's answer: "Co członek
+widzi z domeny, do której nie należy: nic" — not its name, not that it exists. So:
+
+- `GET /databases` lists only the domains the credential opens. Each entry is `name`, `mount`,
+  `kind`, `display_name`, and, when they exist, `replaced_repository` (the git repository the
+  domain replaced, told only to its members), `graph_root` (the id of the domain's root
+  `Collection`, the node carrying `okf:profile_version`) and `files_writes` (`shadow` | `open`, the
+  domain's file-write record). A client ignores an entry field it does not know, and skips an
+  entry whose `kind` or `files_writes` is a value it does not know, reading the others: a kind
+  added later hides that one domain from an older client, never the whole body. `kind` and
+  `display_name` are required, so a body from a server older than story 114.2 does not parse; a
+  client of story 114.5 or later does not support that server.
+- No row, scope value, refusal, agent profile or ticked drive names a domain to someone who is not
+  in it, and nothing lists the domains that exist.
+- A domain the credential does not open and a name that is no domain get one answer, byte for byte
+  apart from the date, on every route under the name and on the realtime upgrade: today's 401 for
+  a mount the token does not open — Syncular's own on its routes, `{"error":
+  "sync.auth_required"}` on the upgrade and the server's own routes.
+- The general domain's directory carries `actors` and no `clients`: every person is in it, and
+  `clients` would show each the others' devices.
+
+A map-dependent admission — a graph command or scope, a first enrolment, a pairing redemption —
+waits while no map has been applied since the server started (`starting`), while the map is being
+applied (`reconciling`), after it failed to apply (`failed`) or when it was restored older than the
+last applied one (`stale_restore`), and is refused meanwhile with `hq.map_closed`; conversations
+and their attachments do not wait. Only `open` admits: a reader takes a barrier state it does not
+know as closed. `hq.map_closed` is answered with 503 on an HTTP route — a first enrolment, a
+pairing redemption; for a graph command it is a commit refusal with no HTTP status. The admin
+route's own refusal while the map cannot be read stays `hq.admin.map_unreadable`.
+`accounts.vectors.json` lists every code the accounts contract adds.
+
+**The operator's admin path.** Every change is one request `{request_id, expected_revision,
+command, confirm?}`; its fields are closed, and `hq.admin.malformed` answers one that does not
+parse. The server checks the request id first: the first request it applies binds the id to the
+request's digest, the SHA-256 of the RFC 8785 (JCS) bytes of the request as the contract
+serialises it after parsing — every required field present, `serving_agents` and `accept` among
+them (`[]` for none), an optional field without a value absent and never `null`. An optional
+request field given as `null` is refused `hq.admin.malformed`, because the canonical form never
+has `null`. `expected_revision`, and every integer in this contract, stays within ±(2^53−1), the
+integers JCS and a JavaScript reader hold exactly; the server refuses a request carrying a larger
+one `hq.admin.malformed`. The same id and digest again gets the recorded answer with no second
+effect, and the same id with another digest is refused `hq.admin.request_reused`. Only then does
+it check the revision, so a retry after a lost answer gets the recorded answer, not a stale
+revision: a request whose `expected_revision` is not the map's revision is refused
+`hq.admin.stale_revision`. The revision is the `seq` of the map's last history event, 0 before the
+first, and `seq` is one sequence for the whole map, not one per domain. An answer of
+`confirmation_required`, `unreconciled` or a refusal applies nothing and binds nothing.
 
 ## Scopes
 
@@ -187,8 +253,11 @@ last wrote it. Times are UTC milliseconds since the epoch.
   it uses when nobody picked), `efforts` (a JSON array of the reasoning efforts it can send, each
   one of `vocabulary.json`'s `efforts`) and `default_effort` (the one it sends when nobody picked;
   absent when it sends none), and `drives` (a JSON array of the drive names it can read: its
-  definition's ceiling less what its container does not mount). Each is absent until an instance
-  says, and a client then offers no picker for it.
+  definition's ceiling less what its container does not mount, and that everyone who reads this
+  database may read). Each is absent until an instance says, and a client then offers no picker
+  for it. A row stored before a reader joined is narrowed by the server's own client when who reads
+  the database, or a drive it names, changes, before the new reader's first pull; a replica that
+  pulled the old row keeps it until its next pull.
 - **`sessions`** — `title`, `status`, `agent_actor`, `created_by_actor`, `created_by_client`,
   `preferred_client` (the instance the person asked for), `parent_session` (a delegated child's
   parent), `invite` (a JSON array of actor ids), `archived`, `heard_until` (the claim holder's mark
@@ -210,7 +279,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
 - **`session_drives`** (schema 4) — one row per session: `drives`, a JSON array of the drive names
   a person ticked for the session's agent to read, and `updated_at_ms`. No row, or an empty array,
   is no drive: none is ticked until a person ticks it. It can only name drives the agent offers
-  (`agent_profiles.drives`), and it grants reading, never writing.
+  (`agent_profiles.drives`), and it grants reading, never writing. When who reads the database,
+  or a ticked drive, changes, the server's own client unticks every drive that no longer passes
+  V17's audience rule — the name and its tick id leave the row, the other ticks keep theirs —
+  before a new reader's first pull.
   From schema 5, `tick_ids` (nullable JSON) names the identity of each tick:
   `{"at": <this row's updated_at_ms>, "drives": {<drive>: <ULID>}}`. A schema-5 client writes it in
   every write of the row: a fresh ULID for each drive it ticks anew, the same id for each drive it
@@ -335,7 +407,10 @@ rule broken refuses the whole commit.
    client and its `actor_id` the commit's actor. Its `models`, `efforts` and `drives` are each
    absent or a JSON array of distinct non-empty strings, every effort one of `vocabulary.json`'s
    `efforts`; `default_model` is absent or one of `models`, and `default_effort` absent or one of
-   `efforts`.
+   `efforts`. Every drive in `drives` is one everyone who reads this database may read; a row that
+   names another is refused (`hq.profile.drive_audience`). The one exception: the service client
+   may rewrite a stored row's `drives` to remove a name that no longer passes this rule, and
+   change nothing else.
 3. **V3 — sessions.** A new session's id starts with the commit's client id followed by `.`.
    `agent_actor`, `created_by_actor`, `created_by_client` and `parent_session` never change. A
    session is inserted only by a person, or by an instance of an agent the registry lets start work;
@@ -426,7 +501,10 @@ rule broken refuses the whole commit.
     database and never changes. `drives` is a JSON array of distinct drive names, each one an
     `agent_profiles` row of the session's agent offers, and each readable by every person of this
     database: a drive is ticked in a database only when everyone who reads that database may read
-    the drive.
+    the drive. The one exception: the service client removes a drive that no longer passes this
+    rule. In the same write it removes that drive's id from `tick_ids.drives`, keeps every
+    remaining drive's id, and sets `updated_at_ms` and `tick_ids.at` to one new value, so the
+    remaining ticks keep their identity; it changes nothing else.
 18. **V18 — a write carried out.** A person message whose `metadata.kind` is `applied` reports what
     became of a `drive_write` approval: its id is `applied.` followed by the approval's id, it is
     written once and never changed, by the device that decided the approval, and it says

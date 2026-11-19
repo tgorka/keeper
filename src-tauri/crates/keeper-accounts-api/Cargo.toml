@@ -1,0 +1,19 @@
+[package]
+name = "keeper-accounts-api"
+description = "The accounts contract: domains, the four roles, the discovery entry and the operator's admin requests"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Types only (story 114.2): no storage, transport, Syncular, SQLite, Tauri or
+# keeper-core. `bun run check:module-edges` holds it to the contract role.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
