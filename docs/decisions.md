@@ -2016,6 +2016,19 @@ them, download them from anyone else, send audio anywhere, or start the micropho
 
 ## D-37 — An agent's conversation is a row in a database the person runs, and keeper is only its client
 
+> **Amended by story 114.1 (2026-11-19).** keeper-hq's server reads the databases it serves — its
+> domains — from its configuration, one syncular instance on its own schema and role for each.
+> Where this entry counts two, read the domains the server lists: "keeper-hq's `tgdrive` and
+> `neuradrive`" (the second paragraph); "runs two independent `@syncular/server` instances … on two
+> schemas of one database" (*What changes*); "A client subscribes to one or both databases … keeper
+> shows both in one Agents window", where a session still lives in exactly one and a delegation,
+> an invitation or an attachment never reaches any other; "Two databases rather than one keep the
+> drives' two audiences apart in Postgres itself" (*Why a database the person runs*), each audience
+> on a schema no other domain's role can read; "in either database: the two share one server
+> process" (*What it costs*); and "an agent subscribed to both databases keeps a memory in each"
+> (*What stays true*), so nothing it learned in one reaches another's readers. The entry is kept as
+> written; its *Status* paragraph records the decision as it was made.
+
 The owner asked whether Matrix adds latency ("czy matrix protokol dodaje dodatkowe latency? jesli
 tak to ile? oraz first time?") and proposed instead that a conversation be "zapisywana w basie danych
 (wszystkich potencjalnych uczestnikow rozmowy) i synchronizaowana z https://syncular.dev/", that
