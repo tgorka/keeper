@@ -142,18 +142,19 @@ impl Hq {
             .chain(std::iter::once((
                 crate::hq::grants::TABLE,
                 crate::hq::grants::units(&source),
-            )));
-            for (table, units) in plan {
-                let key = (source.database.clone(), table);
+            )))
+            .collect();
+            for (base, units) in sessions::windows(plan) {
+                let key = (source.database.clone(), base.variable.clone());
                 if lock(&self.windows).get(&key) == Some(&units) {
                     continue;
                 }
-                match source.replica.set_window(&sessions::window(table), &units) {
+                match source.replica.set_window(&base, &units) {
                     Ok(()) => {
                         lock(&self.windows).insert(key, units);
                     }
                     Err(error) => {
-                        tracing::debug!(database = %source.database, table, %error, "an agents window could not be set");
+                        tracing::debug!(database = %source.database, variable = %base.variable, %error, "an agents window could not be set");
                     }
                 }
             }

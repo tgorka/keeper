@@ -190,7 +190,7 @@ impl World {
             path: dir.join("replica.sqlite"),
             client_id: Some("dev1".to_owned()),
             link: None,
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: None,
         })
         .expect("replica");
@@ -1260,41 +1260,71 @@ async fn a_revoked_scope_or_a_cancellation_stops_reads() {
 #[test]
 fn checkpoint_rows_decide_the_scope() {
     use crate::source::checkpoint_of;
-    let row = |tbl: &str, status: &str, cursor: i64, holds: bool| {
-        json!({"tbl": tbl, "status": status, "cursor": cursor, "holds": holds})
-            .as_object()
-            .expect("row")
-            .clone()
+    let unit = |scopes: Value, status: &str, cursor: i64, bootstrapping: bool, echo: Value| {
+        json!({
+            "scopes": scopes.to_string(),
+            "status": status,
+            "cursor": cursor,
+            "bootstrapping": i64::from(bootstrapping),
+            "echo": if echo.is_null() { Value::Null } else { Value::from(echo.to_string()) },
+        })
+        .as_object()
+        .expect("row")
+        .clone()
     };
-    let all = |status: &str, holds: bool| {
-        vec![
-            row("kg_events", status, 7, holds),
-            row("kg_event_ops", status, 5, holds),
-            row("kg_head", status, 9, holds),
-        ]
+    let ledger = |status: &str, cursor: i64, bootstrapping: bool| {
+        unit(
+            json!({"kg_history": DB}),
+            status,
+            cursor,
+            bootstrapping,
+            Value::Null,
+        )
+    };
+    // The state unit and another domain's ledger never decide this one.
+    let others = vec![
+        unit(json!({"kg_graph": DB}), "revoked", 3, false, Value::Null),
+        unit(
+            json!({"kg_history": "other"}),
+            "revoked",
+            3,
+            false,
+            Value::Null,
+        ),
+    ];
+    let with = |row| {
+        let mut rows = others.clone();
+        rows.push(row);
+        rows
     };
     assert_eq!(
-        checkpoint_of(&all("active", true)),
+        checkpoint_of(DB, &with(ledger("active", 5, false))),
         Checkpoint {
             scope: ScopeState::Granted,
             cursor: Some(5)
         }
     );
     assert_eq!(
-        checkpoint_of(&all("active", false)).scope,
+        checkpoint_of(DB, &with(ledger("revoked", 5, false))).scope,
         ScopeState::Revoked
     );
-    assert_eq!(
-        checkpoint_of(&all("revoked", true)).scope,
-        ScopeState::Revoked
+    let fenced = unit(
+        json!({"kg_history": DB}),
+        "active",
+        5,
+        false,
+        json!([{"table": "kg_events", "status": "revoked", "scopes": {}}]),
     );
+    assert_eq!(checkpoint_of(DB, &with(fenced)).scope, ScopeState::Revoked);
+    assert_eq!(checkpoint_of(DB, &others).scope, ScopeState::Pending);
     assert_eq!(
-        checkpoint_of(&all("active", true)[..2]).scope,
+        checkpoint_of(DB, &with(ledger("active", -1, false))).scope,
         ScopeState::Pending
     );
-    let mut first = all("active", true);
-    first[0] = row("kg_events", "active", -1, true);
-    assert_eq!(checkpoint_of(&first).scope, ScopeState::Pending);
+    assert_eq!(
+        checkpoint_of(DB, &with(ledger("active", 5, true))).scope,
+        ScopeState::Pending
+    );
 }
 
 /// CC-6 (review BLOCKING-1): only an unheard authority read (it left and its

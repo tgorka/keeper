@@ -33,7 +33,7 @@ fn owner_as(domain: &str, client: &str) -> (Arc<FakeReplica>, GraphRequests) {
             path: PathBuf::from("/nowhere"),
             client_id: None,
             link: None,
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: None,
         })
         .expect("opens");

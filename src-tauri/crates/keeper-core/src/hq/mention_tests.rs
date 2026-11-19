@@ -32,7 +32,7 @@ fn open(dir: &Path, database: &str) -> Source {
         path: replica_path(dir, database),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -436,6 +436,7 @@ fn refuse_on_the_server(w: World, commit: &str, code: &str) -> World {
             op: op["op"].as_str().unwrap_or("upsert").to_owned(),
             base_version: None,
             values: op["values"].as_object().cloned(),
+            insert: false,
         })
         .collect();
     let results = vec![CommitOperationOutcome::Error {
@@ -787,7 +788,7 @@ impl keeper_ports::Replica for Counting {
             .fetch_add(covered.0.len(), std::sync::atomic::Ordering::SeqCst);
         Ok(covered)
     }
-    fn subscribe(&self, s: keeper_ports::Subscription) -> Result<(), keeper_ports::ReplicaError> {
+    fn subscribe(&self, s: keeper_ports::Unit) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(
@@ -850,8 +851,11 @@ impl keeper_ports::Replica for Counting {
     ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
         self.inner.granted(table, variable)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, keeper_ports::ReplicaError> {
-        self.inner.revoked_units(table)
+    fn revoked_units(
+        &self,
+        base: &keeper_ports::WindowBase,
+    ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
+        self.inner.revoked_units(base)
     }
     fn upload_refusals(&self) -> Vec<keeper_ports::UploadRefusal> {
         self.inner.upload_refusals()

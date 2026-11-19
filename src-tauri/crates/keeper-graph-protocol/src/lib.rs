@@ -42,7 +42,10 @@ use std::fmt;
 pub const CONTRACT_VERSION: u32 = 1;
 /// The Syncular schema version of the graph tables a build reads and
 /// writes: 6 added the graph, 7 its stable content (`kg_contents`), 8 its
-/// proposals and reviews (`kg_proposals`, `kg_reviews`).
+/// proposals and reviews (`kg_proposals`, `kg_reviews`). Schema 9 changed
+/// no graph table — only which scope variable carries the ledger
+/// (`scope::HISTORY_VARIABLE`, story 115.6) — so the tables, and the
+/// worker protocol that names their version, stay at 8.
 pub const SCHEMA_VERSION: u32 = 8;
 /// The query profile [`profile`] admits and whose symbols [`symbol`] maps.
 pub const PROFILE: &str = "KG-Cypher/1";

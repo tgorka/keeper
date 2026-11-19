@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keeper_graph::admission::{Admission, Process};
-use keeper_graph::client::{subscriptions, GraphClient};
+use keeper_graph::client::{units, GraphClient};
 use keeper_graph::outcome::GraphOutcome;
 use keeper_graph::protocol::change::{ChangeOp, NodeFields};
 use keeper_graph::protocol::worker::InspectEntity;
@@ -52,7 +52,7 @@ fn device(index: u8, database: &str) -> Source {
             base_url: format!("{}/{database}", env("KEEPER_HQ_LIVE_URL")),
             token: env(&format!("KEEPER_HQ_LIVE_TOKEN_{index}")),
         }),
-        subscriptions: subscriptions(database, &actor, &client),
+        units: units(database, &actor, &client),
         watch_presence: None,
     })
     .expect("a real replica");

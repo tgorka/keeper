@@ -48,7 +48,7 @@ fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqE
     let (rows, pending) = source.replica.query_covered(
         "SELECT model, effort, updated_at_ms, _sync_version AS version FROM session_settings WHERE session_id = ?1",
         &[session.into()],
-        &WindowBase { table: "session_settings".to_owned(), variable: "session".to_owned(), fixed_scopes: Vec::new() },
+        &WindowBase::along("session"),
         &[session.to_owned()],
     ).map_err(sentence)?;
     if !pending.is_empty() {
@@ -895,7 +895,7 @@ mod tests {
             path: path.clone(),
             client_id: Some("dev1".to_owned()),
             link: None,
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: None,
         })
         .expect("replica");
@@ -959,21 +959,15 @@ mod tests {
             .expect("seed");
         source
             .replica
-            .set_window(
-                &WindowBase {
-                    table: "session_settings".to_owned(),
-                    variable: "session".to_owned(),
-                    fixed_scopes: Vec::new(),
-                },
-                &["dev1.1".to_owned()],
-            )
+            .set_window(&WindowBase::along("session"), &["dev1.1".to_owned()])
             .expect("window");
         if complete {
             // The real adapter reads the same persisted completion that a server round writes.
             // Offline fixture only: no network or fake query answers.
             rusqlite::Connection::open(path).expect("db").execute(
-                "UPDATE _syncular_subscriptions SET state_json = ?1 WHERE tbl = 'session_settings'",
-                [json!({"requested":{"session":["dev1.1"]}, "effectiveScopes":{"session":["dev1.1"]}, "status":"active", "cursor":0}).to_string()],
+                "UPDATE _syncular_units SET status = 'active', cursor = 0, bootstrap_state = NULL \
+                 WHERE json_extract(scopes, '$.session') = ?1",
+                ["dev1.1"],
             ).expect("complete settings window");
         }
         (dir, source)
@@ -1242,6 +1236,7 @@ mod tests {
             values: json!({"session_id": "dev1.1", "model": "alternate"})
                 .as_object()
                 .cloned(),
+            insert: false,
         }];
         let results = vec![CommitOperationOutcome::Error {
             rejection: RejectionRecord {
@@ -2049,20 +2044,14 @@ mod tests {
         let ids: Vec<String> = sessions.iter().map(|s| (*s).to_owned()).collect();
         source
             .replica
-            .set_window(
-                &WindowBase {
-                    table: TABLE.to_owned(),
-                    variable: "session".to_owned(),
-                    fixed_scopes: Vec::new(),
-                },
-                &ids,
-            )
+            .set_window(&WindowBase::along("session"), &ids)
             .expect("window");
         rusqlite::Connection::open(dir.path().join("settings.sqlite"))
             .expect("db")
             .execute(
-                "UPDATE _syncular_subscriptions SET state_json = ?1 WHERE tbl = 'session_settings'",
-                [json!({"requested":{"session":ids}, "effectiveScopes":{"session":ids}, "status":"active", "cursor":0}).to_string()],
+                "UPDATE _syncular_units SET status = 'active', cursor = 0, bootstrap_state = NULL \
+                 WHERE json_extract(scopes, '$.session') IN (SELECT value FROM json_each(?1))",
+                [json!(ids).to_string()],
             )
             .expect("complete settings window");
     }

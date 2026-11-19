@@ -298,7 +298,7 @@ impl SearchIndex {
         wait: Duration,
         expired: Option<impl FnMut() -> bool + Send + 'static>,
     ) -> Result<Self, SearchIndexError> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(wait)?;
         conn.progress_handler(STEPS_PER_CHECK, expired)?;
         // A value is admitted by the length SQLite stores for it, which is

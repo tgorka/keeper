@@ -237,7 +237,7 @@ impl Replica for FakeReplica {
     ) -> Result<Covered, ReplicaError> {
         Ok((self.query(sql, params)?, Vec::new()))
     }
-    fn subscribe(&self, _: Subscription) -> Result<(), ReplicaError> {
+    fn subscribe(&self, _: Unit) -> Result<(), ReplicaError> {
         Ok(())
     }
     fn set_window(&self, _: &WindowBase, _: &[String]) -> Result<(), ReplicaError> {
@@ -306,7 +306,7 @@ impl Replica for FakeReplica {
     fn granted(&self, _: &str, _: &str) -> Result<Vec<String>, ReplicaError> {
         Ok(Vec::new())
     }
-    fn revoked_units(&self, _: &str) -> Result<Vec<String>, ReplicaError> {
+    fn revoked_units(&self, _: &WindowBase) -> Result<Vec<String>, ReplicaError> {
         Ok(Vec::new())
     }
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {

@@ -62,69 +62,81 @@ pub struct Checkpoint {
     pub cursor: Option<i64>,
 }
 
-/// The subscriptions a projection reads from: the events, their operations
-/// and the head.
-pub const HISTORY_TABLES: [&str; 3] = ["kg_events", "kg_event_ops", "kg_head"];
+/// The tables a projection reads from: the graph's ledger (the events,
+/// their operations, the head and the reviews), all under `kg_history`.
+pub use crate::protocol::scope::HISTORY_TABLES;
+use crate::protocol::scope::HISTORY_VARIABLE;
 
-/// The state of every history subscription of the replica: its table,
-/// status, cursor and whether its effective `kg_graph` scope holds `?1`.
-pub(crate) const SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
-    json_extract(s.state_json, '$.status') AS status, \
-    json_extract(s.state_json, '$.cursor') AS cursor, \
-    EXISTS (SELECT 1 FROM json_each(json_extract(s.state_json, '$.effectiveScopes.kg_graph')) v \
-      WHERE v.value = ?1) AS holds \
-  FROM _syncular_subscriptions s WHERE s.tbl IN ('kg_events', 'kg_event_ops', 'kg_head')";
+/// Every unit the replica holds, with its scope map, status, the cursor it
+/// has pulled to (its own while it bootstraps or once it is no longer live,
+/// the replica's while it is live), whether a bootstrap is under way, and
+/// the echo of its last pull. syncular-client keeps them in
+/// `_syncular_units`; the replica cursor in `_syncular_meta`.
+pub(crate) const UNITS: &str = "SELECT u.scopes AS scopes, u.status AS status, \
+    COALESCE(u.cursor, (SELECT CAST(m.value AS INTEGER) FROM _syncular_meta m \
+      WHERE m.key = 'replicaCursor')) AS cursor, \
+    u.bootstrap_state IS NOT NULL AS bootstrapping, u.echo AS echo \
+  FROM _syncular_units u";
 
-/// The checkpoint of rows of [`SUBSCRIPTIONS`]: revoked when any history
-/// subscription is revoked (or no longer holds the domain once pulled),
-/// pending until each of the three is active with a cursor, granted with
-/// the lowest cursor otherwise.
-pub(crate) fn checkpoint_of(rows: &[Map<String, Value>]) -> Checkpoint {
-    let mut lowest: Option<i64> = None;
-    let mut pending = false;
-    for table in HISTORY_TABLES {
-        let mine: Vec<_> = rows
-            .iter()
-            .filter(|r| r.get("tbl").and_then(Value::as_str) == Some(table))
-            .collect();
-        if mine.is_empty() {
-            pending = true;
-        }
-        for row in mine {
-            let status = row.get("status").and_then(Value::as_str);
-            let cursor = row.get("cursor").and_then(Value::as_i64);
-            let holds = matches!(row.get("holds"), Some(Value::Bool(true)))
-                || row.get("holds").and_then(Value::as_i64) == Some(1);
-            match (status, cursor) {
-                (Some("revoked"), _) => {
-                    return Checkpoint {
-                        scope: ScopeState::Revoked,
-                        cursor: None,
-                    }
-                }
-                (Some("active"), Some(c)) if c >= 0 => {
-                    if !holds {
-                        return Checkpoint {
-                            scope: ScopeState::Revoked,
-                            cursor: None,
-                        };
-                    }
-                    lowest = Some(lowest.map_or(c, |l| l.min(c)));
-                }
-                _ => pending = true,
-            }
-        }
+/// A unit row's scope map; `None` when it does not parse.
+fn unit_scopes(row: &Map<String, Value>) -> Option<Map<String, Value>> {
+    match row.get("scopes") {
+        Some(Value::String(text)) => serde_json::from_str(text).ok(),
+        Some(Value::Object(scopes)) => Some(scopes.clone()),
+        _ => None,
     }
-    if pending {
-        Checkpoint {
-            scope: ScopeState::Pending,
+}
+
+/// Whether a unit row's last pull revoked `table` (its echo's record).
+fn echo_revoked(row: &Map<String, Value>, table: &str) -> bool {
+    let echo: Option<Vec<Value>> = match row.get("echo") {
+        Some(Value::String(text)) => serde_json::from_str(text).ok(),
+        Some(Value::Array(echo)) => Some(echo.clone()),
+        _ => None,
+    };
+    echo.into_iter().flatten().any(|record| {
+        record.get("table").and_then(Value::as_str) == Some(table)
+            && record.get("status").and_then(Value::as_str) == Some("revoked")
+    })
+}
+
+/// The checkpoint of rows of [`UNITS`] for `domain`'s ledger unit
+/// (`kg_history` = `domain`): revoked when the unit is revoked or its last
+/// pull revoked any ledger table, pending until it is active and its first
+/// pull is done, granted at its cursor otherwise.
+pub(crate) fn checkpoint_of(domain: &str, rows: &[Map<String, Value>]) -> Checkpoint {
+    let pending = Checkpoint {
+        scope: ScopeState::Pending,
+        cursor: None,
+    };
+    let ledger = rows.iter().find(|row| {
+        unit_scopes(row).is_some_and(|scopes| {
+            scopes.len() == 1
+                && scopes.get(HISTORY_VARIABLE).and_then(Value::as_str) == Some(domain)
+        })
+    });
+    let Some(row) = ledger else {
+        return pending;
+    };
+    let revoked = row.get("status").and_then(Value::as_str) == Some("revoked")
+        || HISTORY_TABLES.iter().any(|table| echo_revoked(row, table));
+    if revoked {
+        return Checkpoint {
+            scope: ScopeState::Revoked,
             cursor: None,
-        }
-    } else {
-        Checkpoint {
+        };
+    }
+    let bootstrapping = matches!(row.get("bootstrapping"), Some(Value::Bool(true)))
+        || row.get("bootstrapping").and_then(Value::as_i64) == Some(1);
+    match (
+        row.get("status").and_then(Value::as_str),
+        row.get("cursor").and_then(Value::as_i64),
+    ) {
+        (Some("active"), Some(cursor)) if cursor >= 0 && !bootstrapping => Checkpoint {
             scope: ScopeState::Granted,
-            cursor: lowest,
-        }
+            cursor: Some(cursor),
+        },
+        _ => pending,
     }
 }
 
@@ -136,10 +148,13 @@ pub const MAX_BATCH_EVENTS: usize = 1_024;
 /// exactly (`?2` is the JSON array of their decimal texts), so every lookup
 /// seeks the `(graph, graph_seq)` index and the ops' `(event_id, ordinal)`
 /// index; a range over a cast text sequence would scan the whole graph's
-/// history on every batch.
+/// history on every batch. A subquery's value reaches `json_object` as
+/// text, without the JSON subtype (the SQLite that libsqlite3-sys 0.39
+/// bundles keeps to that strictly), so each array is passed through
+/// `json()` again to embed it as an array rather than a string.
 pub(crate) const BATCH: &str = "SELECT json_object(\
     'head', (SELECT graph_seq FROM kg_head WHERE id = ?1), \
-    'events', (SELECT json_group_array(json(e.row)) FROM (SELECT json_object(\
+    'events', json((SELECT json_group_array(json(e.row)) FROM (SELECT json_object(\
         'id', id, 'graph', graph, 'graph_seq', graph_seq, 'descriptor', descriptor, \
         'request_id', request_id, 'request_digest', request_digest, 'actor_id', actor_id, \
         'client_id', client_id, 'origin_class', origin_class, 'origin_actor', origin_actor, \
@@ -147,14 +162,14 @@ pub(crate) const BATCH: &str = "SELECT json_object(\
         'reverses_event_id', reverses_event_id, 'event_time_ms', event_time_ms, \
         'recorded_at_ms', recorded_at_ms, 'op_count', op_count, 'delta_digest', delta_digest\
       ) AS row FROM kg_events WHERE graph = ?1 \
-        AND graph_seq IN (SELECT value FROM json_each(?2))) e), \
-    'ops', (SELECT json_group_array(json(o.row)) FROM (SELECT json_object(\
+        AND graph_seq IN (SELECT value FROM json_each(?2))) e)), \
+    'ops', json((SELECT json_group_array(json(o.row)) FROM (SELECT json_object(\
         'event_id', p.event_id, 'ordinal', p.ordinal, 'entity_type', p.entity_type, \
         'entity_id', p.entity_id, 'operation', p.operation, \
         'before_revision', p.before_revision, 'after_revision', p.after_revision, \
         'before_value', p.before_value, 'after_value', p.after_value\
       ) AS row FROM kg_event_ops p WHERE p.event_id IN (SELECT id FROM kg_events \
-        WHERE graph = ?1 AND graph_seq IN (SELECT value FROM json_each(?2)))) o)\
+        WHERE graph = ?1 AND graph_seq IN (SELECT value FROM json_each(?2)))) o))\
   ) AS batch";
 
 /// One read of a replica's file: `sql` with `params`, its rows. keeper's is
@@ -164,56 +179,79 @@ pub trait Query: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceErr
 impl<F: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError>> Query for F {}
 
 /// [`GraphSource::checkpoint`] of `domain` over any replica `query`: the
-/// state of its history subscriptions ([`checkpoint_of`]).
+/// state of its ledger unit ([`checkpoint_of`]).
 pub fn checkpoint_with(domain: &str, query: impl Query) -> Result<Checkpoint, SourceError> {
-    let rows = query(SUBSCRIPTIONS, &[Value::from(domain)])?;
-    Ok(checkpoint_of(&rows))
+    let rows = query(UNITS, &[])?;
+    Ok(checkpoint_of(domain, &rows))
 }
 
-/// The status of every replica subscription on one of the tables `?1` (a
-/// JSON array of table names): its table and status.
-pub(crate) const TABLE_SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
-    json_extract(s.state_json, '$.status') AS status \
-  FROM _syncular_subscriptions s WHERE s.tbl IN (SELECT value FROM json_each(?1))";
-
-/// How far a server scope revocation reached the replica's graph
-/// subscriptions (112.1 CC-7, CC-8): the Syncular client deletes a revoked
-/// subscription's scope rows in the transaction that records it revoked.
+/// How far a server scope revocation reached the replica's graph units
+/// (112.1 CC-7, CC-8): the Syncular client deletes a revoked unit's rows in
+/// the transaction that records it revoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Revocation {
-    /// No subscription of these tables is revoked.
+    /// No unit covering these tables is revoked.
     None,
     /// Some are revoked: a revocation signal, its purge not complete.
     Partial,
-    /// Every one of these tables has a subscription, and every one is
-    /// revoked: their rows are purged.
+    /// Every one of these tables is covered by a unit, and every unit
+    /// covering it is revoked: their rows are purged.
     Purged,
 }
 
-/// [`Revocation`] of the subscriptions of `tables` over any replica
-/// `query`. A table with no subscription is not purged (fail closed).
+/// [`Revocation`] of the units covering `tables` over any replica `query`.
+/// A table no unit covers is not purged (fail closed).
 pub fn revocation_with(tables: &[&str], query: impl Query) -> Result<Revocation, SourceError> {
-    let names =
-        serde_json::to_string(tables).map_err(|_| SourceError::Unreadable("tables".into()))?;
-    let rows = query(TABLE_SUBSCRIPTIONS, &[Value::from(names)])?;
+    let rows = query(UNITS, &[])?;
     Ok(revocation_of(tables, &rows))
 }
 
-/// [`Revocation`] of the rows of [`TABLE_SUBSCRIPTIONS`] for `tables`.
+/// The scope variable of a graph table, receipts and proposals included.
+fn variable_of(table: &str) -> Option<&'static str> {
+    use crate::protocol::scope::{
+        CLIENT_VARIABLE, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
+        STATE_TABLES,
+    };
+    if HISTORY_TABLES.contains(&table) {
+        Some(HISTORY_VARIABLE)
+    } else if STATE_TABLES.contains(&table) {
+        Some(GRAPH_VARIABLE)
+    } else if table == RECEIPT_TABLE {
+        Some(CLIENT_VARIABLE)
+    } else if table == PROPOSAL_TABLE {
+        Some(PROPOSAL_VARIABLE)
+    } else {
+        None
+    }
+}
+
+/// [`Revocation`] of the rows of [`UNITS`] for `tables`: a unit covers a
+/// graph table when its scope map is that table's one variable; it stands
+/// revoked for it when the unit is, or its last pull revoked the table.
 pub(crate) fn revocation_of(tables: &[&str], rows: &[Map<String, Value>]) -> Revocation {
-    let revoked =
-        |row: &Map<String, Value>| row.get("status").and_then(Value::as_str) == Some("revoked");
-    if !rows.iter().any(revoked) {
+    let covering = |table: &str| -> Vec<bool> {
+        let Some(variable) = variable_of(table) else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|row| {
+                unit_scopes(row)
+                    .is_some_and(|scopes| scopes.len() == 1 && scopes.contains_key(variable))
+            })
+            .map(|row| {
+                row.get("status").and_then(Value::as_str) == Some("revoked")
+                    || echo_revoked(row, table)
+            })
+            .collect()
+    };
+    let per_table: Vec<Vec<bool>> = tables.iter().map(|table| covering(table)).collect();
+    if !per_table.iter().flatten().any(|revoked| *revoked) {
         return Revocation::None;
     }
-    let purged = tables.iter().all(|table| {
-        let mine: Vec<_> = rows
-            .iter()
-            .filter(|row| row.get("tbl").and_then(Value::as_str) == Some(table))
-            .collect();
-        !mine.is_empty() && mine.into_iter().all(revoked)
-    });
-    if purged {
+    if per_table
+        .iter()
+        .all(|units| !units.is_empty() && units.iter().all(|revoked| *revoked))
+    {
         Revocation::Purged
     } else {
         Revocation::Partial

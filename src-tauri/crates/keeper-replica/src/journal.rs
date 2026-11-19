@@ -25,6 +25,7 @@ pub fn journal_refused(
             op: (*op).to_owned(),
             base_version: None,
             values: values.as_object().cloned(),
+            insert: false,
         })
         .collect();
     let results = vec![CommitOperationOutcome::Error {

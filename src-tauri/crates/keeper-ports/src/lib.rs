@@ -12,6 +12,7 @@
 //! in it, and [`server`], the agents server's address grammar every
 //! replica path and request reads the same way.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,22 +47,46 @@ pub enum RowOp {
     },
 }
 
-/// A named subscription: `table`'s rows under `scopes` (each a variable and
-/// the values requested).
+/// A unit (SPEC §4.1): one value per scope variable. It covers every table
+/// that declares all of its variables; its id is derived from the map.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Subscription {
-    pub id: String,
-    pub table: String,
-    pub scopes: Vec<(String, Vec<String>)>,
+pub struct Unit {
+    pub scopes: BTreeMap<String, String>,
 }
 
-/// A windowed subscription's base (SPEC §4.8): `table` subscribed along
-/// `variable`, one unit per value, with `fixed_scopes` shared by every unit.
+impl Unit {
+    /// The unit of one variable's one value.
+    pub fn of(variable: &str, value: &str) -> Unit {
+        Unit {
+            scopes: BTreeMap::from([(variable.to_owned(), value.to_owned())]),
+        }
+    }
+}
+
+/// A window's base (SPEC §4.8): one unit per value of `variable`, each with
+/// `fixed_scopes` beside it. A base names no table: each unit covers every
+/// table declaring its variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowBase {
-    pub table: String,
     pub variable: String,
-    pub fixed_scopes: Vec<(String, Vec<String>)>,
+    pub fixed_scopes: BTreeMap<String, String>,
+}
+
+impl WindowBase {
+    /// The base along `variable` alone.
+    pub fn along(variable: &str) -> WindowBase {
+        WindowBase {
+            variable: variable.to_owned(),
+            fixed_scopes: BTreeMap::new(),
+        }
+    }
+
+    /// The unit of `value` in this window.
+    pub fn unit(&self, value: &str) -> Unit {
+        let mut scopes = self.fixed_scopes.clone();
+        scopes.insert(self.variable.clone(), value.to_owned());
+        Unit { scopes }
+    }
 }
 
 /// The units a window holds, and those whose first pull has not completed —
@@ -111,10 +136,10 @@ pub struct ReplicaSpec {
     /// device alone, which keeps the id it minted the first time.
     pub client_id: Option<String>,
     pub link: Option<Link>,
-    /// Subscriptions the replica holds from its first round, registered
-    /// before the owner touches the network.
-    pub subscriptions: Vec<Subscription>,
-    /// A presence key one of those subscriptions registers (`dir:<database>`)
+    /// Units the replica holds from its first round, registered before the
+    /// owner touches the network.
+    pub units: Vec<Unit>,
+    /// A presence key one of those units registers (`dir:<database>`)
     /// whose peers already present the replica asks after on every new
     /// socket: [`ReplicaState::presence_known`].
     pub watch_presence: Option<String>,
@@ -460,8 +485,9 @@ pub trait Replica: Send + Sync {
         base: &WindowBase,
         units: &[String],
     ) -> Result<Covered, ReplicaError>;
-    /// Hold `subscription`, persisted under its id.
-    fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError>;
+    /// Hold `unit` (registering it again changes nothing; a revoked unit is
+    /// asked for afresh).
+    fn subscribe(&self, unit: Unit) -> Result<(), ReplicaError>;
     /// Set a window's units: units added are subscribed, units removed are
     /// evicted (rows the outbox still holds stay). Persisted with the replica.
     fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError>;
@@ -500,17 +526,17 @@ pub trait Replica: Send + Sync {
     /// The standing refusals of commits written here that wrote a row of
     /// `table`, newest first, with what each wrote. Answers from the file.
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
-    /// The values of `variable` the server granted this replica's active
-    /// subscriptions of `table` on their last pull (their effective scopes):
-    /// what it allows, never what was only asked for. A unit asked for and
-    /// not granted (revoked), or not pulled yet, is absent. Answers from the
+    /// The values of `variable` the server granted this replica's active,
+    /// pulled units covering `table` (their effective scopes for it): what
+    /// it allows, never what was only asked for. A unit asked for and not
+    /// granted (revoked), or not pulled yet, is absent. Answers from the
     /// file.
     fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError>;
-    /// The units of `table`'s window whose subscription the server revoked.
+    /// The values of `base`'s window whose unit the server revoked.
     /// syncular-client never asks the server for such a unit again while it
     /// stays in the window; taking it out and putting it back
     /// ([`Replica::set_window`]) subscribes it afresh. Answers from the file.
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError>;
+    fn revoked_units(&self, base: &WindowBase) -> Result<Vec<String>, ReplicaError>;
     /// The server's standing refusals of uploads of blobs commits written
     /// here reference, each resolved ([`UploadRefusal`]). Answers from what
     /// the replica kept beside its file, never the network.

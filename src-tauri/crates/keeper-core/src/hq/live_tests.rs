@@ -377,7 +377,7 @@ fn world(reads_trace: bool) -> World {
         path: dir.path().join("alpha.sqlite"),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");

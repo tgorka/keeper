@@ -2,24 +2,33 @@
 //!
 //! | tables | scope variable | value |
 //! | --- | --- | --- |
-//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_reviews` | `kg_graph` | the database's (domain's) name |
+//! | `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` (the state) | `kg_graph` | the database's (domain's) name |
+//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` (the ledger) | `kg_history` | the database's (domain's) name |
 //! | `kg_receipts` | `kg_client` | [`client_scope`] of the requesting actor and client |
 //! | `kg_proposals` | `kg_proposal` | the proposer's actor id: a replica subscribes to its own actor's only |
 //!
-//! No other variable reaches these tables. An enumerated reviewer reads a
-//! proposal through an authorised remote query, never through `kg_proposal`. Bindings, contexts, session
-//! sources, authority epochs and reference indexes are the server's own
-//! tables and have no scope at all.
+//! The state and the ledger were one variable, `kg_graph`, through schema
+//! version 8; version 9 (story 115.6) puts the ledger under `kg_history`, so a
+//! replica holds the state without the history unless it asks for both.
+//! `kg_head` names the event it points at, and a reference never crosses a
+//! scope boundary, so the head is the ledger's. No other variable reaches
+//! these tables. An enumerated reviewer reads a proposal through an
+//! authorised remote query, never through `kg_proposal`. Bindings, contexts,
+//! session sources, authority epochs and reference indexes are the server's
+//! own tables and have no scope at all.
 
-/// The `kg_graph` scope variable.
+/// The `kg_graph` scope variable: the graph's state.
 pub const GRAPH_VARIABLE: &str = "kg_graph";
+/// The `kg_history` scope variable: the graph's ledger.
+pub const HISTORY_VARIABLE: &str = "kg_history";
 /// The `kg_client` scope variable.
 pub const CLIENT_VARIABLE: &str = "kg_client";
 
 /// The `kg_proposal` scope variable.
 pub const PROPOSAL_VARIABLE: &str = "kg_proposal";
 
-/// The tables scoped by `kg_graph`, in bootstrap order.
+/// Every table whose scope value is the domain's name, in bootstrap order:
+/// [`HISTORY_TABLES`] and [`STATE_TABLES`] together.
 pub const GRAPH_TABLES: [&str; 9] = [
     "kg_events",
     "kg_event_ops",
@@ -30,6 +39,16 @@ pub const GRAPH_TABLES: [&str; 9] = [
     "kg_node_tags",
     "kg_contents",
     "kg_reviews",
+];
+/// The ledger: the tables scoped by `kg_history`.
+pub const HISTORY_TABLES: [&str; 4] = ["kg_events", "kg_event_ops", "kg_head", "kg_reviews"];
+/// The state: the tables scoped by `kg_graph`.
+pub const STATE_TABLES: [&str; 5] = [
+    "kg_nodes",
+    "kg_edges",
+    "kg_tags",
+    "kg_node_tags",
+    "kg_contents",
 ];
 /// The table scoped by `kg_client`.
 pub const RECEIPT_TABLE: &str = "kg_receipts";

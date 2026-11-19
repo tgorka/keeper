@@ -91,21 +91,10 @@ use crate::hq::vm::{
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
 use keeper_ports::server::ServerUrl;
-use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Subscription};
+use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Unit};
 
 /// The keychain item of a server's pairing: this prefix and the base URL.
 const KEYCHAIN_PREFIX: &str = "agents-server/";
-
-/// The directory subscriptions every linked replica holds: the database's
-/// actors and clients (the person's devices among them), by `dir`. Beside
-/// them each holds the person's memberships (`memberships`), from which the
-/// Agents window's windows follow ([`window`]), and the person's choice of
-/// which instance answers each agent (`preferences`, [`instances`]).
-const DIRECTORY: [(&str, &str); 3] = [
-    ("directoryActors", "actors"),
-    ("directoryClients", "clients"),
-    ("directoryAgentProfiles", "agent_profiles"),
-];
 
 /// The longest wait before a refused database is tried again.
 const MAX_REFUSAL_BACKOFF: Duration = Duration::from_secs(600);
@@ -324,7 +313,7 @@ pub struct Hq {
     /// The sessions open on screen, and their pages.
     views: Mutex<HashMap<sessions::AgentSessionRef, timeline::Opened>>,
     /// The units each replica's windows were last set to.
-    windows: Mutex<HashMap<(String, &'static str), Vec<String>>>,
+    windows: Mutex<HashMap<(String, String), Vec<String>>>,
     /// When each database's revoked grants units were last asked for again
     /// ([`grants::reask_revoked`]); emptied when the replicas restart.
     grants_asked: Mutex<HashMap<String, std::time::Instant>>,
@@ -580,25 +569,14 @@ impl Hq {
                 base_url: server.mount(database),
                 token: pairing.token.clone(),
             }),
-            subscriptions: if linked {
-                DIRECTORY
-                    .iter()
-                    .map(|(id, table)| Subscription {
-                        id: (*id).to_owned(),
-                        table: (*table).to_owned(),
-                        scopes: vec![("dir".to_owned(), vec![database.to_owned()])],
-                    })
-                    .chain(std::iter::once(Subscription {
-                        id: "memberships".to_owned(),
-                        table: "session_members".to_owned(),
-                        scopes: vec![("member".to_owned(), vec![pairing.actor_id.clone()])],
-                    }))
-                    .chain(std::iter::once(Subscription {
-                        id: "preferences".to_owned(),
-                        table: "instance_prefs".to_owned(),
-                        scopes: vec![("actor".to_owned(), vec![pairing.actor_id.clone()])],
-                    }))
-                    .collect()
+            // The directory (actors, clients, agent profiles), this actor's
+            // memberships and its preferences: one unit each.
+            units: if linked {
+                vec![
+                    Unit::of("dir", database),
+                    Unit::of("member", &pairing.actor_id),
+                    Unit::of("actor", &pairing.actor_id),
+                ]
             } else {
                 Vec::new()
             },
@@ -756,7 +734,7 @@ impl Hq {
                 path: local,
                 client_id: None,
                 link: None,
-                subscriptions: Vec::new(),
+                units: Vec::new(),
                 watch_presence: None,
             });
         }

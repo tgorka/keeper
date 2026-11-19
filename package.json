@@ -95,9 +95,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.2",
-    "@syncular/core": "0.32.1",
-    "@syncular/server": "0.32.1",
-    "@syncular/typegen": "0.32.1",
+    "@syncular/core": "0.97.0",
+    "@syncular/server": "0.97.0",
+    "@syncular/typegen": "0.97.0",
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

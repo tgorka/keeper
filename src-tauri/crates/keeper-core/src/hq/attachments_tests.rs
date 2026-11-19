@@ -33,7 +33,7 @@ fn spec(dir: &Path) -> ReplicaSpec {
         path: dir.join("alpha.sqlite"),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     }
 }
@@ -761,6 +761,7 @@ fn journal_refusal(dir: &Path, commit: &str, ops: &[(&str, Value)], code: &str) 
             op: "upsert".to_owned(),
             base_version: None,
             values: values.as_object().cloned(),
+            insert: false,
         })
         .collect();
     let results = vec![CommitOperationOutcome::Error {

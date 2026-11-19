@@ -1,37 +1,50 @@
 {
-  "formatVersion": 2,
+  "formatVersion": 3,
   "migrations": [
     {
       "name": "0001_initial",
-      "sha256": "62ca56a80d227c1e53e7e564b049a9453b546a04c83f17de67034de6396750e5"
+      "sha256": "62ca56a80d227c1e53e7e564b049a9453b546a04c83f17de67034de6396750e5",
+      "schemaVersion": 1
     },
     {
       "name": "0002_session_trust",
-      "sha256": "c7b8cb3bdd61e7199aa178b0b639dbc412de77c51a044b3830c8b7bdaf2a6edc"
+      "sha256": "c7b8cb3bdd61e7199aa178b0b639dbc412de77c51a044b3830c8b7bdaf2a6edc",
+      "schemaVersion": 2
     },
     {
       "name": "0003_agent_profile_tools",
-      "sha256": "cfbe97c7f13cf5b4f3bb7c12f776a71914c5d96f14bfc6b1cdedad2c1f1558d0"
+      "sha256": "cfbe97c7f13cf5b4f3bb7c12f776a71914c5d96f14bfc6b1cdedad2c1f1558d0",
+      "schemaVersion": 3
     },
     {
       "name": "0004_grants_settings_drives",
-      "sha256": "5d82cb2d4c59120f429537ba3fc16040050418f3ab6fccf9991f60d3987d06c2"
+      "sha256": "5d82cb2d4c59120f429537ba3fc16040050418f3ab6fccf9991f60d3987d06c2",
+      "schemaVersion": 4
     },
     {
       "name": "0005_session_drive_ticks",
-      "sha256": "3c527ed867f6cbe5b7fe16525d902a2d91cdedd4726e108c19a270b85c38f653"
+      "sha256": "3c527ed867f6cbe5b7fe16525d902a2d91cdedd4726e108c19a270b85c38f653",
+      "schemaVersion": 5
     },
     {
       "name": "0006_knowledge_graph",
-      "sha256": "5a227272f5124d5dd80936d6c05d9e2b198f41dd2192d8859d8512ffdc7d1c7c"
+      "sha256": "5a227272f5124d5dd80936d6c05d9e2b198f41dd2192d8859d8512ffdc7d1c7c",
+      "schemaVersion": 6
     },
     {
       "name": "0007_knowledge_graph_contents",
-      "sha256": "08ddca222e8214cd2d2eb6132b20d1cbdb69ab0a0ffc36f2bb8b1d330ed355bf"
+      "sha256": "08ddca222e8214cd2d2eb6132b20d1cbdb69ab0a0ffc36f2bb8b1d330ed355bf",
+      "schemaVersion": 7
     },
     {
       "name": "0008_knowledge_graph_review",
-      "sha256": "8da0350aa0e8277211ccdf717df39aee06e43e326e9a0dee733948280219d267"
+      "sha256": "8da0350aa0e8277211ccdf717df39aee06e43e326e9a0dee733948280219d267",
+      "schemaVersion": 8
+    },
+    {
+      "name": "0009_knowledge_graph_history",
+      "sha256": "adb538368d72536d4dbf8fcefabe904e798b5499a54aa863c3c71d1d4c87ac81",
+      "schemaVersion": 9
     }
   ],
   "head": {

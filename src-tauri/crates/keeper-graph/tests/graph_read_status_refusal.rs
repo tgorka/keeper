@@ -121,7 +121,7 @@ fn read_status(answer: Answer) -> Result<(), QueryError> {
             base_url: format!("{base}/tgdrive"),
             token: "t".to_owned(),
         }),
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");

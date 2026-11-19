@@ -18,7 +18,7 @@ use crate::hq::sessions::{self, object};
 use keeper_ports::Source;
 use keeper_ports::{
     Covered, Delivery, Peer, RefusedCommit, Rejection, Replica, ReplicaError, ReplicaSpec,
-    ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase, WindowState,
+    ReplicaState, RowOp, RowWrites, Unit, UploadRefusal, WindowBase, WindowState,
 };
 use keeper_replica::SyncularReplica;
 
@@ -159,7 +159,7 @@ impl Replica for Server {
     ) -> Result<Covered, ReplicaError> {
         self.inner.query_covered(sql, params, base, units)
     }
-    fn subscribe(&self, s: Subscription) -> Result<(), ReplicaError> {
+    fn subscribe(&self, s: Unit) -> Result<(), ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
@@ -229,8 +229,8 @@ impl Replica for Server {
     fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
         self.inner.granted(table, variable)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError> {
-        self.inner.revoked_units(table)
+    fn revoked_units(&self, base: &keeper_ports::WindowBase) -> Result<Vec<String>, ReplicaError> {
+        self.inner.revoked_units(base)
     }
     fn upload_refusals(&self) -> Vec<UploadRefusal> {
         self.inner.upload_refusals()
@@ -418,7 +418,7 @@ fn world_with(args: Value, digest: Option<&str>) -> World {
         path: dir.path().join("tgdrive.sqlite"),
         client_id: Some("ana.dev".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");

@@ -376,9 +376,14 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 // Windows
 // ---------------------------------------------------------------------------
 
-/// The windows a replica holds, each along one scope variable. Every held
-/// session's members are held beside its row, so the People sheet reads
-/// who else is in it.
+/// The tables the windows read, each with the scope variable it is held
+/// along. Every held session's members are held beside its row, so the
+/// People sheet reads who else is in it.
+///
+/// A window is a variable's, not a table's (SPEC §4.8): the unit of one
+/// value covers every table declaring that variable, so the tables of one
+/// variable share one window, whose units are the union of what [`plan`]
+/// asks for each ([`windows`]).
 pub const WINDOWS: [(&str, &str); 13] = [
     ("sessions", "session"),
     ("session_members", "session"),
@@ -396,16 +401,30 @@ pub const WINDOWS: [(&str, &str); 13] = [
     ("standing_grants", "person_agent"),
 ];
 
+/// The window `table` is read through.
 pub fn window(table: &str) -> WindowBase {
     let variable = WINDOWS
         .iter()
         .find(|(t, _)| *t == table)
         .map_or("session", |(_, v)| *v);
-    WindowBase {
-        table: table.to_owned(),
-        variable: variable.to_owned(),
-        fixed_scopes: Vec::new(),
+    WindowBase::along(variable)
+}
+
+/// [`plan`]'s per-table units as the windows hold them: one window per
+/// variable, its units the union of its tables' (sorted, without repeats).
+pub fn windows(plan: Vec<(&'static str, Vec<String>)>) -> Vec<(WindowBase, Vec<String>)> {
+    let mut by_variable: Vec<(WindowBase, BTreeSet<String>)> = Vec::new();
+    for (table, units) in plan {
+        let base = window(table);
+        match by_variable.iter_mut().find(|(held, _)| *held == base) {
+            Some((_, held)) => held.extend(units),
+            None => by_variable.push((base, units.into_iter().collect())),
+        }
     }
+    by_variable
+        .into_iter()
+        .map(|(base, units)| (base, units.into_iter().collect()))
+        .collect()
 }
 
 /// A membership as the window plan reads it.

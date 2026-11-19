@@ -29,7 +29,7 @@ fn open(dir: &Path) -> Source {
         path: dir.join("graph.sqlite"),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -488,8 +488,7 @@ mod answering {
     use super::Answering;
     use keeper_ports::{
         BlobBody, CommandResult, Covered, Delivery, LinkState, Peer, RefusedCommit, Replica,
-        ReplicaError, ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase,
-        WindowState,
+        ReplicaError, ReplicaState, RowOp, RowWrites, Unit, UploadRefusal, WindowBase, WindowState,
     };
     use serde_json::{Map, Value};
 
@@ -509,8 +508,8 @@ mod answering {
         ) -> Result<Covered, ReplicaError> {
             self.inner.query_covered(sql, params, base, units)
         }
-        fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError> {
-            self.inner.subscribe(subscription)
+        fn subscribe(&self, unit: Unit) -> Result<(), ReplicaError> {
+            self.inner.subscribe(unit)
         }
         fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
             self.inner.set_window(base, units)
@@ -556,8 +555,8 @@ mod answering {
         fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
             self.inner.granted(table, variable)
         }
-        fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError> {
-            self.inner.revoked_units(table)
+        fn revoked_units(&self, base: &WindowBase) -> Result<Vec<String>, ReplicaError> {
+            self.inner.revoked_units(base)
         }
         fn upload_refusals(&self) -> Vec<UploadRefusal> {
             self.inner.upload_refusals()
@@ -693,38 +692,66 @@ fn the_source_helpers_answer_over_any_query_channel() {
 }
 
 /// CC-8 (112.1): a server's scope revocation is purged by the Syncular
-/// client itself (`purge_scope_rows`, in the transaction that records the
-/// subscription `revoked`), and that purge fails closed — the revocation is
-/// not applied — for a table whose schema maps no column to the revoked
-/// scope variable. Every subscription the graph takes (each graph table
-/// under `kg_graph`, 111.x's `kg_contents`/`kg_reviews` among them, the
-/// receipts under `kg_client` and the proposals under `kg_proposal`)
-/// therefore needs that mapping in the contract's schema, or a revocation
-/// would leave its rows; and the purge check reads exactly those tables.
+/// client itself, in the transaction that records the unit `revoked`, and
+/// that purge reaches a table only through the column its schema maps to
+/// the revoked variable. A unit covers every table that declares all of
+/// its variables (SPEC §4.1), so every table the graph reads (the state
+/// under `kg_graph`, the ledger under `kg_history`, the receipts under
+/// `kg_client`, the proposals under `kg_proposal`) must be covered by
+/// exactly one of the graph's units through a mapped column, or a
+/// revocation would leave its rows; and the purge check reads exactly
+/// those tables.
 #[test]
-fn every_graph_subscription_has_a_purgeable_scope_column() {
+fn every_graph_table_is_covered_by_one_unit_through_a_mapped_column() {
     let schema = syncular_client::parse_schema_json(
         keeper_replica::schema().expect("the contract's schema"),
     )
     .expect("compiles");
-    let taken = super::client::subscriptions(DB, "ana", "dev1");
-    let tables: Vec<&str> = taken.iter().map(|s| s.table.as_str()).collect();
-    assert_eq!(tables, super::client::subscribed_tables());
+    let units = super::client::units(DB, "ana", "dev1");
+    assert_eq!(units.len(), 4, "state, ledger, receipts, proposals");
+    let tables = super::client::subscribed_tables();
     assert_eq!(
-        taken.len(),
+        tables.len(),
         11,
         "nine graph tables, the receipts, the proposals"
     );
-    for subscription in taken {
+    for name in tables {
         let table = schema
-            .table(&subscription.table)
-            .unwrap_or_else(|| panic!("{} is in the schema", subscription.table));
-        for (variable, _) in &subscription.scopes {
-            assert!(
-                table.scope_column(variable).is_some(),
-                "{} maps no column to {variable}: a revocation could not purge it",
-                subscription.table
-            );
-        }
+            .table(name)
+            .unwrap_or_else(|| panic!("{name} is in the schema"));
+        let covering = units
+            .iter()
+            .filter(|unit| {
+                unit.scopes
+                    .keys()
+                    .all(|variable| table.scope_column(variable).is_some())
+            })
+            .count();
+        assert_eq!(covering, 1, "{name} is covered by exactly one graph unit");
+    }
+}
+
+/// G-14 (115.6): the state and the ledger are two units. The state unit
+/// covers no ledger table and the ledger unit no state table, so a replica
+/// holding only the state holds no event.
+#[test]
+fn the_state_unit_and_the_ledger_unit_cover_disjoint_tables() {
+    use super::protocol::scope::{HISTORY_TABLES, STATE_TABLES};
+    let schema = syncular_client::parse_schema_json(
+        keeper_replica::schema().expect("the contract's schema"),
+    )
+    .expect("compiles");
+    let covers = |variable: &str, name: &str| {
+        schema
+            .table(name)
+            .is_some_and(|table| table.scope_column(variable).is_some())
+    };
+    for name in STATE_TABLES {
+        assert!(covers("kg_graph", name), "{name} is state");
+        assert!(!covers("kg_history", name), "{name} is not ledger");
+    }
+    for name in HISTORY_TABLES {
+        assert!(covers("kg_history", name), "{name} is ledger");
+        assert!(!covers("kg_graph", name), "{name} is not state");
     }
 }

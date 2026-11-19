@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 use clap::Subcommand;
 use keeper_graph::admission::{Admission, Process};
 use keeper_graph::client::{
-    subscribed_tables, subscriptions, Applied, GraphClient, GraphClientError, Prepared,
+    subscribed_tables, units, Applied, GraphClient, GraphClientError, Prepared,
 };
 use keeper_graph::lifecycle::{Lifecycle, LifecycleError};
 use keeper_graph::outcome::{GraphOutcome, PendingCause};
@@ -359,7 +359,7 @@ fn open(args: &Args) -> Result<Source, Value> {
             base_url: format!("{}/{}", args.url.trim_end_matches('/'), args.database),
             token,
         }),
-        subscriptions: subscriptions(&args.database, &args.actor, &args.client),
+        units: units(&args.database, &args.actor, &args.client),
         watch_presence: None,
     })
     .map_err(|e| fail("storage_unavailable", &e.to_string()))?;

@@ -32,8 +32,8 @@ use super::protocol::proposal::{self, Decision, Proposal, DECIDE, PROPOSE};
 use super::protocol::request::Request;
 use super::protocol::review::{self, Target, ACKNOWLEDGE};
 use super::protocol::scope::{
-    client_scope, CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE,
-    RECEIPT_TABLE,
+    client_scope, CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, HISTORY_VARIABLE, PROPOSAL_TABLE,
+    PROPOSAL_VARIABLE, RECEIPT_TABLE,
 };
 use super::protocol::wire::{
     self, decode_content, decode_edge, decode_history, decode_node, decode_proposals,
@@ -43,11 +43,11 @@ use super::protocol::Refusal;
 use super::write::{Caller, GraphWrite, Writer};
 use keeper_graph_protocol::tag::normalise;
 use keeper_ports::Source;
-use keeper_ports::{LinkState, ReplicaError, Subscription};
+use keeper_ports::{LinkState, ReplicaError, Unit};
 
-/// The tables [`subscriptions`] subscribes: every graph table, the
-/// receipts and the proposals. A revocation of the domain purges all of
-/// them ([`super::source::revocation_with`]).
+/// The tables [`units`] covers: every graph table, the receipts and the
+/// proposals. A revocation of the domain purges all of them
+/// ([`super::source::revocation_with`]).
 #[must_use]
 pub fn subscribed_tables() -> Vec<&'static str> {
     GRAPH_TABLES
@@ -56,46 +56,20 @@ pub fn subscribed_tables() -> Vec<&'static str> {
         .collect()
 }
 
-/// The subscriptions a replica of `database` holds for the graph: every
-/// graph table under the database's `kg_graph` scope, this device's own
-/// receipts under its `kg_client` scope, and this actor's own proposals
-/// under its `kg_proposal` scope (never another proposer's). Ids are the
-/// contract's subscription names.
+/// The units a replica of `database` holds for the graph: its state under
+/// the database's `kg_graph` value, its ledger under the same `kg_history`
+/// value (the history this client reads, its events and their reviews),
+/// this device's own receipts under its `kg_client` value, and this
+/// actor's own proposals under its `kg_proposal` value (never another
+/// proposer's).
 #[must_use]
-pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscription> {
-    const NAMES: [&str; 9] = [
-        "kgEvents",
-        "kgEventOps",
-        "kgHead",
-        "kgNodes",
-        "kgEdges",
-        "kgTags",
-        "kgNodeTags",
-        "kgContents",
-        "kgReviews",
-    ];
-    NAMES
-        .iter()
-        .zip(GRAPH_TABLES)
-        .map(|(id, table)| Subscription {
-            id: (*id).to_owned(),
-            table: table.to_owned(),
-            scopes: vec![(GRAPH_VARIABLE.to_owned(), vec![database.to_owned()])],
-        })
-        .chain(std::iter::once(Subscription {
-            id: "kgReceipts".to_owned(),
-            table: RECEIPT_TABLE.to_owned(),
-            scopes: vec![(
-                CLIENT_VARIABLE.to_owned(),
-                vec![client_scope(actor, client)],
-            )],
-        }))
-        .chain(std::iter::once(Subscription {
-            id: "kgProposals".to_owned(),
-            table: PROPOSAL_TABLE.to_owned(),
-            scopes: vec![(PROPOSAL_VARIABLE.to_owned(), vec![actor.to_owned()])],
-        }))
-        .collect()
+pub fn units(database: &str, actor: &str, client: &str) -> Vec<Unit> {
+    vec![
+        Unit::of(GRAPH_VARIABLE, database),
+        Unit::of(HISTORY_VARIABLE, database),
+        Unit::of(CLIENT_VARIABLE, &client_scope(actor, client)),
+        Unit::of(PROPOSAL_VARIABLE, actor),
+    ]
 }
 
 /// A command with its request id, ready to send (and to persist first).

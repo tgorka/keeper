@@ -33,7 +33,7 @@ fn open(dir: &std::path::Path, database: &str) -> Source {
         path: dir.join(format!("{database}.sqlite")),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -811,12 +811,9 @@ fn archiving_shrinks_the_windows_and_an_outbox_pinned_row_survives() {
     ops.push(message("m1", "dev1.1", "person", t, None, Value::Null));
     w.alpha.replica.mutate(ops).expect("seed");
     let apply = |source: &Source| {
-        for (table, units) in sessions::plan(&sessions::held(source), &HashMap::new(), false, now())
-        {
-            source
-                .replica
-                .set_window(&sessions::window(table), &units)
-                .expect("window");
+        let plan = sessions::plan(&sessions::held(source), &HashMap::new(), false, now());
+        for (base, units) in sessions::windows(plan) {
+            source.replica.set_window(&base, &units).expect("window");
         }
     };
     apply(&w.alpha);
@@ -1121,7 +1118,7 @@ impl keeper_ports::Replica for Staged {
     ) -> Result<keeper_ports::Covered, keeper_ports::ReplicaError> {
         self.inner.query_covered(sql, params, base, units)
     }
-    fn subscribe(&self, s: keeper_ports::Subscription) -> Result<(), keeper_ports::ReplicaError> {
+    fn subscribe(&self, s: keeper_ports::Unit) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(
@@ -1174,8 +1171,11 @@ impl keeper_ports::Replica for Staged {
     ) -> Result<keeper_ports::RowWrites, keeper_ports::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, keeper_ports::ReplicaError> {
-        self.inner.revoked_units(table)
+    fn revoked_units(
+        &self,
+        base: &keeper_ports::WindowBase,
+    ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
+        self.inner.revoked_units(base)
     }
     fn granted(
         &self,

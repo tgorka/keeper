@@ -912,11 +912,11 @@ pub fn list(sources: &[Source], now_ms: i64) -> AgentGrantsVm {
 /// asks the server, which grants it or revokes it again. The units asked
 /// again.
 pub fn reask_revoked(source: &Source) -> Result<Vec<String>, ReplicaError> {
-    let revoked = source.replica.revoked_units(TABLE)?;
+    let base = crate::hq::sessions::window(TABLE);
+    let revoked = source.replica.revoked_units(&base)?;
     if revoked.is_empty() {
         return Ok(revoked);
     }
-    let base = crate::hq::sessions::window(TABLE);
     let units = source.replica.window_state(&base)?.units;
     let kept: Vec<String> = units
         .iter()

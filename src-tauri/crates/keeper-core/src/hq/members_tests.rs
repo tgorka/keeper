@@ -31,7 +31,7 @@ fn open(dir: &std::path::Path, database: &str, actor: &str) -> Source {
         path: dir.join(format!("{database}-{actor}.sqlite")),
         client_id: Some(format!("{actor}.dev")),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -948,7 +948,7 @@ fn an_unreadable_answer_keeps_its_request_and_a_retry_replays_it() {
             base_url: format!("http://127.0.0.1:{port}/alpha"),
             token: "0123456789abcdef".to_owned(),
         }),
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
