@@ -39,7 +39,9 @@ import {
   type ScopeMap,
 } from "@syncular/core";
 import {
+  compileSchema,
   computeEffective,
+  coveredTables,
   ensureSyncServerReady,
   handleRemoteOperation,
   MemorySegmentStore,
@@ -192,34 +194,26 @@ async function runSessionPage(
   return decodeRemoteOperationResponse(bytes);
 }
 
-/** The scope variables the contract declares on `table`. */
-function declared(table: string): Set<string> {
-  const found = schema.tables.find((candidate) => candidate.name === table);
-  if (found === undefined) fail(`no table ${table} in the contract`);
-  const patterns = (found as unknown as { scopes: (string | { pattern: string })[] }).scopes;
-  return new Set(
-    patterns.map((scope) => {
-      const pattern = typeof scope === "string" ? scope : scope.pattern;
-      return /\{([^}]+)\}/.exec(pattern)?.[1] ?? pattern;
-    }),
-  );
-}
+/** The contract as the server compiles it, for its own unit matching. */
+const compiled = compileSchema(schema);
 
-/** The rows of `table` a unit receives, through the server's own matching: none
- * when the unit does not cover the table (SPEC §4.1: it covers every table that
- * declares all of its variables). */
+/** The rows of `table` a unit receives, through the server's own matching: the
+ * server decides which tables the unit covers (`coveredTables`, SPEC §4.1: every
+ * table that declares all of its variables) and each one's effective scopes; a
+ * table the unit does not cover receives none. */
 async function rowsFor(
   server: SyncServerConfig,
   table: string,
   unit: Record<string, string>,
   allowed: ScopeMap,
 ): Promise<string[]> {
-  const variables = declared(table);
-  if (!Object.keys(unit).every((variable) => variables.has(variable))) return [];
+  if (!compiled.tables.has(table)) fail(`no table ${table} in the contract`);
+  const covered = coveredTables(compiled, unit).find((candidate) => candidate.name === table);
+  if (covered === undefined) return [];
   const requested: ScopeMap = Object.fromEntries(
     Object.entries(unit).map(([variable, value]) => [variable, [value]]),
   );
-  const outcome = computeEffective(variables, requested, { ok: true, allowed });
+  const outcome = computeEffective(covered.declaredVariables, requested, { ok: true, allowed });
   if (outcome.status !== "active") return [];
   const rows = await server.storage.scanRows(PARTITION, {
     table,

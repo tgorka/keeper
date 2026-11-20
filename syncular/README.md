@@ -1002,3 +1002,9 @@ cached replay of an earlier run — come back page by page from a registered `se
 refuses a page key the actor does not hold; and unless an agent instance's `agentMemoryOwn` and
 `agentMemoryFamily` subscriptions receive its own rows and its family peers' rows, and never
 another family's. Point it at a fresh, throwaway database.
+
+Which tables a unit covers is the server's own answer (`coveredTables`), never the script's. The
+graph line "none across units" has a self-test, `scripts/check-syncular-live.test.ts`: it declares
+the four ledger tables under `kg_graph` as well, regenerates that contract beside a copy of the
+script, and expects the check to fail on that line. It needs a fresh schema of its own in
+`KEEPER_SYNC_TEST_PG_MUTANT_URL` and is skipped without one.
