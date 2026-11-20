@@ -3547,8 +3547,10 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         &keeper_ports::Rejection::new("blob.too_large", ""),
         "huge.zip",
     );
-    // Resolved: the commit goes without the body and the server refuses
-    // it; the message stays shown with its caption and the upload's reason.
+    // Resolved: the commit stands refused — by the client itself when the
+    // server's body says the refusal is final (`retryable: false`), by the
+    // server when a bare status made keeper push it without the body. Either
+    // way the message stays shown with its caption and the upload's reason.
     let delivery = delivered(&skip.replica, &refused_commit).await;
     assert!(matches!(delivery, Delivery::Refused(_)), "{delivery:?}");
     let shown_refused = |hq: &Arc<Hq>| {

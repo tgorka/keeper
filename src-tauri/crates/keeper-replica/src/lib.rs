@@ -831,10 +831,43 @@ impl BlobCache {
 
     /// The commits waiting in the outbox, with their operations.
     fn outbox(&self) -> Result<Vec<(String, Vec<Value>)>, rusqlite::Error> {
-        let mut statement = self
-            .bodies
-            .prepare("SELECT commit_id, ops_json FROM _syncular_outbox")?;
-        let rows = statement.query_map([], |row| {
+        self.commits("SELECT commit_id, ops_json FROM _syncular_outbox", [])
+    }
+
+    /// The last entry of the client's outcome journal: what a round
+    /// journals comes after it.
+    fn journal_mark(&self) -> Result<i64, rusqlite::Error> {
+        self.bodies.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM _syncular_commit_outcomes",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// The commits the client journaled rejected after `mark`, with their
+    /// operations. An upload the server refuses with `retryable: false` in
+    /// its body is final to syncular-client (pinned `=0.97.0`,
+    /// `client.rs` `apply_sync_round`): inside the round it takes every
+    /// commit pinning the blob out of the outbox and journals it rejected
+    /// with its operations (`drop_outbox_commits`), so by the time the round
+    /// returns those commits are here and no longer in [`Self::outbox`].
+    fn rejected_since(&self, mark: i64) -> Result<Vec<(String, Vec<Value>)>, rusqlite::Error> {
+        self.commits(
+            "SELECT client_commit_id, operations_json FROM _syncular_commit_outcomes \
+             WHERE seq > ?1 AND status = 'rejected' AND resolution = 'active' \
+             AND operations_json IS NOT NULL",
+            [mark],
+        )
+    }
+
+    /// Commit ids with their operations, read by `sql` as (id, JSON array).
+    fn commits(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<(String, Vec<Value>)>, rusqlite::Error> {
+        let mut statement = self.bodies.prepare(sql)?;
+        let rows = statement.query_map(params, |row| {
             let commit: String = row.get(0)?;
             let ops: String = row.get(1)?;
             Ok((commit, ops))
@@ -1422,23 +1455,33 @@ impl Owner {
     }
 
     /// The server refused `blob_id`'s upload. The refusal is tied to every
-    /// commit in the outbox that references the blob and kept beside the
-    /// replica first; then the blob leaves the upload queue and those
-    /// commits' pins, so the next round uploads whatever else is staged and
-    /// pushes every commit — those too, which the server refuses without
-    /// the body, and whose rows the outcome journal then keeps. Nothing
-    /// else is touched: a commit that does not reference the blob, and
-    /// every other body it pins, stay as they are. Not kept, nothing is
-    /// released: the next round meets the same refusal and tries again.
-    fn resolve_refused_upload(&mut self, blob_id: &str, rejection: &Rejection) {
-        let outbox = match self.cache.outbox() {
-            Ok(outbox) => outbox,
+    /// commit that references the blob — in the outbox, or journaled
+    /// rejected since the round began (`mark`, [`BlobCache::rejected_since`]):
+    /// a refusal whose body says `retryable: false` makes the client drop
+    /// those commits itself, a bare status leaves them waiting — and kept
+    /// beside the replica first; then the blob leaves the upload queue and
+    /// those commits' pins, so the next round uploads whatever else is
+    /// staged and pushes every commit still waiting — those too, which the
+    /// server refuses without the body, and whose rows the outcome journal
+    /// then keeps. Nothing else is touched: a commit that does not reference
+    /// the blob, and every other body it pins, stay as they are. Not kept,
+    /// nothing is released: the next round meets the same refusal and tries
+    /// again.
+    fn resolve_refused_upload(&mut self, blob_id: &str, rejection: &Rejection, mark: Option<i64>) {
+        let commits = self.cache.outbox().and_then(|mut commits| {
+            if let Some(mark) = mark {
+                commits.extend(self.cache.rejected_since(mark)?);
+            }
+            Ok(commits)
+        });
+        let commits = match commits {
+            Ok(commits) => commits,
             Err(error) => {
                 tracing::warn!(database = %self.database, %error, "the commits behind a refused upload could not be read");
                 return;
             }
         };
-        let refusals: Vec<UploadRefusal> = outbox
+        let refusals: Vec<UploadRefusal> = commits
             .iter()
             .filter_map(|(commit, ops)| refusal_of(commit, ops, blob_id, rejection))
             .collect();
@@ -1626,6 +1669,13 @@ impl Owner {
     fn round(&mut self) {
         self.dirty = false;
         self.transport.refused_uploads.clear();
+        let mark = self
+            .cache
+            .journal_mark()
+            .inspect_err(|error| {
+                tracing::warn!(database = %self.database, %error, "the outcome journal could not be read before a round");
+            })
+            .ok();
         let outcome = self.client.sync_until_idle(&mut self.transport, None);
         if self.connected() {
             self.rounds_on_socket = self.rounds_on_socket.saturating_add(1);
@@ -1634,7 +1684,7 @@ impl Owner {
         self.schedule.round_done(&verdict, Instant::now());
         for (blob, refusal) in std::mem::take(&mut self.transport.refused_uploads) {
             tracing::warn!(database = %self.database, code = %refusal.code, %blob, "the agents server refused an upload; the commits that reference it go without it");
-            self.resolve_refused_upload(&blob, &refusal);
+            self.resolve_refused_upload(&blob, &refusal, mark);
         }
         match verdict {
             RoundVerdict::Answered => {}
@@ -2441,7 +2491,9 @@ impl Opener for SyncularOpener {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use keeper_testkit::{blob_server, bootstrapped, pins, pushed_after, puts, queued};
+    use keeper_testkit::{
+        blob_server, blob_server_answering, bootstrapped, pins, pushed_after, puts, queued,
+    };
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
     use syncular_client::SyncReport;
@@ -3814,6 +3866,71 @@ pub(crate) mod tests {
             vec![waiting],
             "what is kept beside the replica"
         );
+    }
+
+    /// The agents server refuses an upload with its own error document,
+    /// `retryable: false`. syncular-client then takes the commits naming the
+    /// blob out of the outbox inside the round and journals them rejected;
+    /// the refusal still reaches the readers and the file beside the
+    /// replica, tied to that commit, and still stands after a reopen.
+    #[test]
+    fn an_upload_refused_with_the_servers_own_body_is_still_recorded() {
+        let big = vec![3u8; 64];
+        let document = json!({
+            "code": "blob.too_large",
+            "message": "blob exceeds the server's limit",
+            "category": "invalid-request",
+            "retryable": false,
+            "recommendedAction": "fixRequest",
+        });
+        let (port, seen) = blob_server_answering(vec![(sha(&big), 413, document.to_string())]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = linked(dir.path(), port);
+        let open = || {
+            let (wake, _woken) = mpsc::channel();
+            Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens")
+        };
+        let mut owner = open();
+        bootstrapped(&spec.path);
+        let commit: String = ask(&mut owner, |reply| {
+            Command::Commit(
+                vec![body(&big)],
+                vec![mutation(message("m-1")), attachment("a-1", "m-1", &big)],
+                reply,
+            )
+        });
+
+        owner.round();
+        assert!(
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .any(|(_, path, status, _)| *status == 413 && path.contains(&sha(&big))),
+            "the server refused the upload"
+        );
+        assert_eq!(
+            owner.client.status_snapshot().outbox,
+            0,
+            "the client took the commit out of the outbox itself"
+        );
+        let expect = |refusals: &[UploadRefusal]| {
+            assert_eq!(refusals.len(), 1, "{refusals:?}");
+            let refusal = &refusals[0];
+            assert_eq!(refusal.commit_id, commit);
+            assert_eq!(refusal.blob_id, sha(&big));
+            assert_eq!(refusal.rejection.code, "blob.too_large");
+            assert_eq!(refusal.refused_rows, vec!["a-1".to_owned()]);
+            let mut rows = refusal.commit_rows.clone();
+            rows.sort();
+            assert_eq!(rows, vec!["a-1".to_owned(), "m-1".to_owned()]);
+        };
+        expect(&owner.upload_refusals.lock().expect("held"));
+        expect(&owner.cache.log.refusals().expect("reads"));
+
+        owner.stop();
+        drop(owner);
+        let owner = open();
+        expect(&owner.upload_refusals.lock().expect("held"));
     }
 
     /// R1071K-07: the process dies after a commit staged its first blobs and
