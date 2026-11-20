@@ -324,7 +324,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
         -- idempotence, and so is the one table rebuild (`materialized`'s
         -- `oid`, see `add_materialized_oid`), which the same column list
-        -- guards. A row rewrite is not, because after it runs the old value
+        -- guards — as long as the list is read under the write lock that
+        -- makes the change, which `migrate_late_columns` holds for all of
+        -- them. A row rewrite is not, because after it runs the old value
         -- becomes a legitimate one again.
         -- Paths this clone has ever held real content for.
         --
@@ -423,13 +425,44 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    ensure_activity_columns(conn)?;
-    ensure_journal_columns(conn)?;
-    ensure_materialized_columns(conn)?;
-    ensure_task_columns(conn)?;
-    ensure_task_run_columns(conn)?;
-    ensure_prune_default(conn)?;
-    retire_bot_tasks(conn)?;
+    migrate_late_columns(conn)?;
+    Ok(())
+}
+
+/// Every late column, the `materialized` rebuild and the two content
+/// migrations (`lfsPruneLocal`'s one-shot, the retired bot tasks), in one
+/// `BEGIN IMMEDIATE` transaction.
+///
+/// The app and `keeper-syncd` share `sync.db`, are upgraded together, and an
+/// update starts both at once — so two first openers of a store that is
+/// missing a late column is the ordinary case, not a corner. Each `ensure_*`
+/// reads `table_info` and then adds what it did not see; outside a lock the
+/// second opener reads the list before the first's `ADD COLUMN` commits,
+/// waits for the lock on its own `ALTER` and then fails with `duplicate column
+/// name`, and the app or the daemon does not start. `ensure_prune_default`'s
+/// marker has the same read-then-write shape and would fail the same way, on
+/// its `INSERT`; [`retire_bot_tasks`] would name a retired task twice.
+///
+/// `IMMEDIATE` takes the write lock before the first read, so every list is
+/// read by the one opener that holds it: the second waits at `BEGIN`, then
+/// finds the first's columns and adds nothing. The transaction holds no read
+/// snapshot while it waits, so it gets the busy handler — `rusqlite`'s
+/// five-second timeout, see [`open`] — rather than `SQLITE_BUSY_SNAPSHOT`,
+/// and the wait is bounded by it. On a store that is already current the
+/// lock is held for the reads alone and the commit writes nothing.
+///
+/// One transaction for all of it also makes the upgrade atomic: a failure
+/// part-way, the rebuild's refusal included, leaves every table as it was.
+fn migrate_late_columns(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    ensure_activity_columns(&tx)?;
+    ensure_journal_columns(&tx)?;
+    ensure_materialized_columns(&tx)?;
+    ensure_task_columns(&tx)?;
+    ensure_task_run_columns(&tx)?;
+    ensure_prune_default(&tx)?;
+    retire_bot_tasks(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -551,7 +584,9 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// a last use, no remote confirmation was recorded, nothing was pinned. An
 /// `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
 /// idempotence — the rule stated at the top of [`migrate`] — so a second
-/// `migrate` on the same connection adds nothing and errors on nothing.
+/// `migrate` on the same connection adds nothing and errors on nothing. It
+/// takes a [`rusqlite::Transaction`] because the list must be read under the
+/// write lock that adds the columns; [`migrate_late_columns`] says why.
 ///
 /// `pinned` and `local_origin` are `INTEGER`s read as booleans, which is how
 /// SQLite spells one; [`materialized_rows`] narrows both, so no caller sees
@@ -587,7 +622,7 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// alias: oid"). `CREATE TABLE` still accepts a declared `oid` column, so a
 /// fresh install gets it from the `CREATE TABLE` above, and a store that
 /// predates it is rebuilt by [`add_materialized_oid`].
-fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
+fn ensure_materialized_columns(conn: &rusqlite::Transaction) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
     let existing: Vec<String> = stmt
@@ -619,26 +654,28 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Give `materialized` its `oid TEXT` column by rebuilding the table, in one
-/// transaction: a new table declaring every column the old one has (name,
-/// type, `NOT NULL`, `DEFAULT` and primary key as `table_info` reports them)
-/// plus `oid`, every row copied across, the old table dropped and the new one
-/// renamed into its place. Nullable and without a `DEFAULT`, so every copied
-/// row reads `oid` as `NULL` — exactly what `ADD COLUMN` would have given it.
-/// See [`ensure_materialized_columns`] for why `ADD COLUMN` cannot.
+/// Give `materialized` its `oid TEXT` column by rebuilding the table, inside
+/// the caller's transaction: a new table declaring every column the old one
+/// has (name, type, `NOT NULL`, `DEFAULT` and primary key as `table_info`
+/// reports them) plus `oid`, every row copied across, the old table dropped
+/// and the new one renamed into its place. Nullable and without a `DEFAULT`,
+/// so every copied row reads `oid` as `NULL` — exactly what `ADD COLUMN` would
+/// have given it. See [`ensure_materialized_columns`] for why `ADD COLUMN`
+/// cannot.
 ///
-/// The transaction is `IMMEDIATE` and the column list is read inside it,
-/// because the app and `keeper-syncd` share this file and may both open an
-/// un-migrated store at once. The second waits here for the first's write
-/// lock; a list it read before waiting would rebuild from a stale shape and
-/// drop whatever the first added after `oid`. Read under the lock, it finds
-/// `oid` already there and leaves the table alone.
+/// The transaction is [`migrate_late_columns`]' `IMMEDIATE` one, so the
+/// column list read here and the caller's decision that `oid` is missing were
+/// both made under the write lock: a second opener of an un-migrated store
+/// waits at that `BEGIN`, finds `oid` and never gets here, rather than
+/// rebuilding from a shape it read before the first committed and dropping
+/// whatever the first added after `oid`. A failure anywhere rolls the whole
+/// rebuild back with the caller's transaction.
 ///
 /// The rebuild carries columns and the primary key and nothing else, so an
 /// index, trigger or view that names `materialized` would vanish with the old
 /// table (or, for a view, fail the rename). No shipped schema has one; if one
 /// appears, this refuses with an error naming it rather than drop it.
-fn add_materialized_oid(conn: &Connection) -> Result<()> {
+fn add_materialized_oid(tx: &rusqlite::Transaction) -> Result<()> {
     struct Column {
         name: String,
         kind: String,
@@ -646,7 +683,6 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
         default: Option<String>,
         pk: i64,
     }
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut stmt = tx.prepare("PRAGMA table_info(materialized)")?;
     let columns: Vec<Column> = stmt
         .query_map([], |r| {
@@ -660,19 +696,20 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    if columns.iter().any(|c| c.name == "oid") {
-        // Another opener rebuilt it while this one waited for the lock.
-        return Ok(());
-    }
-
-    // The primary key's automatic index (`sqlite_autoindex_materialized_1`)
-    // is recreated by the new table's own `PRIMARY KEY`; anything else that
-    // names the table is something the rebuild cannot carry.
+    // Indexes are matched by the table they index and nothing else. The
+    // primary key's automatic index is recreated by the new table's own
+    // `PRIMARY KEY`, so it alone is left out — by its `origin`, not its name,
+    // because a `UNIQUE` constraint's index is `sqlite_autoindex_…` too and
+    // the rebuild would drop that constraint. Triggers and views are matched
+    // by their text as well, since one on another table can name this one.
+    // Anything found is something the rebuild cannot carry.
     let mut stmt = tx.prepare(
         "SELECT type, name FROM sqlite_schema
-          WHERE type IN ('index', 'trigger', 'view')
-            AND name NOT LIKE 'sqlite_autoindex_materialized_%'
-            AND (tbl_name = 'materialized' OR sql LIKE '%materialized%')
+          WHERE (type = 'index' AND tbl_name = 'materialized'
+                 AND name NOT IN (SELECT name FROM pragma_index_list('materialized')
+                                   WHERE origin = 'pk'))
+             OR (type IN ('trigger', 'view')
+                 AND (tbl_name = 'materialized' OR sql LIKE '%materialized%'))
           ORDER BY type, name",
     )?;
     let dependents: Vec<String> = stmt
@@ -725,7 +762,6 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
          ALTER TABLE materialized_with_oid RENAME TO materialized;",
         defs = defs.join(", "),
     ))?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -5001,17 +5037,16 @@ const RETIRED_TASKS_KEY: &str = "tasks.retired_bot_tasks";
 /// no such row is left there is nothing to do, so it runs on every open
 /// without a marker, and a row an older build on the same machine writes
 /// later is removed the same way.
-fn retire_bot_tasks(conn: &Connection) -> Result<()> {
+fn retire_bot_tasks(tx: &rusqlite::Transaction) -> Result<()> {
     let removed: Vec<(String, Option<String>)> = {
-        let mut stmt = conn.prepare("SELECT id, description FROM tasks WHERE kind = 'bot'")?;
+        let mut stmt = tx.prepare("SELECT id, description FROM tasks WHERE kind = 'bot'")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1).unwrap_or_default())))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     if removed.is_empty() {
         return Ok(());
     }
-    let mut names = retired_tasks(conn)?;
-    let tx = conn.unchecked_transaction()?;
+    let mut names = retired_tasks(tx)?;
     for (id, description) in &removed {
         tracing::warn!(
             task = %id,
@@ -5034,7 +5069,8 @@ fn retire_bot_tasks(conn: &Connection) -> Result<()> {
             serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned()),
         ),
     )?;
-    tx.commit()?;
+    // Committed by `migrate_late_columns`, which read `removed` and `names`
+    // under the same lock.
     Ok(())
 }
 
@@ -7038,12 +7074,14 @@ mod tests {
         assert_eq!(row.size_bytes, Some(7));
     }
 
-    /// A rebuild that fails part-way rolls back whole: the old table, its rows
-    /// and its columns are where they were, and no half-built table is left
-    /// behind for the next launch to trip over. A foreign key from another
-    /// table is something the rebuild does not look for, and with
-    /// `foreign_keys = ON` (as `open` sets it) it fails the `DROP TABLE`
-    /// after the new table has been created and filled.
+    /// A rebuild that fails part-way rolls back whole, and takes the upgrade's
+    /// other changes with it: the old table, its rows and its columns are
+    /// where they were — the `ADD COLUMN`s `migrate` ran before the rebuild
+    /// included — and no half-built table is left behind for the next launch
+    /// to trip over. A foreign key from another table is something the
+    /// rebuild does not look for, and with `foreign_keys = ON` (as `open` sets
+    /// it) it fails the `DROP TABLE` after the new table has been created and
+    /// filled.
     #[test]
     fn a_failed_rebuild_leaves_the_old_table() {
         let c = Connection::open_in_memory().expect("in-memory db");
@@ -7058,9 +7096,7 @@ mod tests {
         )
         .expect("plant a referencing table");
 
-        // The rebuild itself, not `migrate`: the `ADD COLUMN`s that precede it
-        // there commit on their own, and are not what this is about.
-        let err = add_materialized_oid(&c).expect_err("the rebuild cannot drop a referenced table");
+        let err = migrate(&c).expect_err("the rebuild cannot drop a referenced table");
         assert!(
             err.to_string().contains("FOREIGN KEY constraint failed"),
             "it failed at the DROP, after the new table was built: {err}"
@@ -7079,7 +7115,8 @@ mod tests {
     }
 
     /// An index, trigger or view on `materialized` is refused by name before
-    /// anything changes, rather than dropped by the rebuild without a word.
+    /// anything changes, rather than dropped by the rebuild without a word —
+    /// and the refusal leaves the columns `migrate` added before it unadded.
     #[test]
     fn a_rebuild_refuses_objects_it_cannot_carry() {
         let c = Connection::open_in_memory().expect("in-memory db");
@@ -7094,7 +7131,7 @@ mod tests {
         .expect("plant dependents");
         let sql = materialized_sql(&c);
 
-        let err = add_materialized_oid(&c).expect_err("the rebuild refuses");
+        let err = migrate(&c).expect_err("the rebuild refuses");
         let SyncError::Journal(message) = err else {
             panic!("expected a Journal error, got {err:?}");
         };
@@ -7197,64 +7234,58 @@ mod tests {
         .expect_err("NOT NULL survives");
     }
 
-    /// Set by [`two_first_openers_rebuild_once`]'s second connection the first
-    /// time it has to wait for the write lock.
-    static SECOND_OPENER_WAITED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    fn note_wait_and_retry(attempt: i32) -> bool {
-        SECOND_OPENER_WAITED.store(true, std::sync::atomic::Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        attempt < 2_000
+    /// What a second opener's write lock does: wait, through a busy handler
+    /// that records it waited, so a test can commit the first opener's work
+    /// only once the second is provably blocked. One flag per expansion, so
+    /// tests running in parallel threads never see each other's.
+    macro_rules! busy_flag {
+        () => {{
+            static WAITED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            fn on_busy(attempt: i32) -> bool {
+                WAITED.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                attempt < 2_000
+            }
+            (&WAITED, on_busy as fn(i32) -> bool)
+        }};
     }
 
-    /// Two processes opening one un-migrated store: the first holds the write
-    /// lock while it rebuilds `materialized` and goes on to add a later column
-    /// and write values; the second reaches the rebuild while the first still
-    /// holds the lock. The second must wait, see `oid` already there, and leave
-    /// the table alone — not rebuild from the shape it saw before it waited,
-    /// which would drop the later column and the first's values.
+    /// Two processes opening one current store that `before` has taken back
+    /// to an older shape, the first part-way through migrating it: `before`
+    /// runs and commits, then `first_uncommitted` runs on the first connection
+    /// inside a `BEGIN IMMEDIATE` it has not committed, and the second calls
+    /// `migrate` on its own connection.
     ///
     /// Deterministic: the first commits only after the second's busy handler
-    /// has fired, so the second is provably waiting on the lock.
-    #[test]
-    fn two_first_openers_rebuild_once() {
+    /// has fired, so the second is waiting on the lock, and every `migrate`
+    /// that reads before taking the lock reads what the first has not yet
+    /// committed as missing.
+    fn second_opener_during_first(
+        before: impl FnOnce(&Connection),
+        first_uncommitted: &str,
+        (waited, on_busy): (&'static std::sync::atomic::AtomicBool, fn(i32) -> bool),
+    ) -> (tempfile::TempDir, Connection, Result<()>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("sync.db");
         let first = Connection::open(&path).expect("first opener");
         first
             .pragma_update(None, "journal_mode", "WAL")
             .expect("wal");
-        plant_pre_56_2_materialized(&first, &[("p", "a.bin", 1)]);
-
+        migrate(&first).expect("a current store");
+        before(&first);
         first
-            .execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE TABLE materialized_with_oid (
-                     profile_id TEXT NOT NULL, path TEXT NOT NULL, at_ms INTEGER NOT NULL,
-                     oid TEXT, PRIMARY KEY (profile_id, path)
-                 );
-                 INSERT INTO materialized_with_oid (profile_id, path, at_ms)
-                     SELECT profile_id, path, at_ms FROM materialized;
-                 DROP TABLE materialized;
-                 ALTER TABLE materialized_with_oid RENAME TO materialized;
-                 ALTER TABLE materialized ADD COLUMN size_bytes INTEGER;
-                 UPDATE materialized SET oid = 'abc', size_bytes = 7;",
-            )
-            .expect("the first opener's rebuild, uncommitted");
+            .execute_batch(&format!("BEGIN IMMEDIATE; {first_uncommitted}"))
+            .expect("the first opener's migration, uncommitted");
 
         let mut second = Connection::open(&path).expect("second opener");
-        second
-            .busy_handler(Some(note_wait_and_retry))
-            .expect("busy handler");
-        let racer = std::thread::spawn(move || add_materialized_oid(&second));
+        second.busy_handler(Some(on_busy)).expect("busy handler");
+        let racer = std::thread::spawn(move || migrate(&second));
 
-        // Commit once the second is waiting on the lock — or has already given
-        // up without waiting, which the `expect` below then reports.
+        // Commit once the second is waiting on the lock — or has already
+        // returned without waiting, which the caller's assertions report.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !SECOND_OPENER_WAITED.load(std::sync::atomic::Ordering::SeqCst)
-            && !racer.is_finished()
-        {
+        while !waited.load(std::sync::atomic::Ordering::SeqCst) && !racer.is_finished() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the second opener neither waited for the lock nor returned"
@@ -7264,22 +7295,176 @@ mod tests {
         first
             .execute_batch("COMMIT")
             .expect("the first opener commits");
+        let second = racer.join().expect("the second opener's thread");
+        (dir, first, second)
+    }
 
-        racer
-            .join()
-            .expect("the second opener's thread")
-            .expect("the second opener waits, finds `oid` and returns");
+    /// `materialized` as it was before Story 56.2, with one row, in a store
+    /// that is otherwise current.
+    fn regress_materialized(c: &Connection) {
+        c.execute_batch("DROP TABLE materialized")
+            .expect("drop the current table");
+        plant_pre_56_2_materialized(c, &[("p", "a.bin", 1)]);
+    }
+
+    /// The app and `keeper-syncd` starting together after an update, on a
+    /// store missing a late column: the first has added `last_used_ms` and
+    /// not committed. The second must wait, find the column and add only what
+    /// is still missing — not add it again from the list it would have read
+    /// before the lock and fail with `duplicate column name`, which kept one
+    /// of the two from starting.
+    #[test]
+    fn two_first_openers_add_each_late_column_once() {
+        let (_dir, first, second) = second_opener_during_first(
+            regress_materialized,
+            "ALTER TABLE materialized ADD COLUMN last_used_ms INTEGER;
+             UPDATE materialized SET last_used_ms = 5;",
+            busy_flag!(),
+        );
+        second.expect("the second opener waits, then adds only what is missing");
         assert_eq!(
             materialized_columns(&first),
-            ["profile_id", "path", "at_ms", "oid", "size_bytes"]
+            [
+                "profile_id",
+                "path",
+                "at_ms",
+                "last_used_ms",
+                "synced_at_ms",
+                "pinned",
+                "oid",
+                "size_bytes",
+                "local_origin",
+                "released_at_ms",
+                "release_at_ms",
+            ]
         );
-        let (oid, size): (Option<String>, Option<i64>) = first
-            .query_row("SELECT oid, size_bytes FROM materialized", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .expect("read");
-        assert_eq!(oid.as_deref(), Some("abc"));
-        assert_eq!(size, Some(7));
+        let row = &materialized_rows(&first, "p").expect("read the ledger")[0];
+        assert_eq!((row.at_ms, row.last_used_ms), (1, Some(5)));
+    }
+
+    /// The same race at the rebuild: the first has rebuilt `materialized`
+    /// with `oid`, gone on to add `size_bytes` and written values. The second
+    /// must find both and leave the table alone — not rebuild from the shape
+    /// it saw before it waited, which would drop `size_bytes` and the first's
+    /// values, nor add `size_bytes` again.
+    #[test]
+    fn two_first_openers_rebuild_once() {
+        let (_dir, first, second) = second_opener_during_first(
+            regress_materialized,
+            "CREATE TABLE materialized_with_oid (
+                 profile_id TEXT NOT NULL, path TEXT NOT NULL, at_ms INTEGER NOT NULL,
+                 oid TEXT, PRIMARY KEY (profile_id, path)
+             );
+             INSERT INTO materialized_with_oid (profile_id, path, at_ms)
+                 SELECT profile_id, path, at_ms FROM materialized;
+             DROP TABLE materialized;
+             ALTER TABLE materialized_with_oid RENAME TO materialized;
+             ALTER TABLE materialized ADD COLUMN size_bytes INTEGER;
+             UPDATE materialized SET oid = 'abc', size_bytes = 7;",
+            busy_flag!(),
+        );
+        second.expect("the second opener waits, finds `oid` and does not rebuild");
+        assert_eq!(
+            materialized_columns(&first),
+            [
+                "profile_id",
+                "path",
+                "at_ms",
+                "oid",
+                "size_bytes",
+                "last_used_ms",
+                "synced_at_ms",
+                "pinned",
+                "local_origin",
+                "released_at_ms",
+                "release_at_ms",
+            ]
+        );
+        let row = &materialized_rows(&first, "p").expect("read the ledger")[0];
+        assert_eq!(row.oid.as_deref(), Some("abc"));
+        assert_eq!(row.size_bytes, Some(7));
+    }
+
+    /// The `lfsPruneLocal` one-shot has the same read-then-write shape: on a
+    /// store without its marker, the second opener must find the first's
+    /// marker rather than insert its own and fail on the key.
+    #[test]
+    fn two_first_openers_apply_the_prune_default_once() {
+        let (_dir, first, second) = second_opener_during_first(
+            |c| {
+                c.execute("DELETE FROM meta WHERE key = ?1", [PRUNE_DEFAULT_MARKER])
+                    .expect("forget the marker");
+            },
+            &format!("INSERT INTO meta (key, value) VALUES ('{PRUNE_DEFAULT_MARKER}', '0');"),
+            busy_flag!(),
+        );
+        second.expect("the second opener waits and finds the marker");
+        let marker: String = first
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [PRUNE_DEFAULT_MARKER],
+                |r| r.get(0),
+            )
+            .expect("the marker");
+        assert_eq!(marker, "0");
+    }
+
+    /// Only `materialized`'s own indexes stop the rebuild. An index on
+    /// another table is matched by the table it indexes, not by its text, so
+    /// one over a column whose name merely contains the word is not refused —
+    /// and survives, since the rebuild never touches its table.
+    #[test]
+    fn a_rebuild_ignores_another_tables_index_that_names_the_word() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        plant_pre_56_2_materialized(&c, &[("p", "a.bin", 1)]);
+        c.execute_batch(
+            "CREATE TABLE other (materialized_at INTEGER);
+             CREATE INDEX other_idx ON other (materialized_at);",
+        )
+        .expect("plant an unrelated index");
+
+        migrate(&c).expect("an unrelated index does not block the rebuild");
+
+        assert!(materialized_columns(&c).iter().any(|c| c == "oid"));
+        assert!(schema_object_exists(&c, "other_idx"));
+    }
+
+    /// The primary key's automatic index is the only one the rebuild may
+    /// leave behind, because the new table's `PRIMARY KEY` recreates it. A
+    /// `UNIQUE` constraint's index is named `sqlite_autoindex_materialized_…`
+    /// as well, and the rebuild does not carry the constraint, so it is
+    /// refused by name rather than dropped without a word.
+    #[test]
+    fn a_rebuild_refuses_a_unique_constraint_it_cannot_carry() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE materialized (
+                 profile_id  TEXT NOT NULL,
+                 path        TEXT NOT NULL,
+                 at_ms       INTEGER NOT NULL,
+                 PRIMARY KEY (profile_id, path),
+                 UNIQUE (path, at_ms)
+             );",
+        )
+        .expect("plant a table with a UNIQUE constraint");
+        let unique: String = c
+            .query_row(
+                "SELECT name FROM pragma_index_list('materialized') WHERE origin = 'u'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the UNIQUE constraint's index");
+        let sql = materialized_sql(&c);
+
+        let err = migrate(&c).expect_err("the rebuild refuses the UNIQUE constraint");
+        let SyncError::Journal(message) = err else {
+            panic!("expected a Journal error, got {err:?}");
+        };
+        assert!(
+            message.contains(&format!("index `{unique}`")),
+            "{unique} missing from: {message}"
+        );
+        assert_eq!(materialized_sql(&c), sql, "the table is untouched");
     }
 
     /// Re-materializing a path moves `at_ms` and touches nothing else (Story
