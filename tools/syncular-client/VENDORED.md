@@ -8,7 +8,7 @@ through `[patch.crates-io]` in `src-tauri/Cargo.toml` (story 115.6).
 - copied from: the crates.io package `syncular-client-0.97.0.crate`,
   sha256 `1329fe09caed1fc82f22b3a0d808a5de4ed4c3e0f6a783bec1fa0b9503a14621`
 - licence: Apache-2.0 (the package's `license` field; the package ships no
-  LICENSE or NOTICE file)
+  LICENSE or NOTICE file); its text is the repository's root `LICENSE`
 
 ## The change
 

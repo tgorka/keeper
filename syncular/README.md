@@ -94,10 +94,12 @@ Schema 9 (`0009_knowledge_graph_history`, story 115.6) changes no table, column 
 the graph's ledger — `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` — from `kg_graph` to a new
 variable, `kg_history`, with the same value (the domain's name) from the same `graph` column; the
 state (`kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`) stays under `kg_graph`.
-`kg_head` is the ledger's, not both: it references `kg_events`, and a reference never crosses scope
-patterns. The server grants `kg_history` wherever it grants `kg_graph`; a replica holds the ledger
-only when it subscribes the ledger's unit. The server serves schemas 3 through 8 beside 9 with the
-ledger under `kg_graph` as before.
+`kg_head` sits under `kg_history` only, not under both: it references `kg_events`, and the code
+generator refuses a reference whose parent has other scope patterns (a reference never crosses
+an authorization boundary). So a reader that holds only the state has no head; one that needs
+the graph's freshness subscribes to `kg_history` for it. The server grants `kg_history` wherever
+it grants `kg_graph`; a replica holds the ledger only when it subscribes the ledger's unit. The
+server serves schemas 3 through 8 beside 9 with the ledger under `kg_graph` as before.
 
 The same release moves keeper, keeper-hq and every agent replica to Syncular 0.97.0, which speaks
 wire 4 only and refuses a wire-3 (0.32.1) client with `sync.invalid_request`. So the order is one
@@ -107,6 +109,12 @@ server has moved. A device not yet updated is refused until it updates. The cont
 lock is format 3 (`syncular migrations upgrade-lock`); 0001–0008 and their hashes are unchanged.
 On its first open the new client upgrades a 0.32.1 replica in place: it drops the old subscription
 table and re-registers the units the device asks for, which then bootstrap again.
+
+Under 0.97 the server answers `sync.commit_expired` for a commit resent below the watermark it
+acknowledged, after it pruned that commit's result. The client journals the commit rejected and
+drops it from the outbox; keeper shows it as a refusal with that code — the commit may well have
+been applied — and does not reset the client id, although the server's error recommends
+`resetClientId`.
 
 ## Domains and the map
 
@@ -238,9 +246,9 @@ Every id a client creates can be minted offline:
 A row of `messages`, `reasoning`, `tool_calls` or `approvals` carries `page_key` =
 `<session_id>/<yyyy-mm>`, the UTC month of its `created_at_ms`. A long session is therefore
 windowed by month: a client subscribes its newest month or months and widens month by month,
-and an archived session is not subscribed at all. The month lives inside the value, never as a
-variable of its own, because a variable may be requested alone and a month variable would read
-across sessions.
+and no month of an archived session is subscribed (its session-scoped rows still sync under
+`session`). The month lives inside the value, never as a variable of its own, because a variable
+may be requested alone and a month variable would read across sessions.
 
 The server refuses any other value: a `page_key` whose session is not the row's `session_id`, or
 whose month is not the month of the row's `created_at_ms`, or lies before the session's creation

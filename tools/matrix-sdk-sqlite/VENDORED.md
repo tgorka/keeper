@@ -9,7 +9,7 @@ one requirement changed. keeper uses it through `[patch.crates-io]` in
 - copied from: the crates.io package `matrix-sdk-sqlite-0.19.1.crate`,
   sha256 `8d4271e06d52a17bc6ec39b5a2985b65dcced737969fac3678967783656edb34`
 - licence: Apache-2.0 (the package's `license` field; the package ships no
-  LICENSE or NOTICE file)
+  LICENSE or NOTICE file); its text is the repository's root `LICENSE`
 
 ## The change
 

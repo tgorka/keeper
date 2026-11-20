@@ -3199,6 +3199,61 @@ pub(crate) mod tests {
         .expect("records");
     }
 
+    /// `sync.commit_expired`: the server pruned the result of a commit this
+    /// replica resent below its acknowledged watermark. syncular-client
+    /// journals it rejected and takes it out of the outbox (its own
+    /// `commits_carry_the_outbox_sequence_and_commit_expired_is_a_rejection`);
+    /// keeper shows it as a refusal with that code, never as a reset: the
+    /// replica keeps its client id, and nothing calls `reset_client_id`.
+    #[test]
+    fn an_expired_commit_is_a_refusal_and_the_replica_keeps_its_client_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("local.sqlite"));
+        let replica = SyncularReplica::open(spec.clone()).expect("opens");
+        let written = replica
+            .mutate(vec![prefs_row("ana/nixie")])
+            .expect("commits");
+        replica.close();
+        replica.join();
+        drop(replica);
+        let client_id = || -> String {
+            let conn = rusqlite::Connection::open(&spec.path).expect("opens");
+            conn.query_row(
+                "SELECT value FROM _syncular_meta WHERE key = 'clientId'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("a client id")
+        };
+        let before = client_id();
+        // What the client does with the server's answer, in the file.
+        rusqlite::Connection::open(&spec.path)
+            .expect("opens")
+            .execute(
+                "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
+                [&written],
+            )
+            .expect("leaves the outbox");
+        journal_refusal(&spec.path, &written, "ana/nixie", "sync.commit_expired");
+
+        let again = SyncularReplica::open(spec.clone()).expect("reopens");
+        match again.delivery(&written).expect("reads") {
+            Delivery::Refused(rejection) => assert_eq!(rejection.code, "sync.commit_expired"),
+            other => panic!("an expired commit read as {other:?}"),
+        }
+        let writes = again
+            .row_writes("instance_prefs", "ana/nixie", None)
+            .expect("reads");
+        assert!(writes.pending.is_empty(), "{writes:?}");
+        assert_eq!(writes.refused.len(), 1, "{writes:?}");
+        assert_eq!(writes.refused[0].commit_id, written);
+        assert_eq!(writes.refused[0].rejection.code, "sync.commit_expired");
+        again.close();
+        again.join();
+        drop(again);
+        assert_eq!(client_id(), before, "no reset");
+    }
+
     #[test]
     fn what_a_row_still_owes_and_was_refused_is_read_from_the_file_across_a_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
