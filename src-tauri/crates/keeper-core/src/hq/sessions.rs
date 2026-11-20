@@ -376,9 +376,14 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 // Windows
 // ---------------------------------------------------------------------------
 
-/// The windows a replica holds, each along one scope variable. Every held
-/// session's members are held beside its row, so the People sheet reads
-/// who else is in it.
+/// The tables the windows read, each with the scope variable it is held
+/// along. Every held session's members are held beside its row, so the
+/// People sheet reads who else is in it.
+///
+/// A window is a variable's, not a table's (SPEC §4.8): the unit of one
+/// value covers every table declaring that variable, so the tables of one
+/// variable share one window, whose units are the union of what [`plan`]
+/// asks for each ([`windows`]).
 pub const WINDOWS: [(&str, &str); 13] = [
     ("sessions", "session"),
     ("session_members", "session"),
@@ -396,16 +401,30 @@ pub const WINDOWS: [(&str, &str); 13] = [
     ("standing_grants", "person_agent"),
 ];
 
+/// The window `table` is read through.
 pub fn window(table: &str) -> WindowBase {
     let variable = WINDOWS
         .iter()
         .find(|(t, _)| *t == table)
         .map_or("session", |(_, v)| *v);
-    WindowBase {
-        table: table.to_owned(),
-        variable: variable.to_owned(),
-        fixed_scopes: Vec::new(),
+    WindowBase::along(variable)
+}
+
+/// [`plan`]'s per-table units as the windows hold them: one window per
+/// variable, its units the union of its tables' (sorted, without repeats).
+pub fn windows(plan: Vec<(&'static str, Vec<String>)>) -> Vec<(WindowBase, Vec<String>)> {
+    let mut by_variable: Vec<(WindowBase, BTreeSet<String>)> = Vec::new();
+    for (table, units) in plan {
+        let base = window(table);
+        match by_variable.iter_mut().find(|(held, _)| *held == base) {
+            Some((_, held)) => held.extend(units),
+            None => by_variable.push((base, units.into_iter().collect())),
+        }
     }
+    by_variable
+        .into_iter()
+        .map(|(base, units)| (base, units.into_iter().collect()))
+        .collect()
 }
 
 /// A membership as the window plan reads it.
@@ -465,15 +484,23 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
     .is_some_and(|row| truthy(row, "reads_trace"))
 }
 
-/// Each window's units for one database: every session row, its members and settings;
-/// for each active session its streamed chunks, its claim, its tool switches,
-/// its drives and its attachments' rows (never their bytes), and
-/// its newest months (widened by `widen` for an opened one); its trace
-/// months only where the person reads the trace, and their thinking only
-/// while `reasoning` is shown. An archived session keeps its session, member
-/// and settings rows, plus its attachments' rows while opened (in `widen`): its messages come
-/// through the server's `sessionPage`, and its files' names, sizes and the
-/// right to open them come with these rows, which go again when it closes.
+/// Each table's units for one database, as asked for: every session row, its
+/// members and settings; for each active session its streamed chunks, its
+/// claim, its tool switches, its drives and its attachments' rows (never
+/// their bytes), and its newest months (widened by `widen` for an opened
+/// one); its trace months only where the person reads the trace, and their
+/// thinking only while `reasoning` is shown. An archived session's messages
+/// come through the server's `sessionPage`.
+///
+/// What syncs is wider than these lists. A unit covers every table that
+/// declares its variable (SPEC §4.1), so [`windows`] holds one unit list per
+/// variable, the union of its tables'. Every held session — archived too —
+/// is in the `session` window, so an archived session also receives its
+/// streamed chunks, claim, tool switches, drives and attachments' rows; and
+/// the `trace` window carries `reasoning` wherever the trace is read, shown
+/// or not. Only an archived session's messages stay out: they are under
+/// `page`. The rows are the same person's under scopes the server already
+/// grants; what grows is the volume.
 pub fn plan(
     held: &[Held],
     widen: &HashMap<String, u32>,
@@ -1511,6 +1538,41 @@ mod tests {
         assert_eq!(opened["turn_chunks"], vec!["c.1", "c.3"]);
         assert_eq!(opened["messages"], vec!["c.1/2026-10", "c.3/2026-10"]);
         assert_eq!(opened["approvals"], vec!["c.1/2026-10"]);
+    }
+
+    /// A unit covers every table that declares its variable, so what syncs
+    /// is one unit list per variable: an archived session's id is in the
+    /// `session` window, which carries every session table, and a read
+    /// trace's months carry `reasoning` while thinking is hidden. Messages
+    /// stay out for an archived session.
+    #[test]
+    fn the_windows_sync_an_archived_sessions_tables_and_a_read_traces_reasoning() {
+        let held = vec![
+            membership("c.1", false, true),
+            membership("c.2", true, true),
+        ];
+        let october = 1_790_928_000_000;
+        let windows = windows(plan(&held, &HashMap::new(), false, october));
+        let of = |variable: &str| -> Vec<String> {
+            windows
+                .iter()
+                .find(|(base, _)| *base == WindowBase::along(variable))
+                .map(|(_, units)| units.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(of("session"), vec!["c.1", "c.2"], "the archived one too");
+        for table in [
+            "turn_chunks",
+            "claims",
+            "session_tool_switches",
+            "session_drives",
+            "attachments",
+        ] {
+            assert_eq!(window(table), WindowBase::along("session"), "{table}");
+        }
+        assert_eq!(of("trace"), vec!["c.1/2026-10"], "thinking hidden");
+        assert_eq!(window("reasoning"), WindowBase::along("trace"));
+        assert_eq!(of("page"), vec!["c.1/2026-10"], "no archived message");
     }
 
     #[test]

@@ -23,7 +23,7 @@ keeper ships no server URL).
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
 
-Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
+Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
 
 ```sh
@@ -37,8 +37,16 @@ bun run check:syncular:live   # against a real Postgres, below
 A migration that has been deployed is immutable: a change is a new `NNNN_name/up.sql` and a new
 `schemaVersions` entry. Tables are added; columns are appended and nullable. A server upgrades
 first and serves the previous version beside the new one through syncular's schema window; a
-client rebootstraps on its own schema bump. Removing or renaming a column, changing a type, a
-scope or a primary key is a new table, not an edit.
+client rebootstraps on its own schema bump. Removing or renaming a column, changing a type or a
+primary key is a new table, not an edit. A table's scope patterns are the exception, from
+Syncular 0.69 on: changing them is an edit, made only at a schema-version bump (a new migration
+directory, which may carry no DDL at all), because Syncular re-keys a table whose scope patterns
+differ between two versions for each version's clients. A reference column never crosses scope
+patterns: the referencing table and the referenced one keep the same patterns (§6.11).
+
+Subscriptions are **units** (Syncular's wire 4): a template in `syncular.json` names one value per
+scope variable and no table, and the unit it makes covers every table that declares all of its
+variables. A window is a variable's, not a table's.
 
 ### Schema 5 release prerequisite
 
@@ -79,6 +87,34 @@ server serves schemas 3 through 7 beside it with `kg_proposals` and `kg_reviews`
 `kg_contents` below 7, as before). A keeper whose graph worker reads projection version 3 ships
 with or before the server release that first accepts a review or a reversal event: a version-2
 worker refuses a `review` operation (fails closed) until it is upgraded.
+
+### Schema 9 release prerequisite: the Syncular 0.97 move (wire 4)
+
+Schema 9 (`0009_knowledge_graph_history`, story 115.6) changes no table, column or index. It moves
+the graph's ledger — `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` — from `kg_graph` to a new
+variable, `kg_history`, with the same value (the domain's name) from the same `graph` column; the
+state (`kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`) stays under `kg_graph`.
+`kg_head` sits under `kg_history` only, not under both: it references `kg_events`, and the code
+generator refuses a reference whose parent has other scope patterns (a reference never crosses
+an authorization boundary). So a reader that holds only the state has no head; one that needs
+the graph's freshness subscribes to `kg_history` for it. The server grants `kg_history` wherever
+it grants `kg_graph`; a replica holds the ledger only when it subscribes the ledger's unit. The
+server serves schemas 3 through 8 beside 9 with the ledger under `kg_graph` as before.
+
+The same release moves keeper, keeper-hq and every agent replica to Syncular 0.97.0, which speaks
+wire 4 only and refuses a wire-3 (0.32.1) client with `sync.invalid_request`. So the order is one
+window: the server and the agent containers move first, then the keeper build is published and
+installed on every device; no keeper build containing this contract is published before the
+server has moved. A device not yet updated is refused until it updates. The contract's migrations
+lock is format 3 (`syncular migrations upgrade-lock`); 0001–0008 and their hashes are unchanged.
+On its first open the new client upgrades a 0.32.1 replica in place: it drops the old subscription
+table and re-registers the units the device asks for, which then bootstrap again.
+
+Under 0.97 the server answers `sync.commit_expired` for a commit resent below the watermark it
+acknowledged, after it pruned that commit's result. The client journals the commit rejected and
+drops it from the outbox; keeper shows it as a refusal with that code — the commit may well have
+been applied — and does not reset the client id, although the server's error recommends
+`resetClientId`.
 
 ## Domains and the map
 
@@ -164,7 +200,8 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
 | `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
-| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_reviews` |
+| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` (the state; schema 9) |
+| `kg_history` | the name of the database (its graph's domain) | as `kg_graph` | as `kg_graph` | `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` (the ledger; schema 9; through schema 8 these were under `kg_graph`) |
 | `kg_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `kg_receipts` |
 | `kg_proposal` | a proposer's actor id | itself | itself | `kg_proposals` |
 
@@ -209,9 +246,9 @@ Every id a client creates can be minted offline:
 A row of `messages`, `reasoning`, `tool_calls` or `approvals` carries `page_key` =
 `<session_id>/<yyyy-mm>`, the UTC month of its `created_at_ms`. A long session is therefore
 windowed by month: a client subscribes its newest month or months and widens month by month,
-and an archived session is not subscribed at all. The month lives inside the value, never as a
-variable of its own, because a variable may be requested alone and a month variable would read
-across sessions.
+and no month of an archived session is subscribed (its session-scoped rows still sync under
+`session`). The month lives inside the value, never as a variable of its own, because a variable
+may be requested alone and a month variable would read across sessions.
 
 The server refuses any other value: a `page_key` whose session is not the row's `session_id`, or
 whose month is not the month of the row's `created_at_ms`, or lies before the session's creation
@@ -973,3 +1010,9 @@ cached replay of an earlier run — come back page by page from a registered `se
 refuses a page key the actor does not hold; and unless an agent instance's `agentMemoryOwn` and
 `agentMemoryFamily` subscriptions receive its own rows and its family peers' rows, and never
 another family's. Point it at a fresh, throwaway database.
+
+Which tables a unit covers is the server's own answer (`coveredTables`), never the script's. The
+graph line "none across units" has a self-test, `scripts/check-syncular-live.test.ts`: it declares
+the four ledger tables under `kg_graph` as well, regenerates that contract beside a copy of the
+script, and expects the check to fail on that line. It needs a fresh schema of its own in
+`KEEPER_SYNC_TEST_PG_MUTANT_URL` and is skipped without one.

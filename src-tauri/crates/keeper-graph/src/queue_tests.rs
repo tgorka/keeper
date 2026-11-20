@@ -21,7 +21,7 @@ fn source(dir: &Path, actor: &str, client: &str) -> Source {
             path: dir.join(format!("{actor}.sqlite")),
             client_id: Some(client.to_owned()),
             link: None,
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: None,
         })
         .expect("opens");

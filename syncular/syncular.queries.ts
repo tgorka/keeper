@@ -98,12 +98,11 @@ export interface QueryResultColumn {
   readonly nullable: boolean;
 }
 
+/** A window base (SPEC §4.8) and the unit values a query reads. */
 export interface WindowCoverage {
   readonly base: {
-    readonly table: string;
     readonly variable: string;
-    readonly fixedScopes?: Readonly<Record<string, readonly string[]>>;
-    readonly params?: string;
+    readonly fixedScopes?: Readonly<Record<string, string>>;
   };
   readonly units: readonly string[];
 }
@@ -262,7 +261,7 @@ export const pageReasoningQuery: NamedQuery<PageReasoningRow, PageReasoningParam
     { table: 'reasoning', scopeKeys: ['trace:' + String(params.pageKey) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'reasoning', variable: 'trace' }, units: [String(params.pageKey)] },
+    { base: { variable: 'trace' }, units: [String(params.pageKey)] },
   ],
   bind: (params: PageReasoningParams) => pageReasoningSelect(params).bind,
   rowKey: (row) => [row.id],
@@ -342,7 +341,7 @@ export const pageToolCallsQuery: NamedQuery<PageToolCallsRow, PageToolCallsParam
     { table: 'tool_calls', scopeKeys: ['trace:' + String(params.pageKey) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'tool_calls', variable: 'trace' }, units: [String(params.pageKey)] },
+    { base: { variable: 'trace' }, units: [String(params.pageKey)] },
   ],
   bind: (params: PageToolCallsParams) => pageToolCallsSelect(params).bind,
   rowKey: (row) => [row.id],
@@ -424,7 +423,7 @@ export const pageApprovalsQuery: NamedQuery<PageApprovalsRow, PageApprovalsParam
     { table: 'approvals', scopeKeys: ['trace:' + String(params.pageKey) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'approvals', variable: 'trace' }, units: [String(params.pageKey)] },
+    { base: { variable: 'trace' }, units: [String(params.pageKey)] },
   ],
   bind: (params: PageApprovalsParams) => pageApprovalsSelect(params).bind,
   rowKey: (row) => [row.id],
@@ -501,7 +500,7 @@ export const turnChunksQuery: NamedQuery<TurnChunksRow, TurnChunksParams> = {
     { table: 'turn_chunks', scopeKeys: ['session:' + String(params.sessionId) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'turn_chunks', variable: 'session' }, units: [String(params.sessionId)] },
+    { base: { variable: 'session' }, units: [String(params.sessionId)] },
   ],
   bind: (params: TurnChunksParams) => turnChunksSelect(params).bind,
   rowKey: (row) => [row.id],
@@ -577,7 +576,7 @@ export const sessionAttachmentsQuery: NamedQuery<SessionAttachmentsRow, SessionA
     { table: 'attachments', scopeKeys: ['session:' + String(params.sessionId) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'attachments', variable: 'session' }, units: [String(params.sessionId)] },
+    { base: { variable: 'session' }, units: [String(params.sessionId)] },
   ],
   bind: (params: SessionAttachmentsParams) => sessionAttachmentsSelect(params).bind,
   rowKey: (row) => [row.id],
@@ -663,7 +662,7 @@ export const sessionPageQuery: NamedQuery<SessionPageRow, SessionPageParams> = {
     { table: 'messages', scopeKeys: ['page:' + String(params.pageKey) + ''] },
   ],
   coverage: (params) => [
-    { base: { table: 'messages', variable: 'page' }, units: [String(params.pageKey)] },
+    { base: { variable: 'page' }, units: [String(params.pageKey)] },
   ],
   bind: (params: SessionPageParams) => sessionPageSelect(params).bind,
   rowKey: (row) => [row.id],

@@ -17,11 +17,12 @@
 //   - an agent instance's two memory subscriptions, as the generated
 //     templates request them, receive its own rows and its family peers'
 //     rows and never another family's;
-//   - the graph subscriptions, as the generated templates request them,
-//     receive one graph's rows only under that graph's `kg_graph` value and
-//     a client's receipts only under its own `kg_client` value, and a
-//     caller holding every conversation scope but no graph scope receives
-//     no graph row at all;
+//   - the graph's units, as the generated templates request them, receive
+//     one graph's rows only under that graph's value — its state under
+//     `kg_graph`, its ledger under `kg_history` (schema 9) — the state unit
+//     no ledger row and the ledger unit no state row, a client's receipts
+//     only under its own `kg_client` value, and a caller holding every
+//     conversation scope but no graph scope receives no graph row at all;
 //   - a proposal (`kg_proposals`, schema 8) reaches its proposer under its
 //     own `kg_proposal` value only: another actor's value, and a graph
 //     reader without it, receive none.
@@ -32,9 +33,15 @@
 //   KEEPER_SYNC_TEST_PG_URL="postgres://role_a:…@host/db postgres://role_b:…@host/db" \
 //     bun run check:syncular:live
 
-import { decodeRemoteOperationResponse, encodeRemoteOperationRequest } from "@syncular/core";
 import {
+  decodeRemoteOperationResponse,
+  encodeRemoteOperationRequest,
+  type ScopeMap,
+} from "@syncular/core";
+import {
+  compileSchema,
   computeEffective,
+  coveredTables,
   ensureSyncServerReady,
   handleRemoteOperation,
   MemorySegmentStore,
@@ -43,7 +50,6 @@ import {
   PostgresServerStorage,
   RemoteOperationRegistry,
   registerRemoteQuery,
-  type ScopeMap,
   type ServerSchema,
   type SyncServerConfig,
   seedMutations,
@@ -53,17 +59,10 @@ import {
   agentMemoryFamilySubscription,
   agentMemoryOwnSubscription,
   schema as generatedSchema,
-  kgContentsSubscription,
-  kgEdgesSubscription,
-  kgEventOpsSubscription,
-  kgEventsSubscription,
-  kgHeadSubscription,
-  kgNodesSubscription,
-  kgNodeTagsSubscription,
+  kgGraphSubscription,
+  kgHistorySubscription,
   kgProposalsSubscription,
   kgReceiptsSubscription,
-  kgReviewsSubscription,
-  kgTagsSubscription,
 } from "../syncular/syncular.generated.ts";
 import { sessionPageQuery } from "../syncular/syncular.queries.ts";
 
@@ -141,6 +140,7 @@ function config(sql: SQL): SyncServerConfig {
             agent: [AGENT, PEER, STRANGER],
             family: [FAMILY, OTHER_FAMILY],
             kg_graph: [GRAPH, OTHER_GRAPH],
+            kg_history: [GRAPH, OTHER_GRAPH],
             kg_client: [OWN_RECEIPTS, OTHER_RECEIPTS],
             kg_proposal: [ACTOR, OTHER_PROPOSER],
           }
@@ -194,14 +194,26 @@ async function runSessionPage(
   return decodeRemoteOperationResponse(bytes);
 }
 
-/** The rows of `table` a subscription receives, through the server's own matching. */
+/** The contract as the server compiles it, for its own unit matching. */
+const compiled = compileSchema(schema);
+
+/** The rows of `table` a unit receives, through the server's own matching: the
+ * server decides which tables the unit covers (`coveredTables`, SPEC §4.1: every
+ * table that declares all of its variables) and each one's effective scopes; a
+ * table the unit does not cover receives none. */
 async function rowsFor(
   server: SyncServerConfig,
   table: string,
-  requested: ScopeMap,
+  unit: Record<string, string>,
   allowed: ScopeMap,
 ): Promise<string[]> {
-  const outcome = computeEffective(requested, { ok: true, allowed });
+  if (!compiled.tables.has(table)) fail(`no table ${table} in the contract`);
+  const covered = coveredTables(compiled, unit).find((candidate) => candidate.name === table);
+  if (covered === undefined) return [];
+  const requested: ScopeMap = Object.fromEntries(
+    Object.entries(unit).map(([variable, value]) => [variable, [value]]),
+  );
+  const outcome = computeEffective(covered.declaredVariables, requested, { ok: true, allowed });
   if (outcome.status !== "active") return [];
   const rows = await server.storage.scanRows(PARTITION, {
     table,
@@ -525,39 +537,43 @@ async function checkOne(url: string): Promise<void> {
     { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `proposals-${RUN}` },
     [proposalRow(ACTOR, now), proposalRow(OTHER_PROPOSER, now)],
   );
-  const graphSubscriptions = [
-    kgEventsSubscription,
-    kgEventOpsSubscription,
-    kgHeadSubscription,
-    kgNodesSubscription,
-    kgEdgesSubscription,
-    kgTagsSubscription,
-    kgNodeTagsSubscription,
-    kgContentsSubscription,
-    kgReviewsSubscription,
+  // Schema 9: the state under `kg_graph`, the ledger (head included) under
+  // `kg_history`; one unit of each per graph.
+  const state = ["kg_nodes", "kg_edges", "kg_tags", "kg_node_tags", "kg_contents"];
+  const ledger = ["kg_events", "kg_event_ops", "kg_head", "kg_reviews"];
+  const units = [
+    { tables: state, variable: "kg_graph", unit: kgGraphSubscription.scopes({ database: GRAPH }) },
+    {
+      tables: ledger,
+      variable: "kg_history",
+      unit: kgHistorySubscription.scopes({ database: GRAPH }),
+    },
   ];
-  for (const subscription of graphSubscriptions) {
-    const { table } = subscription;
-    const reader = await rowsFor(first, table, subscription.scopes({ database: GRAPH }), {
-      kg_graph: [GRAPH],
-    });
-    const otherReader = await rowsFor(first, table, subscription.scopes({ database: GRAPH }), {
-      kg_graph: [OTHER_GRAPH],
-    });
-    const conversationOnly = await rowsFor(
-      first,
-      table,
-      subscription.scopes({ database: GRAPH }),
-      CONVERSATION_SCOPES,
-    );
-    if (reader.length !== 1 || !reader[0]?.includes(GRAPH) || reader[0]?.includes(OTHER_GRAPH)) {
-      fail(`${role}: ${table} for its graph's reader received ${JSON.stringify(reader)}`);
+  const graphReader = { kg_graph: [GRAPH], kg_history: [GRAPH] };
+  for (const { tables, variable, unit } of units) {
+    for (const table of tables) {
+      const reader = await rowsFor(first, table, unit, graphReader);
+      const otherReader = await rowsFor(first, table, unit, { [variable]: [OTHER_GRAPH] });
+      const conversationOnly = await rowsFor(first, table, unit, CONVERSATION_SCOPES);
+      if (reader.length !== 1 || !reader[0]?.includes(GRAPH) || reader[0]?.includes(OTHER_GRAPH)) {
+        fail(`${role}: ${table} for its graph's reader received ${JSON.stringify(reader)}`);
+      }
+      if (otherReader.length !== 0 || conversationOnly.length !== 0) {
+        fail(
+          `${role}: ${table} reached a caller without its graph: ` +
+            `${JSON.stringify({ otherReader, conversationOnly })}`,
+        );
+      }
     }
-    if (otherReader.length !== 0 || conversationOnly.length !== 0) {
-      fail(
-        `${role}: ${table} reached a caller without its graph: ` +
-          `${JSON.stringify({ otherReader, conversationOnly })}`,
-      );
+  }
+  // The state unit holds no ledger row and the ledger unit no state row, even
+  // for a reader granted both.
+  for (const { tables, unit } of units) {
+    for (const table of [...state, ...ledger].filter((name) => !tables.includes(name))) {
+      const crossed = await rowsFor(first, table, unit, graphReader);
+      if (crossed.length !== 0) {
+        fail(`${role}: ${table} reached the other graph unit: ${JSON.stringify(crossed)}`);
+      }
     }
   }
   const ownReceipts = await rowsFor(
@@ -622,7 +638,19 @@ async function checkOne(url: string): Promise<void> {
     const stored = chains.find((row: { graph: string }) => row.graph === graph)?.origin_chain;
     return typeof stored === "string" ? JSON.parse(stored) : stored;
   };
-  if (JSON.stringify(chainOf(GRAPH)) !== JSON.stringify(ORIGIN_CHAIN)) {
+  // Object member order is not kept: from Syncular 0.97 a JSON column comes back with its
+  // members in key order, so the chain is compared by value.
+  const sorted = (value: unknown): unknown =>
+    Array.isArray(value)
+      ? value.map(sorted)
+      : value !== null && typeof value === "object"
+        ? Object.fromEntries(
+            Object.entries(value)
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([key, member]) => [key, sorted(member)]),
+          )
+        : value;
+  if (JSON.stringify(sorted(chainOf(GRAPH))) !== JSON.stringify(sorted(ORIGIN_CHAIN))) {
     fail(`${role}: a written origin_chain came back as ${JSON.stringify(chainOf(GRAPH))}`);
   }
   if (chainOf(OTHER_GRAPH) !== null || chains.length !== 2) {
@@ -635,7 +663,8 @@ async function checkOne(url: string): Promise<void> {
       `second start a no-op, this run's commits ${commits}, sessionPage paged ` +
       `${ids1.length}+${ids2.length} fresh rows, foreign page refused, memory: own ${own.length}, ` +
       `family ${family.length} (with the peer), other family ${foreign.length}, graph: ` +
-      `${graphSubscriptions.length} tables one graph each, none without kg_graph, ` +
+      `${state.length} state and ${ledger.length} ledger tables one graph each, none across ` +
+      `units, none without a graph scope, ` +
       `receipts own ${ownReceipts.length} other client ${otherClients.length}, ` +
       `proposals own ${ownProposals.length} other actor ${otherProposals.length} ` +
       `graph reader ${readerProposals.length}, ` +

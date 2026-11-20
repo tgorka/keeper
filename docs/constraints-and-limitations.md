@@ -129,15 +129,13 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   above: the document reader never extracts, and the updater extracts on Windows only,
   minisign-verified releases only. Follow-up: the same updater upgrade to `zip >=9`,
   then remove.
-- **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **expires 2026-12-31**, owner decision
-  2026-11-11): `matrix-sdk-sqlite 0.19.1 -> rusqlite ^0.40.2 -> libsqlite3-sys ^0.38`.
-  `libsqlite3-sys` is `links = "sqlite3"`, so the whole graph (keeper-core, keeper-sync,
-  syncular-client, the graph worker) shares that one version; the fix needs
-  `libsqlite3-sys >=0.39`, i.e. `rusqlite >=0.41`. The exposure is a crafted database plus
-  `-wal` pair with mismatched page sizes opened locally. Bump trigger: matrix-rust-sdk main
-  `18757f7e08` (2026-11-09) moved to `rusqlite 0.41.1` but is not yet released. Follow-up:
-  bump `rusqlite`, `libsqlite3-sys` and keeper-graph-query's exact `=0.38.2` pin once a
-  released `matrix-sdk-sqlite` allows it, then remove the waiver.
+- **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **waiver removed** in story 115.6):
+  the graph now links `rusqlite 0.41.1 -> libsqlite3-sys 0.39.1`, the patched line, and
+  keeper-graph-query's exact pin is `=0.39.1`. matrix-sdk 0.19.1 still asks for rusqlite
+  0.40, so `matrix-sdk-sqlite` comes from the vendored copy in `tools/matrix-sdk-sqlite`
+  (its requirement moved to 0.41 only; D-39). `libsqlite3-sys` is `links = "sqlite3"`,
+  so the whole graph (keeper-core, keeper-sync, syncular-client, the graph worker) still
+  shares one version (`bun run check:one-sqlite`).
 
 No unmaintained crate is replaced in this lane. Each follow-up upgrades or replaces
 the dependency that owns it, rather than substituting an incompatible transitive crate:

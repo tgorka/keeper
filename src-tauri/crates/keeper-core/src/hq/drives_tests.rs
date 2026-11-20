@@ -23,7 +23,7 @@ fn open(dir: &Path, database: &str) -> Source {
         path: dir.join(format!("{database}.sqlite")),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -360,6 +360,7 @@ fn journal_refusal(path: &Path, commit: &str, drives: &[&str], code: &str) {
                        "updated_at_ms": 5})
         .as_object()
         .cloned(),
+        insert: false,
     }];
     let results = vec![CommitOperationOutcome::Error {
         rejection: RejectionRecord {

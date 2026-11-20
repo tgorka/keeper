@@ -817,7 +817,7 @@ impl Replica for Staged {
         }
         self.inner.query_covered(sql, params, base, units)
     }
-    fn subscribe(&self, s: Subscription) -> Result<(), keeper_ports::ReplicaError> {
+    fn subscribe(&self, s: keeper_ports::Unit) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(
@@ -887,8 +887,11 @@ impl Replica for Staged {
     ) -> Result<keeper_ports::RowWrites, keeper_ports::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, keeper_ports::ReplicaError> {
-        self.inner.revoked_units(table)
+    fn revoked_units(
+        &self,
+        base: &keeper_ports::WindowBase,
+    ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
+        self.inner.revoked_units(base)
     }
     fn granted(
         &self,
@@ -1380,7 +1383,7 @@ fn paired_holding_alpha(world: &World) {
         path: alpha,
         client_id: Some("ana.1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");

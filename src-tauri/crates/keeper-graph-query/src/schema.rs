@@ -51,7 +51,7 @@ pub const KEEPER: [&str; 4] = [
 ];
 const SEQUENCE: &str = "CREATE TABLE sqlite_sequence(name,seq)";
 const STATISTICS: &str = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
-/// libsqlite3-sys 0.38.2 `bundled` compiles with SQLITE_ENABLE_STAT4 (its build.rs:164).
+/// libsqlite3-sys 0.39.1 `bundled` compiles with SQLITE_ENABLE_STAT4 (its build.rs:181).
 const STATISTICS4: &str = "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)";
 
 #[derive(Clone, Copy, PartialEq, Eq)]

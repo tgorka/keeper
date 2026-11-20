@@ -45,7 +45,7 @@ use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::vm::{HqDatabaseState, HqPhase, HqStatusVm};
 use keeper_core::hq::Hq;
 use keeper_core::platform::Platform;
-use keeper_ports::{Replica, RowOp, Subscription};
+use keeper_ports::{Replica, RowOp, Unit};
 use keeper_replica::SyncularOpener;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -637,14 +637,10 @@ async fn mutate(replica: &Arc<dyn Replica>, ops: Vec<RowOp>) -> String {
         .expect("joins")
 }
 
-async fn subscribe(replica: &Arc<dyn Replica>, id: &str, table: &str, variable: &str, value: &str) {
+async fn subscribe(replica: &Arc<dyn Replica>, variable: &str, value: &str) {
     let replica = Arc::clone(replica);
-    let subscription = Subscription {
-        id: id.to_owned(),
-        table: table.to_owned(),
-        scopes: vec![(variable.to_owned(), vec![value.to_owned()])],
-    };
-    tokio::task::spawn_blocking(move || replica.subscribe(subscription).expect("subscribes"))
+    let unit = Unit::of(variable, value);
+    tokio::task::spawn_blocking(move || replica.subscribe(unit).expect("subscribes"))
         .await
         .expect("joins");
 }
@@ -876,7 +872,7 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
             )],
         )
         .await;
-        subscribe(&rb, &format!("page-{db}"), "messages", "page", &page).await;
+        subscribe(&rb, "page", &page).await;
         rb.sync_now();
         let rows = wait_rows(
             &rb,
@@ -3551,8 +3547,10 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         &keeper_ports::Rejection::new("blob.too_large", ""),
         "huge.zip",
     );
-    // Resolved: the commit goes without the body and the server refuses
-    // it; the message stays shown with its caption and the upload's reason.
+    // Resolved: the commit stands refused — by the client itself when the
+    // server's body says the refusal is final (`retryable: false`), by the
+    // server when a bare status made keeper push it without the body. Either
+    // way the message stays shown with its caption and the upload's reason.
     let delivery = delivered(&skip.replica, &refused_commit).await;
     assert!(matches!(delivery, Delivery::Refused(_)), "{delivery:?}");
     let shown_refused = |hq: &Arc<Hq>| {

@@ -515,59 +515,78 @@ fn a_caller_sends_only_under_its_own_authority() {
         .is_empty());
 }
 
-/// CC-7/CC-8: a revocation is a signal as soon as one graph, receipt or
-/// proposal subscription reads revoked, and purged only once every one of
-/// the subscribed tables has a subscription and all of them read revoked.
+/// CC-7/CC-8: a revocation is a signal as soon as one of the graph's units
+/// (state, ledger, receipts, proposals) reads revoked, and purged only once
+/// every subscribed table is covered by a unit and all of them read
+/// revoked — the unit itself, or its last pull's echo for the table.
 #[test]
 fn a_purge_needs_every_subscribed_table_revoked() {
-    use super::client::subscribed_tables;
+    use super::client::{subscribed_tables, units};
     use super::source::{revocation_of, Revocation};
     let tables = subscribed_tables();
     assert!(tables.contains(&"kg_receipts"));
     assert!(tables.contains(&"kg_contents"));
     assert!(tables.contains(&"kg_reviews"));
     assert!(tables.contains(&"kg_proposals"));
-    let row = |table: &str, status: &str| {
-        json!({"tbl": table, "status": status})
+    let held = units("alpha", "ana", "dev1");
+    let row = |n: usize, status: &str| {
+        json!({"scopes": json!(held[n].scopes).to_string(), "status": status, "echo": null})
             .as_object()
             .cloned()
             .unwrap_or_default()
     };
     let all = |status: &str| -> Vec<Map<String, Value>> {
-        tables.iter().map(|t| row(t, status)).collect()
+        (0..held.len()).map(|n| row(n, status)).collect()
     };
     assert_eq!(revocation_of(&tables, &all("active")), Revocation::None);
     assert_eq!(revocation_of(&tables, &all("revoked")), Revocation::Purged);
-    for (n, table) in tables.iter().enumerate() {
-        // One table still active: its rows may be on disk.
+    for n in 0..held.len() {
+        let unit = &held[n].scopes;
+        // One unit still active: its tables' rows may be on disk.
         let mut rows = all("revoked");
-        rows[n] = row(table, "active");
+        rows[n] = row(n, "active");
         assert_eq!(
             revocation_of(&tables, &rows),
             Revocation::Partial,
-            "{table}"
+            "{unit:?}"
         );
-        // One table with no subscription at all: not purged either.
+        // One unit not held at all: not purged either.
         let mut rows = all("revoked");
         rows.remove(n);
         assert_eq!(
             revocation_of(&tables, &rows),
             Revocation::Partial,
-            "{table}"
+            "{unit:?}"
         );
-        // Only that table revoked: already a signal.
+        // Only that unit revoked: already a signal.
         let mut rows = all("active");
-        rows[n] = row(table, "revoked");
+        rows[n] = row(n, "revoked");
         assert_eq!(
             revocation_of(&tables, &rows),
             Revocation::Partial,
-            "{table}"
+            "{unit:?}"
         );
     }
     assert_eq!(revocation_of(&tables, &[]), Revocation::None);
-    // A table held by two subscriptions (a re-subscribe, a second scope):
-    // one still active keeps its rows, so the table is not purged.
+    // A table held by two units of its variable: one still active keeps
+    // its rows, so the table is not purged.
     let mut rows = all("revoked");
-    rows.push(row("kg_receipts", "active"));
+    rows.push(
+        json!({"scopes": json!({"kg_client": "other"}).to_string(), "status": "active"})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    assert_eq!(revocation_of(&tables, &rows), Revocation::Partial);
+    // An active unit whose last pull revoked one of its tables: a signal.
+    let mut rows = all("active");
+    rows[1] = json!({
+        "scopes": json!(held[1].scopes).to_string(),
+        "status": "active",
+        "echo": json!([{"table": "kg_events", "status": "revoked", "scopes": {}}]).to_string(),
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default();
     assert_eq!(revocation_of(&tables, &rows), Revocation::Partial);
 }

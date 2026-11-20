@@ -32,9 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keeper_graph::client::{
-    subscribed_tables, subscriptions, GraphClient, GraphClientError, Prepared,
-};
+use keeper_graph::client::{subscribed_tables, units, GraphClient, GraphClientError, Prepared};
 use keeper_graph::lifecycle::Lifecycle;
 use keeper_graph::outcome::{GraphOutcome, PendingCause};
 use keeper_graph::prefix::{self, Prefix};
@@ -74,7 +72,7 @@ fn open_at(index: u8, database: &str, url: &str, name: &str) -> Source {
             base_url: format!("{url}/{database}"),
             token: env(&format!("KEEPER_HQ_LIVE_TOKEN_{index}")),
         }),
-        subscriptions: subscriptions(database, &actor, &client),
+        units: units(database, &actor, &client),
         watch_presence: None,
     })
     .expect("opens a real replica");
@@ -700,7 +698,7 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
         path: state_dir().join(format!("offline-{}.sqlite", ulid())),
         client_id: Some(env("KEEPER_HQ_LIVE_CLIENT_1")),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -1035,7 +1033,7 @@ fn reviewer() -> Source {
             base_url: format!("{}/{database}", env("KEEPER_HQ_LIVE_URL")),
             token: env("KEEPER_HQ_LIVE_REVIEWER_TOKEN"),
         }),
-        subscriptions: subscriptions(&database, &actor, &client),
+        units: units(&database, &actor, &client),
         watch_presence: None,
     })
     .expect("opens a real replica");
@@ -1891,7 +1889,7 @@ fn unlinked_at(index: u8, database: &str, name: &str) -> Source {
         path: state_dir().join(name),
         client_id: Some(client.clone()),
         link: None,
-        subscriptions: subscriptions(database, &actor, &client),
+        units: units(database, &actor, &client),
         watch_presence: None,
     })
     .expect("opens the replica unlinked");

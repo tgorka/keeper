@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 # The reviewed worker's canonical bytes: JCS serialized from the borrowed tree.
 serde_jcs = { workspace = true }
 rusqlite = { workspace = true, features = ["hooks", "limits"] }
-libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
+libsqlite3-sys = { version = "=0.39.1", features = ["bundled"] }
 # `stats` only adds relaxed counters (max/total) inside the same audited alloc paths.
 cap = { version = "=0.1.2", features = ["stats"] }
 nix = { version = "=0.31.3", default-features = false, features = ["resource"] }

@@ -214,16 +214,18 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
     "UIApplication",
 ] }
 # Account registry + opaque account ids. rusqlite is also matrix-sdk's store engine:
-# the graph links one libsqlite3-sys (`bun run check:one-sqlite`).
+# the graph links one libsqlite3-sys (`bun run check:one-sqlite`). 0.41 because
+# syncular-client >= 0.58 requires it (story 115.6); matrix-sdk-sqlite follows
+# through the vendored copy patched in below.
 ulid = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # The agents' database (AD-418, AD-421): the person's own syncular server, one
 # local replica per database the device's token opens. Consumed by keeper-replica
 # and by keeper-core's and keeper-graph's tests only, behind keeper-ports. Apache-2.0; its `native-transport`
 # is ureq 3, tungstenite 0.30 (rustls, webpki roots), url 2 and polling 3 —
 # all already in Cargo.lock — and it links the rusqlite above, so the graph
 # still holds one libsqlite3-sys (`bun run check:one-sqlite`).
-syncular-client = { version = "=0.32.1", features = ["native-transport"] }
+syncular-client = { version = "=0.97.0", features = ["native-transport"] }
 # The classic NanoKVM's login (96.5, `keeper-ported::nanokvm`): its password
 # travels AES-256-CBC-encrypted under a key the reference publishes. Both
 # already in Cargo.lock (matrix-sdk-crypto, vodozemac); `MIT OR Apache-2.0`.
@@ -576,5 +578,13 @@ panic = "abort"
 # selectors, which push on the iPhone needs (Epic 98, `push_ios.rs`). See
 # tools/tao/NOTICE. Retire it when upstream has both: delete this table and the
 # directory.
+#
+# Two vendored copies, story 115.6 (decision D-39): matrix-sdk-sqlite 0.19.1 with
+# its rusqlite requirement moved to 0.41, so Matrix links beside syncular-client
+# 0.97.0 on one libsqlite3-sys; and syncular-client 0.97.0 with one type
+# annotation that keeper's graph needs. Each directory's VENDORED.md holds the
+# exact diff and the condition that retires it.
 [patch.crates-io]
 tao = { path = "../tools/tao" }
+matrix-sdk-sqlite = { path = "../tools/matrix-sdk-sqlite" }
+syncular-client = { path = "../tools/syncular-client" }

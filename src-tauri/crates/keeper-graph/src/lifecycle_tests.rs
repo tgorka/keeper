@@ -91,7 +91,7 @@ fn queued(dir: &Path) -> Lifecycle {
             path: dir.join("ana.sqlite"),
             client_id: Some("dev1".to_owned()),
             link: None,
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: None,
         })
         .expect("opens");
@@ -289,7 +289,7 @@ fn enqueue_another(lifecycle: &Lifecycle, dir: &Path) -> String {
                 path: dir.join("ana-2.sqlite"),
                 client_id: Some("dev1".to_owned()),
                 link: None,
-                subscriptions: Vec::new(),
+                units: Vec::new(),
                 watch_presence: None,
             })
             .expect("opens"),

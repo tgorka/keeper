@@ -1,0 +1,13 @@
+-- The knowledge graph's state and its ledger under two scope variables, schema version 9 (the
+-- README's *The knowledge graph*; story 115.6). 0006, 0007 and 0008 are never re-opened.
+--
+-- No table, column or index changes. What changes is the manifest's scope of the graph tables
+-- (`syncular.json`), which Syncular applies at a schema-version bump and nowhere else: a table
+-- whose scope patterns differ between two versions is re-keyed for that version's clients.
+--   * state, `kg_graph` (the domain's name): `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`,
+--     `kg_contents`;
+--   * ledger, `kg_history` (the same domain name): `kg_events`, `kg_event_ops`, `kg_head`,
+--     `kg_reviews`.
+-- `kg_head` sits under `kg_history` only: `kg_head.event_id` references `kg_events`, and a
+-- reference may not cross scope patterns. A replica that needs the head subscribes to the ledger.
+-- Both variables take their value from the same `graph` column; each is a unit of its own.

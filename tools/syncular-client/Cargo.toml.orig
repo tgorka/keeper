@@ -1,0 +1,93 @@
+[package]
+name = "syncular-client"
+version = "0.97.0"
+edition = "2021"
+description = "Syncular v2 Rust client core on rusqlite, implemented from SPEC.md alone (language-neutrality POC, stage 2)"
+license = "Apache-2.0"
+repository = "https://github.com/syncular/syncular"
+
+[dependencies]
+ssp2 = { package = "syncular-ssp2", path = "../ssp2", version = "0.97.0" }
+# §12 local authority for native hosts: `localAuthorityPath` routes sync rounds
+# to the in-process authority until attach completes. Feature-gated so the
+# conformance and wasm builds do not link the server profile.
+syncular-authority = { path = "../authority", version = "0.97.0", optional = true }
+# The 0.40 line gates the fallible `u64`/`usize` conversions behind this
+# feature, and the client passes both as SQLite parameters. The conversions
+# error on a value SQLite cannot hold instead of truncating it.
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ryu-js = "1.0.3"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+libc = { version = "0.2", optional = true }
+
+# §5.10.5 native CRDT: the Rust Yjs port. Feature-gated so the
+# dependency-lean core (and the conformance/codec builds that never touch a
+# crdt column's contents) do not pay for it. yrs is Yjs-wire-compatible — an
+# update it produces merges byte-identically with a `@syncular/crdt-yjs`
+# update on the server (§5.10.2), which is what makes the cross-core pairing
+# converge. Only the app-facing materialize/edit helpers need it; round-trip
+# of opaque crdt bytes stays free (a crdt column is a bytes column, §2.4).
+[dependencies.yrs]
+version = "0.28"
+optional = true
+
+# §5.11 client-side encryption. rand_core supplies the production CSPRNG nonce
+# at the encode seam; the crypto/wrap primitives live in ssp2 behind e2ee.
+[dependencies.rand_core]
+version = "0.6"
+features = ["getrandom"]
+optional = true
+
+# One native transport implementation shared by the FFI and Tauri hosts.
+# Keeping it behind a client feature preserves dependency-lean core builds.
+[dependencies.ureq]
+version = "3.5"
+optional = true
+
+[dependencies.tungstenite]
+version = "0.30"
+optional = true
+features = ["rustls-tls-webpki-roots"]
+
+[dependencies.url]
+version = "2"
+optional = true
+
+[dependencies.polling]
+version = "3"
+optional = true
+
+# `wasm32-unknown-unknown` runs inside a JS host: the wall clock comes from
+# `Date.now()`, uuid's v4 source is the host CSPRNG, and the `getrandom`
+# versions behind `e2ee` need their JS backend switched on (getrandom 0.2 wants
+# the `js` feature, 0.4 the `wasm_js` feature; the cfg flag getrandom 0.3 asks
+# for does not exist in either). Without them those crates refuse to compile on
+# this target, and `std::time::SystemTime` panics at runtime. The getrandom
+# entries are feature-unification shims for crates this crate does not call
+# directly.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom_js = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_wasm_js = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+js-sys = "0.3"
+uuid = { version = "1", features = ["v4", "js"] }
+
+# Tests count COMMITs with a commit hook.
+[dev-dependencies]
+# §7.2.2 tests drive a real server: the local authority.
+syncular-authority = { path = "../authority" }
+rusqlite = { version = "0.41", features = ["hooks"] }
+tungstenite = "0.30"
+
+[features]
+default = []
+# Internal repository measurements and conformance only. Exposes the owned
+# connection for benchmark reads and deterministic SQLite fault setup.
+bench-internals = ["dep:libc"]
+# A local authority merges crdt pushes too (§5.10.3), so it gets the merger.
+crdt-yjs = ["dep:yrs", "syncular-authority?/crdt-yjs"]
+e2ee = ["ssp2/e2ee", "dep:rand_core"]
+native-transport = ["dep:ureq", "dep:tungstenite", "dep:url", "dep:polling"]
+local-authority = ["dep:syncular-authority"]

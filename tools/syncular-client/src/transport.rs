@@ -1,0 +1,291 @@
+//! The transport seam handed TO the client by its host (the conformance
+//! harness, an app shell, …). Bytes and strings only — mirroring the
+//! `ClientEndpoints` inversion of the conformance driver contract. The
+//! client is synchronous: the driver protocol is request/response.
+
+/// A transport-level or request-level failure (§1.1 HTTP-JSON surface).
+#[derive(Debug, Clone)]
+pub struct TransportError {
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl TransportError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        TransportError {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+/// Direct-endpoint segment fetch (§5.5). Signed-URL descriptors never
+/// reach this call: the §5.4 resolution lives in the client core, which
+/// routes url-carrying descriptors through `fetch_url` instead.
+#[derive(Debug, Clone)]
+pub struct SegmentRequest {
+    pub segment_id: String,
+    pub table: String,
+    /// Canonical JSON (§11.2) of the requested scope map (§5.5).
+    pub requested_scopes_json: String,
+    /// The descriptor's `byteLength` (§5.4): the transport stops reading once
+    /// the body exceeds it, and the client rejects the longer body.
+    pub byte_length: u64,
+}
+
+/// One segment body fetch of a response's batch: the direct endpoint (§5.5) or
+/// a signed URL (§5.4). The client resolves §5.4 descriptor routing before the
+/// batch, so a URL arm here is always fetchable (never at/past expiry).
+#[derive(Debug, Clone)]
+pub enum SegmentFetch {
+    /// Direct-endpoint request (§5.5).
+    Direct(SegmentRequest),
+    /// Plain GET of a signed URL; the URL is the entire grant (§5.4).
+    /// `byte_length` caps the read as on [`SegmentRequest`].
+    Url { url: String, byte_length: u64 },
+}
+
+/// A §5.9.5 blob download result: inline bytes, or a presigned url the client
+/// fetches directly (always-issue). `url_expires_at_ms` is present iff `url`.
+#[derive(Debug, Clone)]
+pub enum BlobDownload {
+    Bytes(Vec<u8>),
+    Url {
+        url: String,
+        url_expires_at_ms: Option<i64>,
+    },
+}
+
+/// A §5.9.3 presigned-upload grant: a single PUT url, an already-present
+/// marker (skip the PUT), or none (stream through the direct endpoint).
+#[derive(Debug, Clone)]
+pub enum BlobUploadGrant {
+    Url {
+        url: String,
+        url_expires_at_ms: Option<i64>,
+    },
+    Present,
+    None,
+}
+
+pub trait Transport {
+    /// One combined push+pull round trip (§1.5) over the request/response
+    /// binding (`POST /sync`, loopback, …).
+    fn sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError>;
+    /// One registered authoritative query or command request. Hosts that do
+    /// not expose `<mount>/operations` keep the default fail-loud behavior.
+    fn remote_operation(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let _ = request;
+        Err(TransportError::new(
+            "client.remote_operations_unconfigured",
+            "this transport has no remote operation endpoint",
+        ))
+    }
+    /// One combined push+pull round over the realtime socket (§8.7). The
+    /// host owns the WS-binding mechanics — channel tags, chunk assembly
+    /// to the response's END — and returns the assembled response bytes.
+    /// The client calls this instead of `sync` whenever realtime is
+    /// connected (the socket IS the sync-round
+    /// transport, not a fallback pair); the server registers the round's
+    /// live units on the connection at round end, so no reconnect is
+    /// needed after registration changes (§8.7).
+    fn realtime_sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError>;
+    /// Segment download via the direct endpoint (§5.5).
+    fn download_segment(
+        &mut self,
+        request: &SegmentRequest,
+        _on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, TransportError>;
+    /// Every eligible segment body of one response, in wire order (§5.4 / §5.5).
+    /// `on_progress` receives the fetch index and that fetch's cumulative
+    /// decoded bytes.
+    ///
+    /// Returns one result per attempted fetch, in the same order. The default
+    /// runs the single `download_segment` / `fetch_url` calls in order and
+    /// stops after the first error, so a shorter result list means the
+    /// remaining fetches were not attempted. A host that overlaps the fetches
+    /// may attempt all of them; the client still stops consuming at the first
+    /// error, at that descriptor's position in the wire order.
+    fn download_segments(
+        &mut self,
+        fetches: &[SegmentFetch],
+        on_progress: &mut (dyn FnMut(usize, u64) + Send),
+    ) -> Vec<Result<Vec<u8>, TransportError>> {
+        let mut results = Vec::new();
+        for (index, fetch) in fetches.iter().enumerate() {
+            let mut report = |bytes| on_progress(index, bytes);
+            let result = match fetch {
+                SegmentFetch::Direct(request) => self.download_segment(request, &mut report),
+                SegmentFetch::Url { url, byte_length } => {
+                    self.fetch_url(url, *byte_length, &mut report)
+                }
+            };
+            let failed = result.is_err();
+            results.push(result);
+            if failed {
+                break;
+            }
+        }
+        results
+    }
+    /// §5.4 direct URL fetch capability: `true` makes the client
+    /// advertise accept bit 3 (capability negotiation, §4.2). Default:
+    /// not capable.
+    fn supports_url_fetch(&self) -> bool {
+        false
+    }
+    /// Plain GET of a signed URL (§5.4). The URL is the entire grant —
+    /// implementations MUST NOT attach sync-server authentication or the
+    /// `X-Syncular-Scopes` header. Only called when `supports_url_fetch`
+    /// returned `true`. Reading stops once the body exceeds `byte_length`.
+    fn fetch_url(
+        &mut self,
+        url: &str,
+        byte_length: u64,
+        _on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, TransportError> {
+        let _ = (url, byte_length);
+        Err(TransportError::new(
+            "sync.invalid_request",
+            "this transport has no direct URL fetch (§5.4)",
+        ))
+    }
+    /// The I/O executor records when a signed segment fetch began. Apply
+    /// checks expiry against that instant, preserving the fetch-start rule.
+    fn segment_fetch_started_at(&self, _url: &str) -> Option<i64> {
+        None
+    }
+    /// §5.9.3 blob upload: host-authenticated `PUT <mount>/blobs/{blobId}`.
+    /// The server verifies the content address. Default: unsupported.
+    fn blob_upload(
+        &mut self,
+        blob_id: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let _ = (blob_id, bytes, media_type);
+        Err(TransportError::new(
+            "sync.invalid_request",
+            "this transport has no blob upload (§5.9)",
+        ))
+    }
+    /// §5.9.5 blob download: host-authenticated `GET <mount>/blobs/{blobId}`,
+    /// re-authorized server-side against referencing rows. Returns inline
+    /// bytes OR (always-issue, presign configured) a signed url the client
+    /// fetches directly. `byte_length` is the BlobRef's declared size when the
+    /// caller has one; reading inline bytes stops once the body exceeds it.
+    /// Default: none.
+    fn blob_download(
+        &mut self,
+        blob_id: &str,
+        byte_length: Option<u64>,
+    ) -> Result<BlobDownload, TransportError> {
+        let _ = (blob_id, byte_length);
+        Err(TransportError::new(
+            "blob.not_found",
+            "this transport has no blob download (§5.9)",
+        ))
+    }
+    /// §5.9.5 presigned-download fetch: a bare GET of the signed url. MUST
+    /// attach NO host authentication — the url is the entire grant (§5.4).
+    /// Only called when `blob_download` returned a `Url` arm. Reading stops
+    /// once the body exceeds `byte_length`.
+    fn fetch_blob_url(
+        &mut self,
+        url: &str,
+        byte_length: Option<u64>,
+    ) -> Result<Vec<u8>, TransportError> {
+        let _ = (url, byte_length);
+        Err(TransportError::new(
+            "sync.invalid_request",
+            "this transport has no blob url fetch (§5.9.5)",
+        ))
+    }
+    /// §5.9.3 presigned-upload grant: `POST /blobs/{blobId}/upload-grant` with
+    /// the declared size. Absent (`None`) ⇒ the client always streams through
+    /// `blob_upload`. A `Url` grant is PUT via `blob_put_url`.
+    fn blob_upload_grant(
+        &mut self,
+        blob_id: &str,
+        byte_length: u64,
+        media_type: Option<&str>,
+    ) -> Result<BlobUploadGrant, TransportError> {
+        let _ = (blob_id, byte_length, media_type);
+        Ok(BlobUploadGrant::None)
+    }
+    /// §5.9.3 direct-to-storage PUT of the granted url. MUST attach NO host
+    /// authentication — the presigned url is the entire grant (§5.4). Only
+    /// called when `blob_upload_grant` returned a `Url` arm.
+    fn blob_put_url(
+        &mut self,
+        blob_id: &str,
+        url: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let _ = (blob_id, url, bytes, media_type);
+        Err(TransportError::new(
+            "sync.invalid_request",
+            "this transport has no blob put url (§5.9.3)",
+        ))
+    }
+    /// Realtime attach (§8.1). Inbound traffic is delivered by the host via
+    /// `SyncClient::on_realtime_text` / `on_realtime_binary`.
+    /// Open realtime for this exact persisted client identity. Native socket
+    /// servers bind registrations/cursors to the URL-level client id before
+    /// any protocol frame is exchanged. Implementations that close over their
+    /// identity ignore the argument.
+    fn realtime_connect(&mut self, client_id: &str) -> Result<(), TransportError>;
+    /// The whole-round network deadline this transport would apply, as a
+    /// budget. `None` (the default) means no round deadline. The client
+    /// anchors the returned budget once per round and scopes it to each
+    /// `PreparedSyncRound::exchange`, so a reused transport never carries
+    /// stale deadline state.
+    fn round_deadline(&self) -> Option<std::time::Duration> {
+        None
+    }
+    /// Scope the transport to one absolute round deadline for the duration of
+    /// a single exchange; `None` clears it. The default ignores it.
+    fn set_round_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
+    /// Scope the transport to the §7.8 drive bound for the duration of a single
+    /// exchange; `None` clears it. No network call of the exchange may wait
+    /// longer than the bound for a byte to move, and every byte restarts it;
+    /// a call that reaches it fails with `sync.idle_timeout`. The default
+    /// ignores it.
+    fn set_idle_bound(&mut self, _bound: Option<std::time::Duration>) {}
+    /// Client → server JSON control message (acks, §8.2).
+    fn realtime_send(&mut self, text: &str) -> Result<(), TransportError>;
+    fn realtime_close(&mut self) -> Result<(), TransportError>;
+    /// §12: open (or reopen) the host-configured local authority with the
+    /// client's schema before the client opens its replica at `replica_path`.
+    /// A transport without a local authority has nothing to open.
+    fn open_local_authority(
+        &mut self,
+        schema: &serde_json::Value,
+        replica_path: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let _ = (schema, replica_path);
+        Ok(())
+    }
+    /// §12.3 state of the opened local authority (`local`, `attaching`,
+    /// `attached`); `None` when the host configured none or it is not open.
+    fn local_authority_state(&self) -> Option<&'static str> {
+        None
+    }
+    /// §12.3 attach: upload the local authority's rows to the remote server.
+    fn attach_local_authority(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::new(
+            crate::LOCAL_AUTHORITY_UNCONFIGURED_CODE,
+            "this transport has no local authority",
+        ))
+    }
+    /// §12.3 abandon: roll a stopped attach back and serve the client locally.
+    fn abandon_local_authority_attach(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::new(
+            crate::LOCAL_AUTHORITY_UNCONFIGURED_CODE,
+            "this transport has no local authority",
+        ))
+    }
+}

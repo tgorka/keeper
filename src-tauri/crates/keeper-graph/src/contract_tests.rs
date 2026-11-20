@@ -9,7 +9,8 @@ use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change;
 use super::protocol::delta::Op;
 use super::protocol::scope::{
-    CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
+    CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, HISTORY_TABLES, HISTORY_VARIABLE,
+    PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE, STATE_TABLES,
 };
 use super::protocol::SCHEMA_VERSION;
 use keeper_graph_protocol::tag::normalise;
@@ -246,14 +247,16 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
     }
 }
 
-/// Every graph table carries exactly one scope variable, `kg_graph` on the
-/// graph's rows, `kg_client` on receipts and `kg_proposal` on proposals;
-/// no other table carries any of them, and no subscription reaches a graph
-/// table through any other variable.
+/// Every graph table carries exactly one scope variable: `kg_graph` on the
+/// state, `kg_history` on the ledger (schema 9, story 115.6), `kg_client`
+/// on receipts and `kg_proposal` on proposals; no other table carries any
+/// of them, and every unit template naming one names nothing else.
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = keeper_replica::schema().expect("schema");
-    assert_eq!(ir["schemaVersion"], SCHEMA_VERSION);
+    // The contract's head is 9; the graph tables' own DDL is still 8's.
+    assert_eq!(ir["schemaVersion"], 9);
+    assert_eq!(SCHEMA_VERSION, 8);
     let tables = ir["tables"].as_array().expect("tables");
     let scopes = |name: &str| -> Vec<(String, String)> {
         let table = tables
@@ -272,10 +275,21 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             })
             .collect()
     };
-    for table in GRAPH_TABLES {
+    assert_eq!(
+        GRAPH_TABLES.len(),
+        STATE_TABLES.len() + HISTORY_TABLES.len()
+    );
+    for table in STATE_TABLES {
         assert_eq!(
             scopes(table),
             [(GRAPH_VARIABLE.to_owned(), "graph".to_owned())],
+            "{table}"
+        );
+    }
+    for table in HISTORY_TABLES {
+        assert_eq!(
+            scopes(table),
+            [(HISTORY_VARIABLE.to_owned(), "graph".to_owned())],
             "{table}"
         );
     }
@@ -300,22 +314,15 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             assert!(!variable.starts_with("kg_"), "{name} carries {variable}");
         }
     }
-    for subscription in ir["subscriptions"].as_array().expect("subscriptions") {
-        let table = subscription["table"].as_str().expect("table");
-        if !table.starts_with("kg_") {
-            continue;
-        }
-        let requested: Vec<&str> = subscription["scopes"]
+    for template in ir["subscriptions"].as_array().expect("subscriptions") {
+        let variables: Vec<&str> = template["scopes"]
             .as_array()
             .expect("scopes")
             .iter()
             .map(|scope| scope["variable"].as_str().expect("variable"))
             .collect();
-        let expected = match table {
-            RECEIPT_TABLE => CLIENT_VARIABLE,
-            PROPOSAL_TABLE => PROPOSAL_VARIABLE,
-            _ => GRAPH_VARIABLE,
-        };
-        assert_eq!(requested, [expected], "{table}");
+        if variables.iter().any(|variable| variable.starts_with("kg_")) {
+            assert_eq!(variables.len(), 1, "{template}");
+        }
     }
 }

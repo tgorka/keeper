@@ -2174,3 +2174,34 @@ an owner's included — change who is in a domain.
 - **Status / owner:** decided by the owner (the answers quoted above), 2026-11. What keeper ships now,
   with story 114.2's contract rung, is the contract and its vectors; enforcement is keeper-hq's
   server side of story 114.2. Owner is the architect.
+
+## D-39 — keeper builds two upstream crates from vendored copies until their fixes are released
+
+Story 115.6 moves keeper to Syncular 0.97.0, the newest release, which the owner asked for even at
+the cost of switching Matrix off for a while. It did not come to that: two upstream crates needed
+one small change each, and keeper builds both from copies under `tools/`, wired through
+`[patch.crates-io]` in `src-tauri/Cargo.toml`, as it already does for `tools/tao`.
+
+- **`tools/matrix-sdk-sqlite`** — matrix-sdk-sqlite 0.19.1 with its `rusqlite` requirement moved
+  from 0.40.2 to 0.41, and no source change. Every syncular-client from 0.58 needs rusqlite 0.41;
+  matrix-sdk 0.19.1, the newest release, needs 0.40. Both pull a `libsqlite3-sys` that declares
+  `links = "sqlite3"`, so the two cannot be resolved into one build, not even with matrix-sdk made
+  optional. The copy compiles unchanged on 0.41, so Matrix stays on: sign-in, chats, verification,
+  the bridges and push are unchanged, and so is the on-disk Matrix store. It also takes keeper off
+  `libsqlite3-sys` 0.38, retiring the RUSTSEC-2026-0459 waiver.
+  **Removal:** when a matrix-sdk release whose `matrix-sdk-sqlite` requires rusqlite 0.41 exists.
+- **`tools/syncular-client`** — syncular-client 0.97.0 with one type annotation in `scope_filter`'s
+  closure (`Ok::<_, ()>(…)`). Without it the crate does not compile in keeper's dependency graph:
+  rustls under reqwest 0.13 brings `aws-lc-rs`, whose `From<()>` implementations make the closure's
+  error type ambiguous (E0282/E0283). Nothing else in the copy differs from the published crate.
+  **Removal:** when a Syncular release carries the annotation, or otherwise compiles in keeper's
+  graph.
+- **Rule for both:** each directory's `VENDORED.md` names the published version, the sha256 of the
+  `.crate` it came from and the exact diff; no other edit is made inside them. A copy is retired by
+  deleting its directory and its `[patch.crates-io]` line and running `cargo update -p <crate>`.
+- **Gate:** `bun run check:one-sqlite` — the build holds exactly one `libsqlite3-sys` (0.39.x); and
+  `cargo tree -i rusqlite --edges normal,build` shows one `rusqlite` (0.41.x).
+- **Revisit triggers:** either upstream release above; a second change needed inside either copy,
+  which would make it a fork rather than a pinned patch.
+- **Status / owner:** decided within the owner's choice of the newest Syncular release (story
+  115.6), 2026-11-19. Owner is the architect.

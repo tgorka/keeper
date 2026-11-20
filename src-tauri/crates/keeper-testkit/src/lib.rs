@@ -237,7 +237,7 @@ impl Replica for FakeReplica {
     ) -> Result<Covered, ReplicaError> {
         Ok((self.query(sql, params)?, Vec::new()))
     }
-    fn subscribe(&self, _: Subscription) -> Result<(), ReplicaError> {
+    fn subscribe(&self, _: Unit) -> Result<(), ReplicaError> {
         Ok(())
     }
     fn set_window(&self, _: &WindowBase, _: &[String]) -> Result<(), ReplicaError> {
@@ -306,7 +306,7 @@ impl Replica for FakeReplica {
     fn granted(&self, _: &str, _: &str) -> Result<Vec<String>, ReplicaError> {
         Ok(Vec::new())
     }
-    fn revoked_units(&self, _: &str) -> Result<Vec<String>, ReplicaError> {
+    fn revoked_units(&self, _: &WindowBase) -> Result<Vec<String>, ReplicaError> {
         Ok(Vec::new())
     }
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
@@ -467,10 +467,21 @@ pub type Seen = Arc<Mutex<Vec<(String, String, u16, String)>>>;
 
 /// A server for the blob half of a round: an upload grant is answered
 /// `{}` (no signed URL: `PUT` it here) and a `PUT` `200`, unless
-/// `refused` names the blob (then that status, on both); anything else
-/// — the round's push, the socket — `503`: the network cut after the
-/// upload and before the metadata exchange.
+/// `refused` names the blob (then that status, on both, with a bare `{}`
+/// body); anything else — the round's push, the socket — `503`: the network
+/// cut after the upload and before the metadata exchange.
 pub fn blob_server(refused: Vec<(String, u16)>) -> (u16, Seen) {
+    blob_server_answering(
+        refused
+            .into_iter()
+            .map(|(blob, status)| (blob, status, "{}".to_owned()))
+            .collect(),
+    )
+}
+
+/// [`blob_server`], whose refusal of a blob answers with the given body —
+/// the server's own error document, for one.
+pub fn blob_server_answering(refused: Vec<(String, u16, String)>) -> (u16, Seen) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
     let port = listener.local_addr().expect("addr").port();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -510,10 +521,10 @@ pub fn blob_server(refused: Vec<(String, u16)>) -> (u16, Seen) {
             let path = words.next().unwrap_or_default().to_owned();
             let refusal = refused
                 .iter()
-                .find(|(blob, _)| path.contains(blob.as_str()))
-                .map(|(_, status)| *status);
+                .find(|(blob, _, _)| path.contains(blob.as_str()))
+                .map(|(_, status, body)| (*status, body.as_str()));
             let (status, body) = match (method.as_str(), refusal) {
-                (_, Some(status)) if path.contains("/blobs/") => (status, "{}"),
+                (_, Some((status, body))) if path.contains("/blobs/") => (status, body),
                 ("POST", None) if path.ends_with("/upload-grant") => (200, "{}"),
                 ("PUT", None) if path.contains("/blobs/") => (200, "{}"),
                 _ => (503, r#"{"error":"unavailable"}"#),

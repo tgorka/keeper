@@ -571,6 +571,14 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// left, `release_at_ms` is when it may. [`set_release_at`] is the only writer
 /// that fills it and [`forget_materialized`] is the only one that clears it,
 /// because the instruction is spent the moment the content goes.
+///
+/// **`oid` is the one column this cannot add with `ALTER TABLE`.** `oid` is
+/// one of SQLite's names for the rowid, and since SQLite 3.54 `ADD COLUMN`
+/// refuses a rowid alias on a table that has a rowid ("cannot add rowid
+/// alias: oid"). `CREATE TABLE` still accepts a declared `oid` column, so
+/// [`add_materialized_oid`] rebuilds the table with it — the same path for a
+/// fresh install, whose `CREATE TABLE` above has no `oid` either, and for one
+/// that predates it.
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -588,13 +596,84 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
         ("released_at_ms", "INTEGER"),
         ("release_at_ms", "INTEGER"),
     ] {
-        if !existing.iter().any(|c| c == column) {
+        if existing.iter().any(|c| c == column) {
+            continue;
+        }
+        if column == "oid" {
+            add_materialized_oid(conn)?;
+        } else {
             conn.execute(
                 &format!("ALTER TABLE materialized ADD COLUMN {column} {kind}"),
                 [],
             )?;
         }
     }
+    Ok(())
+}
+
+/// Give `materialized` its `oid TEXT` column by rebuilding the table, in one
+/// transaction: a new table declaring every column the old one has (name,
+/// type, `NOT NULL`, `DEFAULT` and primary key as `table_info` reports them)
+/// plus `oid`, every row copied across, the old table dropped and the new one
+/// renamed into its place. Nullable and without a `DEFAULT`, so every copied
+/// row reads `oid` as `NULL` — exactly what `ADD COLUMN` would have given it.
+/// See [`ensure_materialized_columns`] for why `ADD COLUMN` cannot.
+fn add_materialized_oid(conn: &Connection) -> Result<()> {
+    struct Column {
+        name: String,
+        kind: String,
+        not_null: bool,
+        default: Option<String>,
+        pk: i64,
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
+    let columns: Vec<Column> = stmt
+        .query_map([], |r| {
+            Ok(Column {
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                not_null: r.get(3)?,
+                default: r.get(4)?,
+                pk: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let mut defs: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let mut def = format!("{} {}", quote(&c.name), c.kind);
+            if c.not_null {
+                def.push_str(" NOT NULL");
+            }
+            if let Some(default) = &c.default {
+                def.push_str(" DEFAULT ");
+                def.push_str(default);
+            }
+            def
+        })
+        .collect();
+    defs.push("oid TEXT".to_owned());
+    let mut key: Vec<&Column> = columns.iter().filter(|c| c.pk > 0).collect();
+    key.sort_by_key(|c| c.pk);
+    if !key.is_empty() {
+        let key: Vec<String> = key.iter().map(|c| quote(&c.name)).collect();
+        defs.push(format!("PRIMARY KEY ({})", key.join(", ")));
+    }
+    let names: Vec<String> = columns.iter().map(|c| quote(&c.name)).collect();
+    let names = names.join(", ");
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE materialized_with_oid ({defs});
+         INSERT INTO materialized_with_oid ({names}) SELECT {names} FROM materialized;
+         DROP TABLE materialized;
+         ALTER TABLE materialized_with_oid RENAME TO materialized;",
+        defs = defs.join(", "),
+    ))?;
+    tx.commit()?;
     Ok(())
 }
 

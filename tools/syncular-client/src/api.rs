@@ -1,0 +1,1496 @@
+//! Driver-facing API shapes (JSON-able), mirroring the conformance
+//! `ClientInstance` contract: sync reports, conflicts, rejections, row
+//! states, unit states. Serialized as camelCase to cross the shim
+//! boundary unchanged.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::previous_version::PreviousVersionContextConfig;
+/// Stable dynamic value boundary used by generated named queries.
+pub type QueryValue = Value;
+/// One dynamic query result row, keyed by QueryIR runtime projection name.
+pub type QueryRow = Map<String, QueryValue>;
+
+/// An owned blob body returned by the Rust client without driver encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedBlob {
+    pub blob_id: String,
+    pub byte_length: i64,
+    pub bytes: Vec<u8>,
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBucketUnit {
+    Month,
+}
+
+const MAX_TIME_BUCKET_MS: i64 = 253_402_300_799_999;
+
+fn utc_year_month(timestamp_ms: i64) -> Result<(i64, i64), String> {
+    if !(0..=MAX_TIME_BUCKET_MS).contains(&timestamp_ms) {
+        return Err(
+            "sync.invalid_request: time bucket timestamps must fall from 1970 through 9999"
+                .to_owned(),
+        );
+    }
+    let z = timestamp_ms / 86_400_000 + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    Ok((year, month))
+}
+
+/// Derive the immutable UTC scope value stored when a row is created.
+pub fn creation_time_bucket(created_at_ms: i64, unit: TimeBucketUnit) -> Result<String, String> {
+    match unit {
+        TimeBucketUnit::Month => {
+            let (year, month) = utc_year_month(created_at_ms)?;
+            Ok(format!("{year:04}-{month:02}"))
+        }
+    }
+}
+
+/// Return a rolling UTC month window ordered from oldest to newest.
+pub fn last(count: usize, unit: TimeBucketUnit, now_ms: i64) -> Result<Vec<String>, String> {
+    if !(1..=1_200).contains(&count) {
+        return Err(
+            "sync.invalid_request: time bucket count must be from 1 through 1200".to_owned(),
+        );
+    }
+    match unit {
+        TimeBucketUnit::Month => {
+            let (year, month) = utc_year_month(now_ms)?;
+            let current = year * 12 + month - 1;
+            if current - (count as i64 - 1) < 1970 * 12 {
+                return Err(
+                    "sync.invalid_request: every returned UTC month must fall from 1970 through 9999"
+                        .to_owned(),
+                );
+            }
+            Ok((0..count)
+                .rev()
+                .map(|offset| {
+                    let value = current - offset as i64;
+                    format!(
+                        "{:04}-{:02}",
+                        value.div_euclid(12),
+                        value.rem_euclid(12) + 1
+                    )
+                })
+                .collect())
+        }
+    }
+}
+
+/// §4.1: a unit's scope map, one value per requested scope variable.
+pub type UnitScopes = BTreeMap<String, String>;
+
+/// §4.1 persisted unit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnitStatus {
+    Active,
+    Revoked,
+    Failed,
+}
+
+impl UnitStatus {
+    pub fn name(self) -> &'static str {
+        match self {
+            UnitStatus::Active => "active",
+            UnitStatus::Revoked => "revoked",
+            UnitStatus::Failed => "failed",
+        }
+    }
+}
+
+/// §4.4 one fenced record of a persisted echo: the effective lists the
+/// wildcard fence added for a covered table, or its revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EchoRecord {
+    pub table: String,
+    /// `active` or `revoked`.
+    pub status: String,
+    pub scopes: BTreeMap<String, Vec<String>>,
+}
+
+/// §7.4.3 a unit's restriction: the kept cursor `C` through which its other
+/// covered tables hold every change, and the tables it bootstraps, in
+/// ascending code-unit order. It travels as `RESTRICT` (§4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRestriction {
+    pub cursor: i64,
+    pub tables: Vec<String>,
+}
+
+/// §4.1 one registered unit as the client persists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitRecord {
+    /// §4.1: derived from the scope map.
+    pub id: String,
+    pub scopes: UnitScopes,
+    /// An explicit `subscribe` holds the unit; window bases hold it through
+    /// the window registry (§4.1 references).
+    pub explicit: bool,
+    pub status: UnitStatus,
+    /// §10 code when not active, or `sync.cursor_expired` after a reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Absent while the unit is live (§4.5); otherwise `-1`, the pin, or the
+    /// post-bootstrap cursor `P`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<i64>,
+    /// Opaque resume token from `SUB_END` (§4.7); present mid-bootstrap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_state: Option<String>,
+    /// Tables that received a segment in the current bootstrap (§5.6).
+    pub seeded: Vec<String>,
+    /// The echo persisted at the last `SUB_END` (§4.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo: Option<Vec<EchoRecord>>,
+    /// §7.4.3: the restriction a schema bump gave the unit, while it holds one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<UnitRestriction>,
+}
+
+impl UnitRecord {
+    /// §4.1: a catching-up unit holding cursor `-1` or a resume token.
+    pub fn bootstrapping(&self) -> bool {
+        self.cursor
+            .is_some_and(|cursor| cursor < 0 || self.bootstrap_state.is_some())
+    }
+}
+
+/// §4.8 window base: the selected scope variable plus the fixed scope values
+/// every unit of its family shares. A base names no table: each unit covers
+/// every table declaring its variables (§4.1).
+#[derive(Debug, Clone, Default)]
+pub struct WindowBase {
+    pub variable: String,
+    /// One value per other variable, shared by every unit.
+    pub fixed_scopes: UnitScopes,
+}
+
+/// §4.8 completeness oracle (I3): the windowed-in units for a base, plus
+/// the subset whose bootstrap has not yet completed. Registration alone is
+/// not completeness — a `pending` unit's local replica may be empty or
+/// partial (it still has `cursor: -1` or holds a resume token), and MUST NOT
+/// be rendered as complete. A unit with zero server
+/// rows still completes once its bootstrap round finishes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowState {
+    /// Windowed-in units for this base, ordered by value.
+    pub units: Vec<String>,
+    /// Registered units whose bootstrap has not yet completed.
+    pub pending: Vec<String>,
+}
+
+#[cfg(test)]
+mod time_bucket_tests {
+    use super::{creation_time_bucket, last, TimeBucketUnit};
+
+    #[test]
+    fn utc_month_buckets_cross_year_boundaries() {
+        let now = 1_770_508_800_000; // 2026-02-08T00:00:00Z
+        assert_eq!(
+            creation_time_bucket(now, TimeBucketUnit::Month).unwrap(),
+            "2026-02"
+        );
+        assert_eq!(
+            last(3, TimeBucketUnit::Month, now).unwrap(),
+            vec!["2025-12", "2026-01", "2026-02"]
+        );
+    }
+
+    #[test]
+    fn utc_month_buckets_reject_unbounded_input() {
+        assert!(last(0, TimeBucketUnit::Month, 0).is_err());
+        assert!(last(1_201, TimeBucketUnit::Month, 0).is_err());
+        assert!(last(2, TimeBucketUnit::Month, 0).is_err());
+        assert!(creation_time_bucket(-1, TimeBucketUnit::Month).is_err());
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableChange {
+    pub table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_keys: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowChange {
+    pub base_key: String,
+    /// Changed values of the base.
+    pub units: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatusSnapshot {
+    pub current_schema_version: i32,
+    pub outbox: usize,
+    pub upgrading: bool,
+    /// §7.4.5: `upgrading` and the reset kept at least one readable table.
+    pub upgrade_kept_tables: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_state: Option<LeaseState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_floor: Option<SchemaFloor>,
+    pub sync_needed: bool,
+    /// RFC 0005 A2: container presence, so a host can enforce the downgrade
+    /// precondition (`previousVersionDiscard`) instead of documenting it.
+    pub previous_version_context: PreviousVersionStatus,
+    /// §5.11: "preflight" while protected reads, claims and sync are refused;
+    /// a change batch carries the snapshot at each transition.
+    pub security_lifecycle: &'static str,
+}
+
+/// RFC 0005 A2: presence of the previous-version container file.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousVersionStatus {
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
+}
+
+pub const CLIENT_DIAGNOSTICS_VERSION: u8 = 2;
+pub const MAX_DIAGNOSTIC_QUERY_FAILURES: usize = 256;
+
+/// §8.8 client-local code: the `required` policy refused a sync round because
+/// the realtime socket is not connected. Never a wire code (§10.3).
+pub const REALTIME_UNAVAILABLE_CODE: &str = "sync.realtime_unavailable";
+/// §8.8 client-local code: a connected socket ended without a deliberate
+/// disconnect and the round reported no transport code. Never a wire code.
+pub const REALTIME_LOST_CODE: &str = "client.realtime_lost";
+/// §12 client-local code: a local-authority call or config on a host that
+/// has no local authority (the build lacks the `local-authority` feature, the
+/// config names no `localAuthorityPath`, or attach has no remote server).
+pub const LOCAL_AUTHORITY_UNCONFIGURED_CODE: &str = "client.local_authority_unconfigured";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsHost {
+    pub kind: String,
+    pub role: String,
+    pub connectivity: String,
+    pub realtime: RealtimeState,
+    pub realtime_policy: RealtimePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_retry_delay_ms: Option<u64>,
+}
+
+/// §7.6: registered units per state; a unit id never enters diagnostics.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticUnits {
+    pub bootstrapping: usize,
+    pub complete: usize,
+    pub reset: usize,
+    pub revoked: usize,
+    pub failed: usize,
+    /// Distinct stable reason codes of registered units, ascending.
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticRoundCounters {
+    pub pushed: u32,
+    pub applied: usize,
+    pub rejected: usize,
+    pub retryable: usize,
+    pub conflicts: u32,
+    pub commits_applied: u32,
+    pub segment_rows_applied: u32,
+    pub bootstrapping: usize,
+    pub resets: usize,
+    pub revoked: usize,
+    pub failed: usize,
+    pub deferred_commits: usize,
+}
+
+/// Bounded transport classification for progress and diagnostics (§1.8).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportCauseKind {
+    Network,
+    Connect,
+    Tls,
+    Io,
+    Request,
+    Protocol,
+    Timeout,
+    RoundDeadline,
+    Aborted,
+    Body,
+    Status,
+    Redirect,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLastRound {
+    /// §7.6: (`epoch`, `attempt`) identifies the round; it equals its §7.7 progress pair.
+    pub epoch: String,
+    pub attempt: u64,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub duration_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counters: Option<DiagnosticRoundCounters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause_kind: Option<TransportCauseKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLastChange {
+    pub revision: String,
+    pub recorded_at_ms: i64,
+    pub tables: Vec<String>,
+    pub windows: Vec<String>,
+    pub domains_truncated: bool,
+    pub status_changed: bool,
+    pub conflicts_changed: bool,
+    pub rejections_changed: bool,
+    pub outcomes_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsStorage {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_bytes_approx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_outbox_bytes_approx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_outcome_bytes_approx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_outcome_entries: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_cache_bytes_approx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_reason_code: Option<String>,
+}
+
+/// §7.6: the latest owned snapshot read of one query id failed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticQueryFailure {
+    pub id: String,
+    /// Distinct generated table names, ascending.
+    pub tables: Vec<String>,
+    /// `client.storage_corrupt`, `client.storage_io`, or `client.query_failed`.
+    pub code: String,
+    /// SQLite extended result code, when the driver exposed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sqlite_code: Option<i32>,
+    /// First failure since this id's last successful read.
+    pub at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsSnapshot {
+    pub version: u8,
+    pub captured_at_ms: i64,
+    pub host: ClientDiagnosticsHost,
+    pub security_lifecycle: String,
+    pub schema: ClientDiagnosticsSchema,
+    pub replica: ClientDiagnosticsReplica,
+    pub lease: ClientDiagnosticsLease,
+    pub units: DiagnosticUnits,
+    /// Units the next registration list carries; the server limit counts
+    /// these (§4.1).
+    pub active_units: usize,
+    /// §4.5 replica cursor; `-1` while no unit is live.
+    pub replica_cursor: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_round: Option<DiagnosticLastRound>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_change: Option<DiagnosticLastChange>,
+    pub storage: ClientDiagnosticsStorage,
+    pub query_failures: Vec<DiagnosticQueryFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsSchema {
+    pub current_version: i32,
+    pub upgrading: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_version: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsReplica {
+    pub local_revision: String,
+    pub sync_needed: bool,
+    pub pending_outbox: usize,
+}
+
+/// §8.8: how this client treats the realtime binding for sync rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RealtimePolicy {
+    Required,
+    #[default]
+    Optional,
+    Off,
+}
+
+impl RealtimePolicy {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RealtimePolicy::Required => "required",
+            RealtimePolicy::Optional => "optional",
+            RealtimePolicy::Off => "off",
+        }
+    }
+}
+
+/// §8.8: the explicit availability state of the realtime binding. The
+/// TypeScript host adds `unsupported` (no connector configured) and `unknown`
+/// (a wrapper without evidence); the Rust core reaches neither because a
+/// transport always carries a connect path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RealtimeState {
+    Connected,
+    Connecting,
+    #[default]
+    Disconnected,
+    Lost,
+    Refused,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDiagnosticsLease {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// JSON bindings carry the u64 revision as a decimal string (§7.5).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedServerCommit {
+    pub table: String,
+    pub commit_seq: i64,
+    pub source: AppliedServerCommitSource,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AppliedServerCommitSource {
+    Delta,
+    Pull,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChangeBatch {
+    pub revision: String,
+    pub tables: Vec<TableChange>,
+    pub windows: Vec<WindowChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<SyncStatusSnapshot>,
+    pub conflicts_changed: bool,
+    pub rejections_changed: bool,
+    pub outcomes_changed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub applied_commits: Vec<AppliedServerCommit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SyncIntent {
+    None,
+    Interactive,
+    Background {
+        #[serde(rename = "delayMs")]
+        delay_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandEffects {
+    pub sync: SyncIntent,
+}
+
+impl CommandEffects {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            sync: SyncIntent::None,
+        }
+    }
+
+    #[must_use]
+    pub fn interactive() -> Self {
+        Self {
+            sync: SyncIntent::Interactive,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowCoverage {
+    pub base: WindowBase,
+    pub units: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowUnitRef {
+    pub base_key: String,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageSnapshot {
+    pub complete: bool,
+    pub pending: Vec<WindowUnitRef>,
+    pub missing: Vec<WindowUnitRef>,
+}
+
+/// §7.5: the query that owns a snapshot read. The id is application-owned,
+/// stable, and PHI-free; generated named queries pass their `ID` and `TABLES`.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryOwner<'a> {
+    pub id: &'a str,
+    pub tables: &'a [&'a str],
+}
+
+/// §7.5: a failed snapshot read or a failed local authoring write. `code` is
+/// `client.storage_corrupt`, `client.storage_io`, `client.storage_full`, or
+/// `client.storage_busy` when SQLite reported that condition, and `None` for
+/// every other failure, which keeps its existing message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryReadFailure {
+    pub code: Option<&'static str>,
+    pub sqlite_code: Option<i32>,
+    pub sqlite_message: Option<String>,
+    pub rollback_failure: Option<Box<QueryReadFailure>>,
+    pub message: String,
+}
+
+impl std::fmt::Display for QueryReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "{code}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl From<String> for QueryReadFailure {
+    fn from(message: String) -> Self {
+        Self {
+            code: None,
+            sqlite_code: None,
+            sqlite_message: None,
+            rollback_failure: None,
+            message,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for QueryReadFailure {
+    /// Classify by SQLite's primary result code, never by message text.
+    fn from(error: rusqlite::Error) -> Self {
+        let sqlite_code = match &error {
+            rusqlite::Error::SqliteFailure(failure, _) => Some(failure.extended_code),
+            _ => None,
+        };
+        match sqlite_code.map(|code| code & 0xff) {
+            Some(11 | 26) => Self {
+                code: Some("client.storage_corrupt"),
+                sqlite_code,
+                sqlite_message: Some(error.to_string()),
+                rollback_failure: None,
+                message: "local SQLite storage is corrupt".to_owned(),
+            },
+            Some(13) => Self {
+                code: Some("client.storage_full"),
+                sqlite_code,
+                sqlite_message: Some(error.to_string()),
+                rollback_failure: None,
+                message: "local SQLite storage is full".to_owned(),
+            },
+            Some(10) => Self {
+                code: Some("client.storage_io"),
+                sqlite_code,
+                sqlite_message: Some(error.to_string()),
+                rollback_failure: None,
+                message: "local SQLite storage I/O failed".to_owned(),
+            },
+            // SQLITE_BUSY (5) and SQLITE_LOCKED (6), including every extended
+            // code, are transient lock contention: the same operation can
+            // succeed after the conflicting operation releases its lock.
+            Some(5 | 6) => Self {
+                code: Some("client.storage_busy"),
+                sqlite_code,
+                sqlite_message: Some(error.to_string()),
+                rollback_failure: None,
+                message: "local SQLite storage is busy".to_owned(),
+            },
+            _ => Self {
+                code: None,
+                sqlite_code,
+                sqlite_message: Some(error.to_string()),
+                rollback_failure: None,
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+impl QueryReadFailure {
+    /// The operation can be retried after lock contention is resolved.
+    /// SQLITE_LOCKED can involve another statement on the same connection.
+    pub fn retryable(&self) -> bool {
+        self.code == Some("client.storage_busy")
+    }
+
+    pub fn details(&self) -> Option<Value> {
+        self.sqlite_code.map(|code| {
+            let mut details =
+                serde_json::json!({ "sqliteCode": code, "sqliteMessage": self.sqlite_message });
+            if let Some(rollback) = &self.rollback_failure {
+                details["rollbackFailure"] = serde_json::json!({
+                    "sqliteCode": rollback.sqlite_code, "message": rollback.sqlite_message
+                });
+            }
+            details
+        })
+    }
+}
+
+/// A structured failure from a local authoring API (`mutate`/`patch`). `code`
+/// is always a stable `client.*`/`sync.*` identity, `message` is static text
+/// with no table/row/column values, `details` carries SQLite classification
+/// evidence or the preserved legacy cause, and `retryable` is true only for
+/// transient storage contention. Callers read these fields instead of parsing
+/// a `"<code>: "` prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientError {
+    pub code: String,
+    pub message: String,
+    pub details: Option<Value>,
+    pub retryable: bool,
+}
+
+/// The stable default for an authoring failure with no recognized code.
+const DEFAULT_CLIENT_ERROR_CODE: &str = "client.failed";
+
+/// The static text used when no specific static authoring message exists.
+const GENERIC_AUTHORING_MESSAGE: &str = "the local authoring operation failed";
+
+/// The fixed user-facing text for a known authoring code. Dynamic values from
+/// a legacy cause string move to `details.legacyCause` instead.
+fn static_authoring_message(code: &str) -> Option<&'static str> {
+    match code {
+        "sync.unknown_table" => Some("the commit targets an unknown table"),
+        "sync.invalid_request" => Some("the authoring request is invalid"),
+        "sync.row_missing" => Some("a sparse patch requires a local row"),
+        "sync.constraint_violation" => Some("local write violates a unique constraint"),
+        DEFAULT_CLIENT_ERROR_CODE => Some(GENERIC_AUTHORING_MESSAGE),
+        _ => None,
+    }
+}
+
+fn is_client_code(candidate: &str) -> bool {
+    candidate.starts_with("client.") || candidate.starts_with("sync.")
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+impl From<QueryReadFailure> for ClientError {
+    fn from(failure: QueryReadFailure) -> Self {
+        match failure.code {
+            // Classified storage messages are already static.
+            Some(code) => {
+                let details = failure.details();
+                let retryable = failure.retryable();
+                Self {
+                    code: code.to_owned(),
+                    message: failure.message,
+                    details,
+                    retryable,
+                }
+            }
+            None => {
+                let mut details = failure.details().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("legacyCause".to_owned(), Value::String(failure.message));
+                }
+                Self {
+                    code: DEFAULT_CLIENT_ERROR_CODE.to_owned(),
+                    message: GENERIC_AUTHORING_MESSAGE.to_owned(),
+                    details: Some(details),
+                    retryable: false,
+                }
+            }
+        }
+    }
+}
+
+impl From<String> for ClientError {
+    /// Split a core error into structured fields. A recognized code identity
+    /// is preserved and gets static text; any dynamic cause stays in
+    /// `details.legacyCause`. Everything else defaults to `client.failed` with
+    /// the generic message.
+    fn from(message: String) -> Self {
+        // A code-only identity, e.g. `sync.unknown_table`.
+        if !message.contains(": ") && is_client_code(&message) {
+            return Self {
+                code: message.clone(),
+                message: static_authoring_message(&message)
+                    .unwrap_or(GENERIC_AUTHORING_MESSAGE)
+                    .to_owned(),
+                details: None,
+                retryable: false,
+            };
+        }
+        let (code, rest) = match message.split_once(": ") {
+            Some((code, rest)) if is_client_code(code) => (code, Some(rest)),
+            _ => (DEFAULT_CLIENT_ERROR_CODE, None),
+        };
+        match static_authoring_message(code) {
+            Some(fixed) => Self {
+                code: code.to_owned(),
+                message: fixed.to_owned(),
+                details: (rest != Some(fixed))
+                    .then(|| serde_json::json!({ "legacyCause": message })),
+                retryable: false,
+            },
+            None => Self {
+                code: code.to_owned(),
+                message: GENERIC_AUTHORING_MESSAGE.to_owned(),
+                details: Some(serde_json::json!({ "legacyCause": message })),
+                retryable: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuerySnapshot {
+    pub revision: String,
+    pub rows: Vec<QueryRow>,
+    pub coverage: CoverageSnapshot,
+}
+
+impl WindowState {
+    /// The per-unit verdict: registered AND bootstrap-complete.
+    #[must_use]
+    pub fn complete(&self, unit: &str) -> bool {
+        self.units.iter().any(|u| u == unit) && !self.pending.iter().any(|u| u == unit)
+    }
+}
+
+/// One local mutation (§6.1 shapes, schema-agnostic local form per §0).
+#[derive(Debug, Clone)]
+pub enum Mutation {
+    Patch {
+        table: String,
+        values: Map<String, Value>,
+        base_version: Option<i64>,
+    },
+    Upsert {
+        table: String,
+        values: Map<String, Value>,
+        base_version: Option<i64>,
+    },
+    Delete {
+        table: String,
+        row_id: String,
+        base_version: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaFloor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_schema_version: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_schema_version: Option<i32>,
+}
+
+/// §7.3.5: the client's opaque auth-lease state — `leaseId`/`expiresAtMs`
+/// from the last `LEASE` frame, and `errorCode` once a round was rejected
+/// with a request-level lease code (stop-and-surface; no data purge).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// §8.6 a peer's ephemeral presence document on a scope key.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresencePeer {
+    pub actor_id: String,
+    pub client_id: String,
+    pub doc: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncReport {
+    pub pushed: u32,
+    pub applied: Vec<String>,
+    pub rejected: Vec<String>,
+    pub retryable: Vec<String>,
+    pub conflicts: u32,
+    pub commits_applied: u32,
+    pub segment_rows_applied: u32,
+    pub bootstrapping: Vec<String>,
+    pub resets: Vec<String>,
+    pub revoked: Vec<String>,
+    pub failed: Vec<String>,
+    pub deferred_commits: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_floor: Option<SchemaFloor>,
+}
+
+impl SyncReport {
+    /// Aggregate completed rounds. Historical counters and outcome lists
+    /// accumulate; current readiness (`bootstrapping`, `deferred_commits`,
+    /// `schema_floor`) describes the latest round. A schema floor stops the
+    /// loop, so it can only arrive from the latest round.
+    pub fn merge(&mut self, report: &Self) {
+        self.pushed += report.pushed;
+        self.applied.extend(report.applied.iter().cloned());
+        self.rejected.extend(report.rejected.iter().cloned());
+        self.retryable.extend(report.retryable.iter().cloned());
+        self.conflicts += report.conflicts;
+        self.commits_applied += report.commits_applied;
+        self.segment_rows_applied += report.segment_rows_applied;
+        self.bootstrapping = report.bootstrapping.clone();
+        self.resets.extend(report.resets.iter().cloned());
+        self.revoked.extend(report.revoked.iter().cloned());
+        self.failed.extend(report.failed.iter().cloned());
+        self.deferred_commits = report.deferred_commits;
+        self.schema_floor = report.schema_floor.clone();
+    }
+}
+
+/// `sync()` never panics or errors out-of-band: transport and protocol
+/// failures come back as `Failed` (the driver's `{ ok: false }`).
+#[derive(Debug, Clone)]
+pub enum SyncOutcome {
+    Ok(SyncReport),
+    Failed {
+        error_code: String,
+        message: String,
+        details: Option<Value>,
+        /// §10.1 `recommendedAction` from the server's error body, when the
+        /// transport preserved one. Client-local and storage failures carry
+        /// `None`.
+        recommended_action: Option<String>,
+    },
+    /// §8.8: the `required` policy refused a round because the socket is not
+    /// connected. `reason_code` is present for `lost` and `refused` states,
+    /// and `retry_delay_ms` is the delay of the background retry intent this
+    /// outcome scheduled.
+    RealtimeUnavailable {
+        state: RealtimeState,
+        reason_code: Option<String>,
+        retry_delay_ms: u64,
+    },
+    /// §7.8: the round budget ran out while the client was still not idle.
+    /// The aggregate report of every round that ran is retained. This is a
+    /// partial success, not a failure, and MUST NOT be read as idle.
+    BudgetExhausted(SyncReport),
+}
+
+impl SyncOutcome {
+    pub fn to_json(&self) -> Value {
+        match self {
+            SyncOutcome::Ok(report) => {
+                let mut map = Map::new();
+                map.insert("ok".to_owned(), Value::Bool(true));
+                map.insert(
+                    "report".to_owned(),
+                    serde_json::to_value(report).expect("report serializes"),
+                );
+                Value::Object(map)
+            }
+            SyncOutcome::Failed {
+                error_code,
+                message,
+                details,
+                recommended_action,
+            } => {
+                let mut map = Map::new();
+                map.insert("ok".to_owned(), Value::Bool(false));
+                map.insert("errorCode".to_owned(), Value::from(error_code.clone()));
+                map.insert("message".to_owned(), Value::from(message.clone()));
+                if let Some(details) = details {
+                    map.insert("details".to_owned(), details.clone());
+                }
+                if let Some(recommended_action) = recommended_action {
+                    map.insert(
+                        "recommendedAction".to_owned(),
+                        Value::from(recommended_action.clone()),
+                    );
+                }
+                Value::Object(map)
+            }
+            SyncOutcome::RealtimeUnavailable {
+                state,
+                reason_code,
+                retry_delay_ms,
+            } => {
+                let mut map = Map::new();
+                map.insert("ok".to_owned(), Value::Bool(false));
+                map.insert(
+                    "errorCode".to_owned(),
+                    Value::from(REALTIME_UNAVAILABLE_CODE),
+                );
+                map.insert(
+                    "message".to_owned(),
+                    Value::from("realtime is required and the realtime socket is not connected"),
+                );
+                map.insert(
+                    "realtimeState".to_owned(),
+                    serde_json::to_value(state).expect("state serializes"),
+                );
+                if let Some(reason_code) = reason_code {
+                    map.insert(
+                        "realtimeReasonCode".to_owned(),
+                        Value::from(reason_code.clone()),
+                    );
+                }
+                map.insert("retryDelayMs".to_owned(), Value::from(*retry_delay_ms));
+                Value::Object(map)
+            }
+            SyncOutcome::BudgetExhausted(report) => {
+                let mut map = Map::new();
+                map.insert("ok".to_owned(), Value::Bool(true));
+                map.insert("budgetExhausted".to_owned(), Value::Bool(true));
+                map.insert(
+                    "report".to_owned(),
+                    serde_json::to_value(report).expect("report serializes"),
+                );
+                Value::Object(map)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictRecord {
+    pub client_commit_id: String,
+    pub op_index: i32,
+    pub table: String,
+    pub row_id: String,
+    pub code: String,
+    pub message: String,
+    pub server_version: i64,
+    /// Driver row (bytes as `{"$bytes": hex}`), decoded from the conflict
+    /// record's `serverRow` (§6.3).
+    pub server_row: Map<String, Value>,
+    /// §6.3 `conflictColumns`: the present columns whose `column_version`
+    /// exceeded `baseVersion`, decoded from the bitmap into column names in
+    /// declaration order. Absent on a legacy journal entry, which reads as an
+    /// empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<CommitOperation>,
+}
+
+/// Bounded code-like metadata explicitly declared safe for authorized client
+/// recovery UI. Diagnostic prose remains in `RejectionRecord.message`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RejectionDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<BTreeMap<String, String>>,
+}
+
+impl RejectionDetails {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        if raw.len() > 4_096 {
+            return Err("rejection details exceed 4096 encoded bytes".to_owned());
+        }
+        let details: Self = serde_json::from_str(raw)
+            .map_err(|error| format!("invalid rejection details: {error}"))?;
+        details.validate()?;
+        Ok(details)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut members = 0;
+        if let Some(paths) = &self.field_paths {
+            members += 1;
+            if paths.is_empty() || paths.len() > 32 {
+                return Err("fieldPaths must contain 1-32 paths".to_owned());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for path in paths {
+                if path.len() > 160 || !path.split('.').all(valid_identifier) || !seen.insert(path)
+                {
+                    return Err("fieldPaths contains an invalid or duplicate path".to_owned());
+                }
+            }
+        }
+        if let Some(reason) = &self.reason {
+            members += 1;
+            if !valid_token(reason, 96) {
+                return Err("reason must be a lowercase stable token".to_owned());
+            }
+        }
+        if let Some(action) = &self.required_action {
+            members += 1;
+            if !valid_token(action, 96) {
+                return Err("requiredAction must be a lowercase stable token".to_owned());
+            }
+        }
+        if let Some(references) = &self.references {
+            members += 1;
+            if references.is_empty() || references.len() > 16 {
+                return Err("references must contain 1-16 entries".to_owned());
+            }
+            for (key, value) in references {
+                if !valid_token(key, 64)
+                    || value.is_empty()
+                    || value.len() > 256
+                    || value.trim() != value
+                    || value.chars().any(char::is_control)
+                {
+                    return Err("references contains an invalid key or value".to_owned());
+                }
+            }
+        }
+        if members == 0 {
+            return Err("rejection details must not be empty".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn valid_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn valid_token(token: &str, max: usize) -> bool {
+    if token.is_empty() || token.len() > max || !token.starts_with(|c: char| c.is_ascii_lowercase())
+    {
+        return false;
+    }
+    let mut previous_separator = false;
+    for character in token.chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            previous_separator = false;
+        } else if matches!(character, '.' | '_' | '-') && !previous_separator {
+            previous_separator = true;
+        } else {
+            return false;
+        }
+    }
+    !previous_separator
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectionRecord {
+    pub client_commit_id: String,
+    pub op_index: i32,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<RejectionDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<CommitOperation>,
+}
+
+/// Schema-agnostic local operation retained with a failed final outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOperation {
+    pub table: String,
+    pub row_id: String,
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Map<String, Value>>,
+    /// §7.1 insert intent: serialized as `"insert": true`, absent otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insert: bool,
+}
+
+/// One pending outbox commit (§7.1), in the shape the TypeScript client's
+/// `pendingCommits()` returns.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingCommit {
+    /// The outbox sequence number; FIFO send order.
+    pub seq: i64,
+    pub client_commit_id: String,
+    /// Local clock at `mutate`; 0 for a commit queued before 0.89.
+    pub created_at_ms: i64,
+    pub operations: Vec<CommitOperation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitOutcomeStatus {
+    Applied,
+    Cached,
+    Conflict,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitOutcomeResolution {
+    Active,
+    ResolvedKeepServer,
+    Superseded,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommitOperationOutcome {
+    Applied {
+        #[serde(rename = "opIndex")]
+        op_index: i32,
+    },
+    Conflict {
+        conflict: ConflictRecord,
+    },
+    Error {
+        rejection: RejectionRecord,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedUniqueConflict {
+    pub index: String,
+    pub columns: Vec<String>,
+    pub row_id: String,
+    pub server_row: Map<String, Value>,
+    pub server_version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedCommitRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_conflicts: Vec<RetainedUniqueConflict>,
+    pub table: String,
+    pub row_id: String,
+    pub local_row: Option<Map<String, Value>>,
+    /// The latest delivered authorized base; rejection can precede the pull.
+    pub server_row: Option<Map<String, Value>>,
+    pub server_version: Option<i64>,
+}
+
+/// Result of proving every retained base after a completed pull (§7.2.1).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentBaseProof {
+    pub proven: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<RetainedCommitRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CurrentBaseProofReason>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentBaseProofReason {
+    Offline,
+    SyncFailed,
+    SchemaFloor,
+    BudgetExhausted,
+    SnapshotFailed,
+    MissingCoverage,
+    Revoked,
+    OutcomeUnavailable,
+}
+
+impl CurrentBaseProof {
+    pub fn failure(reason: CurrentBaseProofReason) -> Self {
+        Self {
+            proven: false,
+            rows: None,
+            reason: Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOutcome {
+    pub sequence: i64,
+    pub client_commit_id: String,
+    pub status: CommitOutcomeStatus,
+    pub recorded_at_ms: i64,
+    pub results: Vec<CommitOperationOutcome>,
+    /// Complete local failed-commit envelope retained after outbox drain.
+    /// Absent for successful and historical outcomes; never sent over wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<CommitOperation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_rows: Option<Vec<RetainedCommitRow>>,
+    pub resolution: CommitOutcomeResolution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_client_commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOutcomeQuery {
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub active_only: bool,
+}
+
+/// §7.5: the catch-up state of one unit as persisted in the snapshot, never
+/// the mutable owner cache. `Unknown` means the client does not currently
+/// hold the unit (never registered, released, or removed).
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum UnitCatchup {
+    Unknown {
+        id: String,
+    },
+    Known {
+        id: String,
+        status: UnitStatus,
+        live: bool,
+        /// The unit's cursor while it catches up, the replica cursor while live.
+        cursor: i64,
+        has_resume_token: bool,
+        /// True only for an `active` unit that is live or post-bootstrap.
+        bootstrap_complete: bool,
+        /// True only for an `active` unit with cursor `-1` or a resume token.
+        known_pending_pages: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
+}
+
+/// §7.5: delivery status for one client commit id. A commit still in the
+/// outbox is `pending`; a drained commit carries its persisted retained
+/// outcome; an id the client never held, or whose outcome was pruned by
+/// retention, is `unknown`. The outcome preserves every operation result,
+/// rejection code, and conflict. The owning core attaches the retained-row
+/// images of its in-memory failed-commit cache; the read-only sidecar reports
+/// the persisted fields.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommitDelivery {
+    Pending {
+        #[serde(rename = "clientCommitId")]
+        client_commit_id: String,
+    },
+    Known {
+        #[serde(rename = "clientCommitId")]
+        client_commit_id: String,
+        outcome: CommitOutcome,
+    },
+    Unknown {
+        #[serde(rename = "clientCommitId")]
+        client_commit_id: String,
+    },
+}
+
+/// §7.5: the result of one atomic snapshot read over a single SQLite read
+/// transaction: one revision, every requested read-only statement's rows,
+/// requested window coverage, requested unit catch-up states, and requested
+/// commit deliveries.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRead {
+    pub revision: String,
+    pub queries: Vec<Vec<QueryRow>>,
+    pub coverage: CoverageSnapshot,
+    pub units: Vec<UnitCatchup>,
+    pub deliveries: Vec<CommitDelivery>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveCommitOutcomeInput {
+    pub client_commit_id: String,
+    pub resolution: CommitOutcomeResolution,
+    pub replacement_client_commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowState {
+    pub row_id: String,
+    /// Local synced version: `-1` = optimistic, else the server version
+    /// (from a `COMMIT` change or a segment row record, §5.2/§5.6).
+    pub version: i64,
+    pub values: Map<String, Value>,
+    /// §5.11 `_sync_sealed_key` of a sealed row; absent on an unsealed row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_key: Option<String>,
+}
+
+/// One AND-combined application-authorized local purge target. Targets in
+/// one input are OR-combined. Selector columns must compile to plaintext
+/// strings; values are bounded code-like routing identifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalDataPurgeTarget {
+    pub table: String,
+    pub selectors: BTreeMap<String, Vec<String>>,
+}
+
+/// Durable local idempotency key plus exact routing targets. The host owns
+/// directive authenticity and subscription gating; the client owns SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalDataPurgeInput {
+    pub purge_id: String,
+    pub targets: Vec<LocalDataPurgeTarget>,
+}
+
+/// Privacy-safe local purge acknowledgement; row ids never cross the bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDataPurgeResult {
+    pub already_applied: bool,
+    pub purged_rows: usize,
+    pub dropped_commits: usize,
+}
+
+/// Durable application repair id. Reusing the id is an exact no-op.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalDataRebootstrapInput {
+    pub rebootstrap_id: String,
+}
+
+/// Privacy-safe acknowledgement for a replicated-projection recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDataRebootstrapResult {
+    pub already_applied: bool,
+    pub retained_commits: usize,
+    pub reset_subscriptions: usize,
+}
+
+/// Client limits (§4.2 request knobs).
+#[derive(Debug, Clone, Default)]
+pub struct ClientLimits {
+    pub limit_commits: Option<i32>,
+    pub limit_snapshot_rows: Option<i32>,
+    pub max_snapshot_pages: Option<i32>,
+    /// §4.2 accept bitmask; this client defaults to `0b0111` (rows
+    /// baseline + sqlite images, §5.3 — rusqlite can always import).
+    pub accept: Option<u8>,
+    /// §5.9.7 B1 blob-cache size cap (bytes). When set and the sum of cached
+    /// body sizes exceeds it, unreferenced bodies without pending work are
+    /// evicted by creation timestamp after each cache write. `None` retains bodies
+    /// until storage pressure (default).
+    pub blob_cache_max_bytes: Option<i64>,
+    /// Maximum durable final outcomes. Active conflicts/rejections are never
+    /// pruned to satisfy the cap. Defaults to 1,000.
+    pub outcome_retention_max_entries: Option<usize>,
+    /// §7.1: maximum whole commits in one push request. `None` is unbounded.
+    pub max_push_commits_per_request: Option<usize>,
+    /// §7.1: maximum operations across the push commits in one request. `None`
+    /// uses the reference default of 500. A first commit that alone exceeds it
+    /// is a typed `client.push_request_too_large` capacity error and stays
+    /// queued.
+    pub max_push_operations_per_request: Option<usize>,
+    /// §7.1: maximum bytes of the complete encoded SSP2 request (8-byte
+    /// envelope, request header, push commits, pull header, units and progress frames,
+    /// framing, and any §5.11 ciphertext). `None` is unbounded. A request whose
+    /// fixed frames alone exceed it, or whose first commit alone does not fit,
+    /// fails with `client.push_request_too_large` and keeps its intent.
+    pub max_push_request_bytes: Option<usize>,
+    /// RFC 0005 D8: the previous-version capture config. Absent or
+    /// `enabled: false` runs the feature off (default); the descriptor write
+    /// and the container orphan sweep still happen.
+    pub previous_version_context: Option<PreviousVersionContextConfig>,
+    /// Immutable, explicit preflight authority read policy.
+    pub authority_reads: Vec<AuthorityReadDeclaration>,
+}
+
+/// Static read policy; never accepted as snapshot parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityReadDeclaration {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub scopes: std::collections::BTreeMap<String, Vec<String>>,
+}

@@ -195,7 +195,7 @@ impl Reader {
     /// statement re-prepares under this exact policy before it can run again, and any
     /// denial during that re-preparation is recorded and fails the whole query.
     fn with_policy(
-        connection: Connection,
+        mut connection: Connection,
         warmup: &str,
         warmup_parameters: &str,
         reads: Vec<(&'static str, &'static str)>,
@@ -300,8 +300,13 @@ impl Reader {
 mod tests {
     //! R3 transition invariant on the pinned rusqlite/SQLite, independent of GraphQLite:
     //! installing the final authorizer re-authorizes every *inactive* prepared
-    //! statement before it runs again, while a *running* one may finish (advisory
-    //! expiry), which is why `Reader::with_policy` drains its warm-up first.
+    //! statement before it runs again. From rusqlite 0.41 (story 115.6) installing an
+    //! authorizer takes `&mut Connection`, so no statement borrowed from the connection
+    //! — running or not — can be alive at that point: the borrow checker now enforces
+    //! what `Reader::with_policy` does by draining and dropping its warm-up first, and
+    //! the former "a running statement finishes under the old policy" case cannot be
+    //! written. What can still outlive the switch is a statement kept in the
+    //! connection's own cache, which is what this module now proves re-authorized.
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use rusqlite::Connection;
 
@@ -313,7 +318,7 @@ mod tests {
         .expect("fixture");
         c
     }
-    fn final_policy(c: &Connection) {
+    fn final_policy(c: &mut Connection) {
         c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
             AuthAction::Select => Authorization::Allow,
             AuthAction::Read {
@@ -337,23 +342,28 @@ mod tests {
         }
     }
 
+    const WRITE: &str = "INSERT INTO secret VALUES (1)";
+    const HIDDEN: &str = "SELECT x FROM secret";
+    const ALLOWED: &str = "SELECT y FROM open ORDER BY y";
+
     #[test]
-    fn inactive_statements_prepared_before_the_final_policy_are_reauthorized() {
-        let c = fixture();
-        let mut write = c.prepare("INSERT INTO secret VALUES (1)").expect("write");
-        let mut hidden = c.prepare("SELECT x FROM secret").expect("hidden read");
-        let mut allowed = c
-            .prepare("SELECT y FROM open ORDER BY y")
-            .expect("allowed read");
-        final_policy(&c);
-        let write_result = write.execute([]);
-        let hidden_result = hidden.query_row([], |r| r.get::<_, i64>(0));
-        let rows: Vec<i64> = allowed
+    fn cached_statements_prepared_before_the_final_policy_are_reauthorized() {
+        let mut c = fixture();
+        for sql in [WRITE, HIDDEN, ALLOWED] {
+            drop(c.prepare_cached(sql).expect("prepared and cached"));
+        }
+        final_policy(&mut c);
+        let write_result = c.prepare_cached(WRITE).and_then(|mut s| s.execute([]));
+        let hidden_result = c
+            .prepare_cached(HIDDEN)
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)));
+        let rows: Vec<i64> = c
+            .prepare_cached(ALLOWED)
+            .expect("allowed retained read")
             .query_map([], |r| r.get(0))
             .expect("allowed retained read")
             .collect::<Result<_, _>>()
             .expect("rows");
-        drop((write, hidden, allowed));
         c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
             .expect("clear");
         let written: i64 = c
@@ -369,18 +379,5 @@ mod tests {
         );
         assert_eq!(written, 0, "denied write had an effect");
         assert_eq!(rows, vec![1, 2]);
-    }
-
-    #[test]
-    fn a_running_statement_finishes_under_the_old_policy_so_warmup_must_drain() {
-        let c = fixture();
-        let mut running = c.prepare("SELECT y FROM open ORDER BY y").expect("read");
-        let mut rows = running.query([]).expect("query");
-        let first: i64 = rows.next().expect("step").expect("row").get(0).expect("y");
-        c.authorizer(Some(|_: AuthContext<'_>| Authorization::Deny))
-            .expect("deny all");
-        let second = rows.next().expect("advisory expiry lets it continue");
-        assert_eq!(first, 1);
-        assert_eq!(second.map(|r| r.get::<_, i64>(0).expect("y")), Some(2));
     }
 }

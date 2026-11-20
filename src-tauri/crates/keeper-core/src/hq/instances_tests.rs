@@ -33,7 +33,7 @@ fn open_as(dir: &std::path::Path, database: &str, person: &str) -> Source {
         path: dir.join(format!("{database}.sqlite")),
         client_id: Some(format!("{person}.dev")),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -795,6 +795,7 @@ fn journal_refusal(path: &std::path::Path, commit: &str, row_id: &str) {
         values: serde_json::json!({ "id": row_id, "default_client": "nixie.electra" })
             .as_object()
             .cloned(),
+        insert: false,
     }];
     let results = vec![CommitOperationOutcome::Error {
         rejection: RejectionRecord {
@@ -907,7 +908,7 @@ fn a_connected_socket_is_not_a_complete_view_of_who_is_online() {
                 base_url: "https://hq.example.org/alpha".to_owned(),
                 token: "t".to_owned(),
             }),
-            subscriptions: Vec::new(),
+            units: Vec::new(),
             watch_presence: Some("dir:alpha".to_owned()),
         })
         .expect("opens");

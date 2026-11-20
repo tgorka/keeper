@@ -87,7 +87,7 @@ pub fn harness_of(database: &str, over: Over<'_>) -> Harness {
         path: path.clone(),
         client_id: Some(CLIENT.to_owned()),
         link,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     };
     let (replica, fake, seen) = match over {

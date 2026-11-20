@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 8,
+  "schemaVersion": 9,
   "schemaVersions": [
     {
       "version": 1,
@@ -49,11 +49,18 @@
       "migrations": [
         "0008_knowledge_graph_review"
       ]
+    },
+    {
+      "version": 9,
+      "migrations": [
+        "0009_knowledge_graph_history"
+      ]
     }
   ],
   "tables": [
     {
       "name": "actors",
+      "generation": "cd82c4084c0efc6d8cd0616cd24e6e10",
       "primaryKey": "id",
       "columns": [
         {
@@ -108,6 +115,7 @@
     },
     {
       "name": "clients",
+      "generation": "c5ab73dc6917da2dd7a90f701c744280",
       "primaryKey": "id",
       "columns": [
         {
@@ -195,6 +203,7 @@
     },
     {
       "name": "agent_profiles",
+      "generation": "c18bbb5b22fcd68e0126c26cf59429fe",
       "primaryKey": "id",
       "columns": [
         {
@@ -317,6 +326,7 @@
     },
     {
       "name": "sessions",
+      "generation": "c69ed039d58d22dc1b61bb43ea5b715c",
       "primaryKey": "id",
       "columns": [
         {
@@ -420,6 +430,7 @@
     },
     {
       "name": "session_members",
+      "generation": "1c1c047403690ba88fb75e22296631d2",
       "primaryKey": "id",
       "columns": [
         {
@@ -505,6 +516,7 @@
     },
     {
       "name": "claims",
+      "generation": "2c81e9ab2dad5d6bba455bc45b885415",
       "primaryKey": "session_id",
       "columns": [
         {
@@ -582,6 +594,7 @@
     },
     {
       "name": "session_tool_switches",
+      "generation": "7bbfdb4fc1e644ac59001e7943dae3a9",
       "primaryKey": "session_id",
       "columns": [
         {
@@ -644,6 +657,7 @@
     },
     {
       "name": "session_settings",
+      "generation": "eb208dc1d75f497c2a10fcf8a299fa9d",
       "primaryKey": "session_id",
       "columns": [
         {
@@ -711,6 +725,7 @@
     },
     {
       "name": "session_drives",
+      "generation": "91d897e3dacb575ad79cac876b7cc021",
       "primaryKey": "session_id",
       "columns": [
         {
@@ -778,6 +793,7 @@
     },
     {
       "name": "turn_chunks",
+      "generation": "79c75ea52a85dbd840738deca17a859d",
       "primaryKey": "id",
       "columns": [
         {
@@ -863,6 +879,7 @@
     },
     {
       "name": "attachments",
+      "generation": "41372ca2fc7bdd28d86fb5282b7c636c",
       "primaryKey": "id",
       "columns": [
         {
@@ -957,6 +974,7 @@
     },
     {
       "name": "messages",
+      "generation": "dd069c1c71319bd1236fd9791478bf15",
       "primaryKey": "id",
       "columns": [
         {
@@ -1044,6 +1062,7 @@
     },
     {
       "name": "reasoning",
+      "generation": "0d14b4442f6cdccca29dd89acb5f1ec2",
       "primaryKey": "id",
       "columns": [
         {
@@ -1127,6 +1146,7 @@
     },
     {
       "name": "tool_calls",
+      "generation": "39017f7927afeb1695315714d819c921",
       "primaryKey": "id",
       "columns": [
         {
@@ -1229,6 +1249,7 @@
     },
     {
       "name": "approvals",
+      "generation": "07f32063e76af7ca135c7ba97880c918",
       "primaryKey": "id",
       "columns": [
         {
@@ -1360,6 +1381,7 @@
     },
     {
       "name": "instance_prefs",
+      "generation": "c35859f89e5aeb4e927ff985a0297228",
       "primaryKey": "id",
       "columns": [
         {
@@ -1414,6 +1436,7 @@
     },
     {
       "name": "standing_grants",
+      "generation": "92d128279988b97d20b0b4f720cf4b9b",
       "primaryKey": "id",
       "columns": [
         {
@@ -1509,6 +1532,7 @@
     },
     {
       "name": "agent_memory",
+      "generation": "449efdd6e38f76315426244c890ce8be",
       "primaryKey": "id",
       "columns": [
         {
@@ -1583,6 +1607,7 @@
     },
     {
       "name": "kg_events",
+      "generation": "b0b83a5978ca0a285e73a43a5dd8df60",
       "primaryKey": "id",
       "columns": [
         {
@@ -1688,8 +1713,8 @@
       ],
       "scopes": [
         {
-          "pattern": "kg_graph:{kg_graph}",
-          "variable": "kg_graph",
+          "pattern": "kg_history:{kg_history}",
+          "variable": "kg_history",
           "column": "graph"
         }
       ],
@@ -1721,6 +1746,7 @@
     },
     {
       "name": "kg_event_ops",
+      "generation": "66c4efca4f7a084b9b8695dadf2e1cf7",
       "primaryKey": "id",
       "columns": [
         {
@@ -1791,8 +1817,8 @@
       ],
       "scopes": [
         {
-          "pattern": "kg_graph:{kg_graph}",
-          "variable": "kg_graph",
+          "pattern": "kg_history:{kg_history}",
+          "variable": "kg_history",
           "column": "graph"
         }
       ],
@@ -1831,6 +1857,7 @@
     },
     {
       "name": "kg_head",
+      "generation": "285caca68e595570472c5cbdaa99389e",
       "primaryKey": "id",
       "columns": [
         {
@@ -1866,8 +1893,8 @@
       ],
       "scopes": [
         {
-          "pattern": "kg_graph:{kg_graph}",
-          "variable": "kg_graph",
+          "pattern": "kg_history:{kg_history}",
+          "variable": "kg_history",
           "column": "graph"
         }
       ],
@@ -1891,6 +1918,7 @@
     },
     {
       "name": "kg_nodes",
+      "generation": "eb45e61e0354397cc06278ce97ee6059",
       "primaryKey": "id",
       "columns": [
         {
@@ -1996,6 +2024,7 @@
     },
     {
       "name": "kg_edges",
+      "generation": "e4f339d215d464744653d7802c2495bf",
       "primaryKey": "id",
       "columns": [
         {
@@ -2123,6 +2152,7 @@
     },
     {
       "name": "kg_tags",
+      "generation": "d257f0ea553d59b81d7a60edaa495246",
       "primaryKey": "id",
       "columns": [
         {
@@ -2192,6 +2222,7 @@
     },
     {
       "name": "kg_node_tags",
+      "generation": "84e732d196d37d01a2a9bf253396dc0b",
       "primaryKey": "id",
       "columns": [
         {
@@ -2283,6 +2314,7 @@
     },
     {
       "name": "kg_contents",
+      "generation": "14244a30885f3c2908d88804ea142620",
       "primaryKey": "id",
       "columns": [
         {
@@ -2373,6 +2405,7 @@
     },
     {
       "name": "kg_reviews",
+      "generation": "6e7a3a8af2a1ad465f1e679c48311076",
       "primaryKey": "id",
       "columns": [
         {
@@ -2428,8 +2461,8 @@
       ],
       "scopes": [
         {
-          "pattern": "kg_graph:{kg_graph}",
-          "variable": "kg_graph",
+          "pattern": "kg_history:{kg_history}",
+          "variable": "kg_history",
           "column": "graph"
         }
       ],
@@ -2461,6 +2494,7 @@
     },
     {
       "name": "kg_proposals",
+      "generation": "19065034e0f49fd3d0f7ba6b3aeaaca4",
       "primaryKey": "id",
       "columns": [
         {
@@ -2602,6 +2636,7 @@
     },
     {
       "name": "kg_receipts",
+      "generation": "13a8397863faf9616fe4fb78be7dedf2",
       "primaryKey": "id",
       "columns": [
         {
@@ -2691,467 +2726,158 @@
   ],
   "subscriptions": [
     {
-      "name": "directoryActors",
-      "table": "actors",
+      "name": "directory",
       "scopes": [
         {
           "variable": "dir",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "directoryClients",
-      "table": "clients",
-      "scopes": [
-        {
-          "variable": "dir",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "directoryAgentProfiles",
-      "table": "agent_profiles",
-      "scopes": [
-        {
-          "variable": "dir",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "database"
+          }
         }
       ]
     },
     {
       "name": "memberships",
-      "table": "session_members",
       "scopes": [
         {
           "variable": "member",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "actorId"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
+          }
         }
       ]
     },
     {
-      "name": "sessionRow",
-      "table": "sessions",
+      "name": "preferences",
       "scopes": [
         {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
+          "variable": "actor",
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
+          }
         }
       ]
     },
     {
-      "name": "sessionMembers",
-      "table": "session_members",
+      "name": "session",
       "scopes": [
         {
           "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionClaim",
-      "table": "claims",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionToolSwitches",
-      "table": "session_tool_switches",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionSettings",
-      "table": "session_settings",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionDrives",
-      "table": "session_drives",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionTurnChunks",
-      "table": "turn_chunks",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "sessionAttachments",
-      "table": "attachments",
-      "scopes": [
-        {
-          "variable": "session",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "sessionId"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "sessionId"
+          }
         }
       ]
     },
     {
       "name": "messagesPage",
-      "table": "messages",
       "scopes": [
         {
           "variable": "page",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "pageKey"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "pageKey"
+          }
         }
       ]
     },
     {
-      "name": "reasoningPage",
-      "table": "reasoning",
+      "name": "tracePage",
       "scopes": [
         {
           "variable": "trace",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "pageKey"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "toolCallsPage",
-      "table": "tool_calls",
-      "scopes": [
-        {
-          "variable": "trace",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "pageKey"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "approvalsPage",
-      "table": "approvals",
-      "scopes": [
-        {
-          "variable": "trace",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "pageKey"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "instancePrefs",
-      "table": "instance_prefs",
-      "scopes": [
-        {
-          "variable": "actor",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "actorId"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "pageKey"
+          }
         }
       ]
     },
     {
       "name": "standingGrants",
-      "table": "standing_grants",
       "scopes": [
         {
           "variable": "person_agent",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "personAgentKey"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "personAgentKey"
+          }
         }
       ]
     },
     {
       "name": "agentMemoryOwn",
-      "table": "agent_memory",
       "scopes": [
         {
           "variable": "agent",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "agentActor"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "agentActor"
+          }
         }
       ]
     },
     {
       "name": "agentMemoryFamily",
-      "table": "agent_memory",
       "scopes": [
         {
           "variable": "family",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "family"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "family"
+          }
         }
       ]
     },
     {
-      "name": "kgEvents",
-      "table": "kg_events",
+      "name": "kgGraph",
       "scopes": [
         {
           "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "database"
+          }
         }
       ]
     },
     {
-      "name": "kgEventOps",
-      "table": "kg_event_ops",
+      "name": "kgHistory",
       "scopes": [
         {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgHead",
-      "table": "kg_head",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgNodes",
-      "table": "kg_nodes",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgEdges",
-      "table": "kg_edges",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgTags",
-      "table": "kg_tags",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgNodeTags",
-      "table": "kg_node_tags",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgContents",
-      "table": "kg_contents",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgReviews",
-      "table": "kg_reviews",
-      "scopes": [
-        {
-          "variable": "kg_graph",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "database"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "kgProposals",
-      "table": "kg_proposals",
-      "scopes": [
-        {
-          "variable": "kg_proposal",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "actorId"
-            }
-          ]
+          "variable": "kg_history",
+          "value": {
+            "kind": "parameter",
+            "name": "database"
+          }
         }
       ]
     },
     {
       "name": "kgReceipts",
-      "table": "kg_receipts",
       "scopes": [
         {
           "variable": "kg_client",
-          "values": [
-            {
-              "kind": "parameter",
-              "name": "clientScope"
-            }
-          ]
+          "value": {
+            "kind": "parameter",
+            "name": "clientScope"
+          }
+        }
+      ]
+    },
+    {
+      "name": "kgProposals",
+      "scopes": [
+        {
+          "variable": "kg_proposal",
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
+          }
         }
       ]
     }

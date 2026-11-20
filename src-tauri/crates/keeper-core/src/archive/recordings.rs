@@ -2047,7 +2047,7 @@ mod tests {
             "SELECT * FROM recording_segments ORDER BY session_id, \"index\", track",
         ] {
             let mut stmt = conn.prepare(sql).expect("prepare dump");
-            let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+            let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
             let rows = stmt
                 .query_map([], |r| {
                     let mut line = String::new();

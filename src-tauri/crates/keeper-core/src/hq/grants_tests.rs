@@ -49,7 +49,7 @@ fn open_world(dir: tempfile::TempDir, person: &str) -> World {
         path: dir.path().join("alpha.sqlite"),
         client_id: Some("dev1".to_owned()),
         link: None,
-        subscriptions: Vec::new(),
+        units: Vec::new(),
         watch_presence: None,
     })
     .expect("opens");
@@ -72,17 +72,21 @@ fn open_world(dir: tempfile::TempDir, person: &str) -> World {
 /// the replica file.
 fn serve(w: &World, agent: &str) {
     let key = crate::hq::vocabulary::person_agent_key(&w.alpha.actor, agent);
+    w.alpha
+        .replica
+        .subscribe(keeper_ports::Unit::of("person_agent", &key))
+        .expect("the unit");
     let conn = rusqlite::Connection::open(w.dir.path().join("alpha.sqlite")).expect("opens");
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .expect("timeout");
-    let state = json!({"requested": {"person_agent": [key]}, "params": null, "cursor": 3,
-                       "bootstrapState": null, "status": "active", "reasonCode": null,
-                       "effectiveScopes": {"person_agent": [key]}, "syncedOnce": true});
-    conn.execute(
-        "INSERT INTO _syncular_subscriptions (id, tbl, state_json) VALUES (?1, ?2, ?3)",
-        rusqlite::params![format!("grants-{agent}"), TABLE, state.to_string()],
-    )
-    .expect("a granted unit");
+    let granted = conn
+        .execute(
+            "UPDATE _syncular_units SET status = 'active', cursor = 3, bootstrap_state = NULL \
+             WHERE json_extract(scopes, '$.person_agent') = ?1",
+            [&key],
+        )
+        .expect("a granted unit");
+    assert_eq!(granted, 1, "the agent's unit");
 }
 
 fn upsert(table: &str, values: Value) -> RowOp {
@@ -1400,13 +1404,12 @@ fn a_grants_unit_revoked_once_is_asked_again_so_service_that_began_shows() {
     let conn = rusqlite::Connection::open(w.dir.path().join("alpha.sqlite")).expect("opens");
     let revoked = conn
         .execute(
-            "UPDATE _syncular_subscriptions SET state_json = json_set(state_json, \
-             '$.status', 'revoked', '$.reasonCode', 'sync.scope_revoked', '$.cursor', 0) \
-             WHERE id IN (SELECT sub_id FROM _syncular_windows WHERE unit = ?1)",
+            "UPDATE _syncular_units SET status = 'revoked', reason_code = 'sync.scope_revoked', \
+             cursor = 0 WHERE id IN (SELECT sub_id FROM _syncular_windows WHERE unit = ?1)",
             [&key],
         )
         .expect("revoked");
-    assert_eq!(revoked, 1, "the window's own subscription");
+    assert_eq!(revoked, 1, "the window's own unit");
     drop(conn);
     let World { dir, alpha, .. } = w;
     drop(alpha);
@@ -1417,7 +1420,7 @@ fn a_grants_unit_revoked_once_is_asked_again_so_service_that_began_shows() {
         .set_window(&base, std::slice::from_ref(&key))
         .expect("window");
     assert_eq!(
-        w.alpha.replica.revoked_units(TABLE).expect("revoked"),
+        w.alpha.replica.revoked_units(&base).expect("revoked"),
         vec![key.clone()]
     );
     assert_eq!(card(&w, "ana.1", "ap1").grant, None);
@@ -1427,7 +1430,7 @@ fn a_grants_unit_revoked_once_is_asked_again_so_service_that_began_shows() {
     assert!(w
         .alpha
         .replica
-        .revoked_units(TABLE)
+        .revoked_units(&base)
         .expect("revoked")
         .is_empty());
     assert_eq!(
@@ -1442,10 +1445,9 @@ fn a_grants_unit_revoked_once_is_asked_again_so_service_that_began_shows() {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .expect("timeout");
     conn.execute(
-        "UPDATE _syncular_subscriptions SET state_json = json_set(state_json, \
-         '$.status', 'active', '$.cursor', 4, '$.effectiveScopes', json(?2)) \
-         WHERE id IN (SELECT sub_id FROM _syncular_windows WHERE unit = ?1)",
-        rusqlite::params![key, json!({ "person_agent": [key] }).to_string()],
+        "UPDATE _syncular_units SET status = 'active', reason_code = NULL, cursor = 4, \
+         bootstrap_state = NULL WHERE id IN (SELECT sub_id FROM _syncular_windows WHERE unit = ?1)",
+        [&key],
     )
     .expect("granted");
     w.alpha
