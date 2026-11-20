@@ -266,11 +266,12 @@ INVENTORY = {
                                              'native_realloc', 'native_strdup', 'native_strndup', 'sqlite_malloc',
                                              'sqlite_realloc', 'sqlite_size'},
 }
-# The reviewed sources of U01-U11 (110.1 accepted head 56196413). Any edit reopens the
-# inventory review.
+# The reviewed sources of U01-U11 (110.1 accepted head 56196413), with story 115.6's
+# re-read of U01/U02/U09 against libsqlite3-sys 0.39.1 (SQLite 3.54.1): only those three
+# version citations changed. Any edit reopens the inventory review.
 REVIEWED = {
-    'keeper-graph-query/src/allocation.rs': 'ee40f960b218ee1845762e9ea928ea7b13f5702d5fe7da2698c8f527a80529a1',
-    'keeper-graph-query/src/native.rs': 'cb11cf0ce0e3383019760f7aedda9b48c05cdf6a223c0b3ac74fd89bc9c04f13',
+    'keeper-graph-query/src/allocation.rs': '0ba34dcaf602ef4053ad99d8068bd0d35d5c1fe172cf4ddda49d324dc50baafd',
+    'keeper-graph-query/src/native.rs': '394ec2b33b59ff9074f4c5cd7d6a3f45d25f58e5d5509f56b9df60fae68d7636',
 }
 EXPORTS = sorted('keeper_graph_' + n for n in ['malloc', 'free', 'calloc', 'realloc', 'strdup', 'strndup'])
 SAFE_CALLBACKS = {'sqlite_roundup', 'sqlite_init', 'sqlite_shutdown'}

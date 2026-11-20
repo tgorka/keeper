@@ -3624,20 +3624,53 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     println!("PASS after a relaunch the refusal is still shown with its reason, and the next message is delivered");
     skipper.shutdown().await;
 
-    // 8. Archived, its rows leave the phone; opened archived, its chips are
-    // back and a file never opened there opens — downloaded only then.
+    // 8. Archived, its messages leave the phone while its attachment rows
+    // stay: `attachments` rides the `session` window, which keeps every
+    // member session, archived included (keeper-core `hq/sessions.rs`).
+    // Opened archived, its chips are back and a file never opened there
+    // opens — downloaded only then.
+    let phone_replica = phone.replica(&database).expect("a replica");
+    let attachment_rows = query(
+        &phone_replica,
+        "SELECT id FROM attachments WHERE session_id = ?1",
+        vec![json!(key.session_id)],
+    )
+    .await
+    .len();
+    assert!(
+        attachment_rows > 0,
+        "the phone holds the session's attachment rows"
+    );
+    let message_rows = query(
+        &phone_replica,
+        "SELECT id FROM messages WHERE session_id = ?1",
+        vec![json!(key.session_id)],
+    )
+    .await
+    .len();
+    assert!(
+        message_rows > 0,
+        "the phone holds the session's messages before it is archived"
+    );
     {
         let (mac, key) = (Arc::clone(&mac), key.clone());
         off(move || mac.set_archived(&key, true)).await
     }
     .expect("archives");
-    let phone_replica = phone.replica(&database).expect("a replica");
+    wait_rows(
+        &phone_replica,
+        "SELECT id FROM messages WHERE session_id = ?1",
+        vec![json!(key.session_id)],
+        0,
+        Duration::from_secs(60),
+    )
+    .await;
     wait_rows(
         &phone_replica,
         "SELECT id FROM attachments WHERE session_id = ?1",
         vec![json!(key.session_id)],
-        0,
-        Duration::from_secs(60),
+        attachment_rows,
+        Duration::ZERO,
     )
     .await;
     let before = cached(&phone).await;
@@ -3667,7 +3700,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     assert_eq!(cached(&phone).await, before + png.len() as u64);
     phone.close_session(&key);
     println!(
-        "PASS archived: its attachment rows left the phone; opened archived, {} chips shown and photo.png opened on demand",
+        "PASS archived: its messages left the phone and its {attachment_rows} attachment rows stayed; opened archived, {} chips shown and photo.png opened on demand",
         chips.len()
     );
     mac.shutdown().await;

@@ -55,7 +55,7 @@ struct Header {
 }
 const _: () = assert!(std::mem::size_of::<Header>() == 16);
 
-// U02 SAFETY: SQLite 3.53.2 sqlite3_config copies sqlite3_mem_methods. Called
+// U02 SAFETY: SQLite 3.54.1 sqlite3_config copies sqlite3_mem_methods. Called
 // exactly once on marked main, before any SQLite API; callbacks live forever,
 // pAppData is null, varargs use the pinned header's exact types. Non-OK exits.
 #[allow(unsafe_code)]
@@ -210,7 +210,7 @@ unsafe extern "C" fn native_strndup(source: *const c_char, maximum: usize) -> *m
     }
 }
 
-// U09 SAFETY: sqlite3_mem_methods.xMalloc ABI from libsqlite3-sys 0.38.2;
+// U09 SAFETY: sqlite3_mem_methods.xMalloc ABI from libsqlite3-sys 0.39.1;
 // convert nonnegative int, then transfer the U03 allocation to SQLite.
 #[allow(unsafe_code)]
 unsafe extern "C" fn sqlite_malloc(size: c_int) -> *mut c_void {

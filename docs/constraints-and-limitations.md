@@ -255,8 +255,11 @@ Current inventory:
 
 The separate, single-use graph worker executable may carry exactly eleven function-level
 allowances, never a crate/module allowance or a first-party unsafe impl. `allocation.rs`
-and `native.rs` are byte-identical to the independently reviewed 110.1 sources (accepted
-head `56196413`); `scripts/check-graph-boundary.py` pins their SHA-256, so any edit reopens
+and `native.rs` are the independently reviewed 110.1 sources (accepted head `56196413`)
+except for story 115.6's version citations: U01, U02 and U09 were re-read against
+`libsqlite3-sys` 0.39.1 (SQLite 3.54.1), whose `sqlite3_mem_methods` binding, header
+(`sqlite3_config`, the `SQLITE_CONFIG_*` options used) and `malloc.c` are unchanged from
+0.38.2 (3.53.2). `scripts/check-graph-boundary.py` pins their SHA-256, so any edit reopens
 the inventory review.
 
 | ID | `keeper-graph-query` function | Boundary |
