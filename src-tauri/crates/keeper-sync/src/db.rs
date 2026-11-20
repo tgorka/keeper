@@ -322,8 +322,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- Migrations that rewrite CONTENT rather than schema, and must
         -- therefore run exactly once. Schema migrations need no marker: an
         -- `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
-        -- idempotence. A row rewrite is not, because after it runs the old
-        -- value becomes a legitimate one again.
+        -- idempotence, and so is the one table rebuild (`materialized`'s
+        -- `oid`, see `add_materialized_oid`), which the same column list
+        -- guards. A row rewrite is not, because after it runs the old value
+        -- becomes a legitimate one again.
         -- Paths this clone has ever held real content for.
         --
         -- The only way to tell an arriving object that REPLACES something from
@@ -335,15 +337,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- One row per path, written when content lands. Cheap to keep and the
         -- only fact that makes the distinction true.
         --
-        -- `last_used_ms`, `synced_at_ms`, `pinned`, `oid` and `size_bytes`
-        -- (Story 56.2) and `local_origin` (Story 56.5) are missing here on
-        -- purpose, exactly as `activity`'s late columns are:
+        -- `oid` (Story 56.2) is declared here because it cannot be added
+        -- later: SQLite 3.54 refuses `ADD COLUMN oid` (see
+        -- `ensure_materialized_columns`), so a fresh install gets it now and
+        -- only a store that predates it is rebuilt. `last_used_ms`,
+        -- `synced_at_ms`, `pinned` and `size_bytes` (Story 56.2),
+        -- `local_origin` (Story 56.5) and the release columns are missing
+        -- here on purpose, exactly as `activity`'s late columns are:
         -- `ensure_materialized_columns` adds them, so a fresh install and one
-        -- that predates them reach the same schema down one path.
+        -- that predates them reach the same columns down one path. Their
+        -- order differs between the two, and nothing reads the table by
+        -- position.
         CREATE TABLE IF NOT EXISTS materialized (
             profile_id  TEXT NOT NULL,
             path        TEXT NOT NULL,
             at_ms       INTEGER NOT NULL,
+            oid         TEXT,
             PRIMARY KEY (profile_id, path)
         );
 
@@ -575,10 +584,9 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// **`oid` is the one column this cannot add with `ALTER TABLE`.** `oid` is
 /// one of SQLite's names for the rowid, and since SQLite 3.54 `ADD COLUMN`
 /// refuses a rowid alias on a table that has a rowid ("cannot add rowid
-/// alias: oid"). `CREATE TABLE` still accepts a declared `oid` column, so
-/// [`add_materialized_oid`] rebuilds the table with it — the same path for a
-/// fresh install, whose `CREATE TABLE` above has no `oid` either, and for one
-/// that predates it.
+/// alias: oid"). `CREATE TABLE` still accepts a declared `oid` column, so a
+/// fresh install gets it from the `CREATE TABLE` above, and a store that
+/// predates it is rebuilt by [`add_materialized_oid`].
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -618,6 +626,18 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
 /// renamed into its place. Nullable and without a `DEFAULT`, so every copied
 /// row reads `oid` as `NULL` — exactly what `ADD COLUMN` would have given it.
 /// See [`ensure_materialized_columns`] for why `ADD COLUMN` cannot.
+///
+/// The transaction is `IMMEDIATE` and the column list is read inside it,
+/// because the app and `keeper-syncd` share this file and may both open an
+/// un-migrated store at once. The second waits here for the first's write
+/// lock; a list it read before waiting would rebuild from a stale shape and
+/// drop whatever the first added after `oid`. Read under the lock, it finds
+/// `oid` already there and leaves the table alone.
+///
+/// The rebuild carries columns and the primary key and nothing else, so an
+/// index, trigger or view that names `materialized` would vanish with the old
+/// table (or, for a view, fail the rename). No shipped schema has one; if one
+/// appears, this refuses with an error naming it rather than drop it.
 fn add_materialized_oid(conn: &Connection) -> Result<()> {
     struct Column {
         name: String,
@@ -626,7 +646,8 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
         default: Option<String>,
         pk: i64,
     }
-    let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut stmt = tx.prepare("PRAGMA table_info(materialized)")?;
     let columns: Vec<Column> = stmt
         .query_map([], |r| {
             Ok(Column {
@@ -639,6 +660,38 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
+    if columns.iter().any(|c| c.name == "oid") {
+        // Another opener rebuilt it while this one waited for the lock.
+        return Ok(());
+    }
+
+    // The primary key's automatic index (`sqlite_autoindex_materialized_1`)
+    // is recreated by the new table's own `PRIMARY KEY`; anything else that
+    // names the table is something the rebuild cannot carry.
+    let mut stmt = tx.prepare(
+        "SELECT type, name FROM sqlite_schema
+          WHERE type IN ('index', 'trigger', 'view')
+            AND name NOT LIKE 'sqlite_autoindex_materialized_%'
+            AND (tbl_name = 'materialized' OR sql LIKE '%materialized%')
+          ORDER BY type, name",
+    )?;
+    let dependents: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{} `{}`",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !dependents.is_empty() {
+        return Err(SyncError::Journal(format!(
+            "cannot rebuild `materialized` to add `oid`: the rebuild would drop {} \
+             that depends on it",
+            dependents.join(", ")
+        )));
+    }
 
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     let mut defs: Vec<String> = columns
@@ -665,7 +718,6 @@ fn add_materialized_oid(conn: &Connection) -> Result<()> {
     let names: Vec<String> = columns.iter().map(|c| quote(&c.name)).collect();
     let names = names.join(", ");
 
-    let tx = conn.unchecked_transaction()?;
     tx.execute_batch(&format!(
         "CREATE TABLE materialized_with_oid ({defs});
          INSERT INTO materialized_with_oid ({names}) SELECT {names} FROM materialized;
@@ -6878,10 +6930,11 @@ mod tests {
         );
 
         // A second `migrate` on the same connection is the upgrade path an
-        // ordinary `open` takes on every launch. `ALTER TABLE ... ADD COLUMN`
-        // guarded by the column list is its own idempotence, which is why this
-        // schema addition needs no `meta` marker — assert it rather than trust
-        // it, because the failure mode is a daemon that cannot start.
+        // ordinary `open` takes on every launch. The column list guards both
+        // the `ALTER TABLE ... ADD COLUMN`s and the one rebuild that adds
+        // `oid`, which is why this schema addition needs no `meta` marker —
+        // assert it rather than trust it, because the failure mode is a daemon
+        // that cannot start.
         migrate(&c).expect("migrating twice changes nothing");
         assert_eq!(
             materialized_rows(&c, "p").expect("read the ledger").len(),
@@ -6892,6 +6945,341 @@ mod tests {
             std::collections::HashSet::from(["40-media/clip.mp4".to_owned()]),
             "the narrow reader the arrival decision uses still answers the same"
         );
+    }
+
+    /// The pre-Story-56.2 `materialized`, with one row per `(profile, path)`.
+    fn plant_pre_56_2_materialized(c: &Connection, rows: &[(&str, &str, i64)]) {
+        c.execute_batch(
+            "CREATE TABLE materialized (
+                 profile_id  TEXT NOT NULL,
+                 path        TEXT NOT NULL,
+                 at_ms       INTEGER NOT NULL,
+                 PRIMARY KEY (profile_id, path)
+             );",
+        )
+        .expect("plant the pre-56.2 schema");
+        for (profile, path, at_ms) in rows {
+            c.execute(
+                "INSERT INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)",
+                rusqlite::params![profile, path, at_ms],
+            )
+            .expect("plant a row");
+        }
+    }
+
+    fn materialized_sql(c: &Connection) -> String {
+        c.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'materialized'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("materialized's schema")
+    }
+
+    fn materialized_columns(c: &Connection) -> Vec<String> {
+        let mut stmt = c
+            .prepare("SELECT name FROM pragma_table_info('materialized') ORDER BY cid")
+            .expect("prepare");
+        stmt.query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect")
+    }
+
+    fn schema_object_exists(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count")
+            > 0
+    }
+
+    /// A store that already has `oid` keeps its table as it is: a fresh
+    /// install declares the column in `CREATE TABLE`, and a store upgraded by
+    /// the old `ADD COLUMN` (under SQLite 3.53 or earlier) already holds it.
+    /// A rebuild would show as a changed `sqlite_schema.sql` — SQLite stores a
+    /// renamed table's statement as `CREATE TABLE "materialized" (...)`.
+    #[test]
+    fn a_store_that_already_has_oid_is_not_rebuilt() {
+        let fresh = Connection::open_in_memory().expect("in-memory db");
+        migrate(&fresh).expect("a fresh install");
+        let sql = materialized_sql(&fresh);
+        assert!(
+            sql.starts_with("CREATE TABLE materialized ("),
+            "a fresh install is created with `oid`, never rebuilt: {sql}"
+        );
+        migrate(&fresh).expect("a second launch");
+        assert_eq!(materialized_sql(&fresh), sql);
+
+        // Every column the old `ADD COLUMN`s gave a store, in their order.
+        let upgraded = Connection::open_in_memory().expect("in-memory db");
+        upgraded
+            .execute_batch(
+                "CREATE TABLE materialized (
+                     profile_id  TEXT NOT NULL,
+                     path        TEXT NOT NULL,
+                     at_ms       INTEGER NOT NULL,
+                     last_used_ms INTEGER, synced_at_ms INTEGER, pinned INTEGER,
+                     oid TEXT, size_bytes INTEGER, local_origin INTEGER,
+                     released_at_ms INTEGER, release_at_ms INTEGER,
+                     PRIMARY KEY (profile_id, path)
+                 );
+                 INSERT INTO materialized (profile_id, path, at_ms, oid, size_bytes)
+                 VALUES ('p', 'a.bin', 1, 'abc', 7);",
+            )
+            .expect("plant the post-56.2 schema");
+        let sql = materialized_sql(&upgraded);
+        migrate(&upgraded).expect("migrate an upgraded install");
+        assert_eq!(materialized_sql(&upgraded), sql, "the table is untouched");
+        let row = &materialized_rows(&upgraded, "p").expect("read the ledger")[0];
+        assert_eq!(row.oid.as_deref(), Some("abc"));
+        assert_eq!(row.size_bytes, Some(7));
+    }
+
+    /// A rebuild that fails part-way rolls back whole: the old table, its rows
+    /// and its columns are where they were, and no half-built table is left
+    /// behind for the next launch to trip over. A foreign key from another
+    /// table is something the rebuild does not look for, and with
+    /// `foreign_keys = ON` (as `open` sets it) it fails the `DROP TABLE`
+    /// after the new table has been created and filled.
+    #[test]
+    fn a_failed_rebuild_leaves_the_old_table() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.pragma_update(None, "foreign_keys", "ON").expect("fk on");
+        plant_pre_56_2_materialized(&c, &[("p", "a.bin", 1), ("p", "b.bin", 2)]);
+        c.execute_batch(
+            "CREATE TABLE holder (
+                 profile_id TEXT, path TEXT,
+                 FOREIGN KEY (profile_id, path) REFERENCES materialized (profile_id, path)
+             );
+             INSERT INTO holder VALUES ('p', 'a.bin');",
+        )
+        .expect("plant a referencing table");
+
+        // The rebuild itself, not `migrate`: the `ADD COLUMN`s that precede it
+        // there commit on their own, and are not what this is about.
+        let err = add_materialized_oid(&c).expect_err("the rebuild cannot drop a referenced table");
+        assert!(
+            err.to_string().contains("FOREIGN KEY constraint failed"),
+            "it failed at the DROP, after the new table was built: {err}"
+        );
+
+        assert_eq!(materialized_columns(&c), ["profile_id", "path", "at_ms"]);
+        let rows: Vec<(String, i64)> = c
+            .prepare("SELECT path, at_ms FROM materialized ORDER BY path")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(rows, [("a.bin".to_owned(), 1), ("b.bin".to_owned(), 2)]);
+        assert!(!schema_object_exists(&c, "materialized_with_oid"));
+    }
+
+    /// An index, trigger or view on `materialized` is refused by name before
+    /// anything changes, rather than dropped by the rebuild without a word.
+    #[test]
+    fn a_rebuild_refuses_objects_it_cannot_carry() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        plant_pre_56_2_materialized(&c, &[("p", "a.bin", 1)]);
+        c.execute_batch(
+            "CREATE INDEX materialized_at ON materialized (at_ms);
+             CREATE TABLE seen (path TEXT);
+             CREATE TRIGGER materialized_seen AFTER INSERT ON materialized
+                 BEGIN INSERT INTO seen VALUES (new.path); END;
+             CREATE VIEW recent AS SELECT path FROM materialized;",
+        )
+        .expect("plant dependents");
+        let sql = materialized_sql(&c);
+
+        let err = add_materialized_oid(&c).expect_err("the rebuild refuses");
+        let SyncError::Journal(message) = err else {
+            panic!("expected a Journal error, got {err:?}");
+        };
+        for named in [
+            "index `materialized_at`",
+            "trigger `materialized_seen`",
+            "view `recent`",
+        ] {
+            assert!(message.contains(named), "{named} missing from: {message}");
+        }
+        assert_eq!(materialized_sql(&c), sql, "the table is untouched");
+        for object in ["materialized_at", "materialized_seen", "recent"] {
+            assert!(schema_object_exists(&c, object), "{object} survives");
+        }
+    }
+
+    /// Every row, every value in a late column, the composite key, `NOT NULL`
+    /// and a `DEFAULT` survive the rebuild exactly. The planted shape carries
+    /// late columns before `oid` the way an install would that received some
+    /// of them separately, so the copy has more than the key to move.
+    #[test]
+    fn a_rebuild_keeps_every_row_value_and_the_composite_key() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE materialized (
+                 profile_id  TEXT NOT NULL,
+                 path        TEXT NOT NULL,
+                 at_ms       INTEGER NOT NULL,
+                 last_used_ms INTEGER,
+                 synced_at_ms INTEGER,
+                 pinned      INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (profile_id, path)
+             );
+             INSERT INTO materialized VALUES ('p', 'a.bin', 1, 10, 100, 1);
+             INSERT INTO materialized VALUES ('p', 'b.bin', 2, NULL, 200, 0);
+             INSERT INTO materialized VALUES ('q', 'a.bin', 3, 30, NULL, 1);
+             INSERT INTO materialized VALUES ('q', 'c.bin', 4, NULL, NULL, 0);",
+        )
+        .expect("plant an intermediate schema");
+        type Row = (String, String, i64, Option<i64>, Option<i64>, i64);
+        let all = |c: &Connection| -> Vec<Row> {
+            c.prepare(
+                "SELECT profile_id, path, at_ms, last_used_ms, synced_at_ms, pinned
+                   FROM materialized ORDER BY profile_id, path",
+            )
+            .expect("prepare")
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect")
+        };
+        let before = all(&c);
+
+        migrate(&c).expect("migrate");
+
+        assert!(
+            materialized_sql(&c).starts_with("CREATE TABLE \"materialized\""),
+            "this shape is rebuilt"
+        );
+        assert_eq!(all(&c), before);
+        let oids: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM materialized WHERE oid IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(oids, 0, "every copied row reads `oid` as NULL");
+        c.execute(
+            "INSERT INTO materialized (profile_id, path, at_ms) VALUES ('q', 'a.bin', 9)",
+            [],
+        )
+        .expect_err("the composite primary key survives");
+        c.execute(
+            "INSERT INTO materialized (profile_id, path, at_ms) VALUES ('r', 'a.bin', 9)",
+            [],
+        )
+        .expect("the same path under another profile is still a new key");
+        let pinned: i64 = c
+            .query_row(
+                "SELECT pinned FROM materialized WHERE profile_id = 'r'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read");
+        assert_eq!(pinned, 0, "the DEFAULT survives");
+        c.execute(
+            "INSERT INTO materialized (profile_id, path, at_ms, pinned) VALUES ('r', 'b', 1, NULL)",
+            [],
+        )
+        .expect_err("NOT NULL survives");
+    }
+
+    /// Set by [`two_first_openers_rebuild_once`]'s second connection the first
+    /// time it has to wait for the write lock.
+    static SECOND_OPENER_WAITED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn note_wait_and_retry(attempt: i32) -> bool {
+        SECOND_OPENER_WAITED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        attempt < 2_000
+    }
+
+    /// Two processes opening one un-migrated store: the first holds the write
+    /// lock while it rebuilds `materialized` and goes on to add a later column
+    /// and write values; the second reaches the rebuild while the first still
+    /// holds the lock. The second must wait, see `oid` already there, and leave
+    /// the table alone — not rebuild from the shape it saw before it waited,
+    /// which would drop the later column and the first's values.
+    ///
+    /// Deterministic: the first commits only after the second's busy handler
+    /// has fired, so the second is provably waiting on the lock.
+    #[test]
+    fn two_first_openers_rebuild_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.db");
+        let first = Connection::open(&path).expect("first opener");
+        first
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        plant_pre_56_2_materialized(&first, &[("p", "a.bin", 1)]);
+
+        first
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE materialized_with_oid (
+                     profile_id TEXT NOT NULL, path TEXT NOT NULL, at_ms INTEGER NOT NULL,
+                     oid TEXT, PRIMARY KEY (profile_id, path)
+                 );
+                 INSERT INTO materialized_with_oid (profile_id, path, at_ms)
+                     SELECT profile_id, path, at_ms FROM materialized;
+                 DROP TABLE materialized;
+                 ALTER TABLE materialized_with_oid RENAME TO materialized;
+                 ALTER TABLE materialized ADD COLUMN size_bytes INTEGER;
+                 UPDATE materialized SET oid = 'abc', size_bytes = 7;",
+            )
+            .expect("the first opener's rebuild, uncommitted");
+
+        let mut second = Connection::open(&path).expect("second opener");
+        second
+            .busy_handler(Some(note_wait_and_retry))
+            .expect("busy handler");
+        let racer = std::thread::spawn(move || add_materialized_oid(&second));
+
+        // Commit once the second is waiting on the lock — or has already given
+        // up without waiting, which the `expect` below then reports.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SECOND_OPENER_WAITED.load(std::sync::atomic::Ordering::SeqCst)
+            && !racer.is_finished()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second opener neither waited for the lock nor returned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        first
+            .execute_batch("COMMIT")
+            .expect("the first opener commits");
+
+        racer
+            .join()
+            .expect("the second opener's thread")
+            .expect("the second opener waits, finds `oid` and returns");
+        assert_eq!(
+            materialized_columns(&first),
+            ["profile_id", "path", "at_ms", "oid", "size_bytes"]
+        );
+        let (oid, size): (Option<String>, Option<i64>) = first
+            .query_row("SELECT oid, size_bytes FROM materialized", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("read");
+        assert_eq!(oid.as_deref(), Some("abc"));
+        assert_eq!(size, Some(7));
     }
 
     /// Re-materializing a path moves `at_ms` and touches nothing else (Story
