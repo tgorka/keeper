@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
-// U01 SAFETY: GraphQLite 995a8b9 extension.c:677, SQLite 3.53.2.
+// U01 SAFETY: GraphQLite 995a8b9 extension.c:677, SQLite 3.54.1.
 // The worker exclusively owns this fresh connection on marked main. Its allocator
 // callbacks never return NULL; all registration arguments are pinned constants.
 // Reject repeat registration and every live/cached statement BEFORE C entry:
