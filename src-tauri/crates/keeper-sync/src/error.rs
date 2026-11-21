@@ -112,9 +112,19 @@ pub enum SyncError {
     /// own history before giving up, and the background sweep must not queue
     /// the same doomed download again on every scan while a stopped one waits.
     /// `path` and `made_by` are filled in by the engine where it knows them,
-    /// so the stopped row names the file and the device whose commit
+    /// so the waiting row names the file and the device whose commit
     /// published the pointer — the only facts that help a person find the
     /// bytes.
+    ///
+    /// Transient, not permanent. The usual cause is not a lost object but a
+    /// late one: the device that pushed the pointer has not finished
+    /// uploading its bytes yet — on the owner's neuradrive, a conflict copy
+    /// whose pointer reached the server on 2026-10-10 and whose object only
+    /// followed nine days later. Parked, the download waited for a person's
+    /// Retry long after the server could answer it, and the folder read
+    /// "Needs attention" the whole time. Retried on its own slow schedule
+    /// ([`crate::backoff::MISSING_OBJECT_BACKOFF`]), it finishes by itself
+    /// once the bytes land.
     #[error("{}", lfs_object_missing_sentence(host, oid, path.as_deref(), made_by.as_deref()))]
     LfsObjectMissing {
         host: String,
@@ -328,6 +338,8 @@ impl SyncError {
             Self::Network { .. } | Self::Quota { .. } | Self::GitCommand { .. } => {
                 Retriability::Transient
             }
+            // Another device's upload may still land (see the variant).
+            Self::LfsObjectMissing { .. } => Retriability::Transient,
             // Integrity failures are retried because the *source* may be fine
             // and the transfer was the problem — but the staged prefix is
             // always discarded first, so this is a retry from zero, not a
@@ -341,7 +353,6 @@ impl SyncError {
             | Self::Auth { .. }
             | Self::Forbidden { .. }
             | Self::Credential(_)
-            | Self::LfsObjectMissing { .. }
             | Self::InvalidPathForRemote { .. }
             | Self::Diverged { .. }
             | Self::Journal(_)
@@ -393,7 +404,6 @@ impl SyncError {
                 | Self::Auth { .. }
                 | Self::Forbidden { .. }
                 | Self::Credential(_)
-                | Self::LfsObjectMissing { .. }
                 | Self::InvalidPathForRemote { .. }
                 | Self::Quota { .. }
                 | Self::Diverged { .. }
@@ -505,6 +515,15 @@ mod tests {
         };
         assert_eq!(err.retriability(), Retriability::Permanent);
         assert!(err.needs_user_action());
+    }
+
+    #[test]
+    fn a_missing_lfs_object_is_retried_and_needs_nobody() {
+        // neuradrive, 2026-10-10..19: the object followed its pointer nine
+        // days late. A parked download would still be waiting for a Retry.
+        let err = SyncError::lfs_object_missing("electra", "96bae0e0");
+        assert_eq!(err.retriability(), Retriability::Transient);
+        assert!(!err.needs_user_action());
     }
 
     #[test]

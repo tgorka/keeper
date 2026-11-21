@@ -22,6 +22,20 @@ use std::time::Duration;
 /// in which a fresh process believes that row is derived from it.
 pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(600);
 
+/// The schedule of a download the server has no object for
+/// ([`crate::SyncError::LfsObjectMissing`]): 1 min, doubling to 1 h.
+///
+/// Slower than the default because the wait is on another device's upload,
+/// which takes minutes at best and days at worst, and because every attempt
+/// also searches this folder's history for the bytes. Half jitter, not full:
+/// at the cap a retry lands between 30 and 60 min, never seconds after the
+/// last 404.
+pub const MISSING_OBJECT_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(60),
+    max: Duration::from_secs(3600),
+    jitter_pct: 50,
+};
+
 /// Backoff schedule parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
