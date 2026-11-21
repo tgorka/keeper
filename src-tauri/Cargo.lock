@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "keeper"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "block2",
  "chrono",
@@ -4609,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-accounts-api"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4617,7 +4617,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-agent"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "fs4",
@@ -4638,7 +4638,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "keeper-graph",
@@ -4652,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-graph"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "keeper-graph-protocol",
  "keeper-ports",
@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-graph-protocol"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -4744,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-graph-query"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "cap",
  "cc",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-llm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "httpdate",
  "reqwest",
@@ -4778,7 +4778,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-nse"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "keeper-core",
  "keeper-ports",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-paths"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-ported"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -4817,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-ports"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hex",
  "serde_json",
@@ -4829,7 +4829,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-replica"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "hex",
@@ -4849,7 +4849,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-sync"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4883,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-syncd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "hex",
@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-testkit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hex",
  "keeper-ports",
