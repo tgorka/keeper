@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times. queries[]: a KG-Cypher/1 source with its parameters (json text) and optional profile (default KG-Cypher/1); fill replaces the one \"{FILL}\" in its source, else in its parameters. Admitted entries give the engine text, the normalised parameters (when listed), the aliases and the limit; refused ones the code. prefix_chains[]: the chained prefix digest of events [graph_seq, delta_digest] from prefix_genesis. manifests[]: a generation manifest a worker reads, or the code it refuses with. worker: the engine, projection version, Linux worker allocator tunables and prefix genesis every consumer and worker share. An algebra entry state may hold contents (content images; absent is none) and a stamp {time_ms, actor_id}: the acceptance a verify_assertion is stamped with (absent: time 1, actor \"vector-actor\"). node_properties[]: a node kind and its properties (json text), admitted with its reserved members or refused with a code. locators[]: a $locator envelope (json text) as a Resource holds it, admitted or refused. assertion_currency[]: a graph now (nodes, edges, contents) and a node; whether its verification is current, read with no write. reviews[]: an acknowledgement (review id, target event and digest, reviewer) and its one-operation event; a review image valid or not; an acknowledge payload admitted or refused. proposals[]: a graph.propose payload in a graph, refused or its revision, proposal digest and proposed detail; a graph.decide payload refused or its approval_basis (proposer agent-1/runtime-1/context) and a rejection's detail. inverses[]: a graph now (images plus written: {id: graph position last written}; referrers are the rows whose properties or body hold a typed reference), a retained event and the reverser actor; the event refused by the inverse planner, or its plan, expected list and the verdict of apply_inverse with the ids minted in order (ops, delta_digest, affected; a conflict; or a refusal), and the preview's outcome/reason/detail. An entry without event judges its forged plan directly. reversals[]: a graph.reverse payload refused, or its verdict against a graph and event. outcomes[]: a receipt outcome of a descriptor and the stable code a native client reports for it (null: none).",
+  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times. queries[]: a KG-Cypher/1 source with its parameters (json text) and optional profile (default KG-Cypher/1); fill replaces the one \"{FILL}\" in its source, else in its parameters. Admitted entries give the engine text, the normalised parameters (when listed), the aliases and the limit; refused ones the code. prefix_chains[]: the chained prefix digest of events [graph_seq, delta_digest] from prefix_genesis. manifests[]: a generation manifest a worker reads, or the code it refuses with. worker: the engine, projection version, Linux worker allocator tunables and prefix genesis every consumer and worker share. An algebra entry state may hold contents (content images; absent is none) and a stamp {time_ms, actor_id}: the acceptance a verify_assertion is stamped with (absent: time 1, actor \"vector-actor\"). node_properties[]: a node kind and its properties (json text), admitted with its reserved members or refused with a code. locators[]: a $locator envelope (json text) as a Resource holds it, admitted or refused. assertion_currency[]: a graph now (nodes, edges, contents) and a node; whether its verification is current, read with no write. reviews[]: an acknowledgement (review id, target event and digest, reviewer) and its one-operation event; a review image valid or not; an acknowledge payload admitted or refused. proposals[]: a graph.propose payload in a graph, refused or its revision, proposal digest and proposed detail; a graph.decide payload refused or its approval_basis (proposer agent-1/runtime-1/context) and a rejection's detail. inverses[]: a graph now (images plus written: {id: graph position last written}; referrers are the rows whose properties or body hold a typed reference), a retained event and the reverser actor; the event refused by the inverse planner, or its plan, expected list and the verdict of apply_inverse with the ids minted in order (ops, delta_digest, affected; a conflict; or a refusal), and the preview's outcome/reason/detail. An entry without event judges its forged plan directly. reversals[]: a graph.reverse payload refused, or its verdict against a graph and event. outcomes[]: a receipt outcome of a descriptor and the stable code a native client reports for it (null: none). approval_bases: modes is the accounts contract's grant_modes; accepted[] are event approval_basis forms that parse and serialise back exactly, refused[] do not parse; events[] are graph.history headers with a {basis: grant} form that a client which keeps approval_basis as JSON reads unchanged, origin_class agent for a tool's event as for an agent instance's. Every events[] entry names a listed agent grant (accounts vectors' map_views) by grant_id and grant_revision, holding content for a graph.apply and reverse_own for a graph.reverse: an entry with root is an agent instance's, whose rootModes gives that root the event's mode; one without root is a tool's, whose grant has no rootModes and whose mode is apply (story 114.6).",
   "contract_version": 1,
   "schema_version": 8,
   "profile": "KG-Cypher/1",
@@ -45608,5 +45608,358 @@
     "projection_version": 3,
     "linux_glibc_tunables": "glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912:glibc.malloc.arena_max=1",
     "prefix_genesis": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "approval_bases": {
+    "modes": ["ask", "propose", "apply"],
+    "accepted": [
+      {
+        "name": "a person's own write",
+        "json": {
+          "basis": "direct"
+        }
+      },
+      {
+        "name": "an agent's write under a person's approval of the call",
+        "json": {
+          "basis": "approval",
+          "approval_id": "01JP00000000000000000000A1",
+          "grant_id": null,
+          "origin": "tgdrive"
+        }
+      },
+      {
+        "name": "an agent's write approved by a standing grant's approval",
+        "json": {
+          "basis": "approval",
+          "approval_id": "01JP00000000000000000000A2",
+          "grant_id": "01JP00000000000000000000G1",
+          "origin": "tgdrive"
+        }
+      },
+      {
+        "name": "an approved proposal",
+        "json": {
+          "basis": "proposal",
+          "proposal_id": "01JN0000000000000000000020",
+          "proposal_revision": "1",
+          "proposal_digest": "05fc4a487137d75528343ecdc2c202088bafe4e16769ce40fa673a0e2fb55170",
+          "proposer_actor": "agent-1",
+          "proposer_client": "runtime-1",
+          "proposer_context": null
+        }
+      },
+      {
+        "name": "an agent instance's change under apply",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a tool's change inside its grant",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/importer",
+          "grant_revision": 3,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "the mode word ask",
+        "json": {
+          "basis": "grant",
+          "grant_id": "neuradrive/nixi",
+          "grant_revision": 1,
+          "mode": "ask"
+        }
+      },
+      {
+        "name": "the mode word propose",
+        "json": {
+          "basis": "grant",
+          "grant_id": "neuradrive/nixi",
+          "grant_revision": 1,
+          "mode": "propose"
+        }
+      },
+      {
+        "name": "a grant revision of 2^53-1",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 9007199254740991,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "an actor id holding a slash after the domain's",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/team/nixi",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      }
+    ],
+    "refused": [
+      {
+        "name": "a grant basis without mode",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 6
+        }
+      },
+      {
+        "name": "a grant basis without grant_id",
+        "json": {
+          "basis": "grant",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant basis without grant_revision",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant basis whose mode is null",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 6,
+          "mode": null
+        }
+      },
+      {
+        "name": "a mode outside ask, propose and apply",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 6,
+          "mode": "auto"
+        }
+      },
+      {
+        "name": "camelCase keys",
+        "json": {
+          "basis": "grant",
+          "grantId": "tgdrive/nixi",
+          "grantRevision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant id that is null",
+        "json": {
+          "basis": "grant",
+          "grant_id": null,
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant id naming no domain",
+        "json": {
+          "basis": "grant",
+          "grant_id": "nixi",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant id whose domain is no domain name",
+        "json": {
+          "basis": "grant",
+          "grant_id": "TGdrive/nixi",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant id naming no actor",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/",
+          "grant_revision": 6,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant revision of 0",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 0,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant revision beyond 2^53-1",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 9007199254740992,
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant revision as a decimal string",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": "6",
+          "mode": "apply"
+        }
+      },
+      {
+        "name": "a grant basis with a member it does not have",
+        "json": {
+          "basis": "grant",
+          "grant_id": "tgdrive/nixi",
+          "grant_revision": 6,
+          "mode": "apply",
+          "approval_id": null
+        }
+      },
+      {
+        "name": "an approval basis without grant_id",
+        "json": {
+          "basis": "approval",
+          "approval_id": "01JP00000000000000000000A1",
+          "origin": "tgdrive"
+        }
+      },
+      {
+        "name": "a proposal basis without proposer_context",
+        "json": {
+          "basis": "proposal",
+          "proposal_id": "01JN0000000000000000000020",
+          "proposal_revision": "1",
+          "proposal_digest": "05fc4a487137d75528343ecdc2c202088bafe4e16769ce40fa673a0e2fb55170",
+          "proposer_actor": "agent-1",
+          "proposer_client": "runtime-1"
+        }
+      },
+      {
+        "name": "a direct basis with a member",
+        "json": {
+          "basis": "direct",
+          "grant_id": "tgdrive/nixi"
+        }
+      },
+      {
+        "name": "a basis the contract does not have",
+        "json": {
+          "basis": "standing",
+          "grant_id": "tgdrive/nixi"
+        }
+      }
+    ],
+    "events": [
+      {
+        "name": "an agent instance's change under a root its grant gives apply",
+        "root": "01JD0000000000000000000ROOT",
+        "event": {
+          "id": "01JP0000000000000000000001",
+          "graph_seq": "7",
+          "descriptor": "graph.apply",
+          "request_id": "01JP000000000000000000000R",
+          "request_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "actor_id": "nixi",
+          "client_id": "nixi.runtime",
+          "origin_class": "agent",
+          "origin_actor": "kuba",
+          "origin_chain": [
+            {
+              "session_id": "01JP00000000000000000000S1",
+              "agent_actor": "nixi"
+            }
+          ],
+          "context_id": "01JP00000000000000000000C1",
+          "approval_basis": {
+            "basis": "grant",
+            "grant_id": "tgdrive/nixi",
+            "grant_revision": 6,
+            "mode": "apply"
+          },
+          "reverses_event_id": null,
+          "event_time_ms": null,
+          "recorded_at_ms": 2001,
+          "op_count": 1,
+          "delta_digest": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      },
+      {
+        "name": "a tool's change inside its grant, in the run session the server made for it",
+        "event": {
+          "id": "01JP0000000000000000000002",
+          "graph_seq": "8",
+          "descriptor": "graph.apply",
+          "request_id": "01JP000000000000000000000R",
+          "request_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "actor_id": "importer",
+          "client_id": "importer.01",
+          "origin_class": "agent",
+          "origin_actor": null,
+          "origin_chain": [
+            {
+              "session_id": "01JP00000000000000000000S2",
+              "agent_actor": "importer"
+            }
+          ],
+          "context_id": "01JP00000000000000000000C2",
+          "approval_basis": {
+            "basis": "grant",
+            "grant_id": "tgdrive/importer",
+            "grant_revision": 3,
+            "mode": "apply"
+          },
+          "reverses_event_id": null,
+          "event_time_ms": null,
+          "recorded_at_ms": 2001,
+          "op_count": 1,
+          "delta_digest": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      },
+      {
+        "name": "a tool's reversal of its own change under reverse_own",
+        "event": {
+          "id": "01JP0000000000000000000003",
+          "graph_seq": "9",
+          "descriptor": "graph.reverse",
+          "request_id": "01JP000000000000000000000R",
+          "request_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "actor_id": "importer",
+          "client_id": "importer.01",
+          "origin_class": "agent",
+          "origin_actor": null,
+          "origin_chain": [
+            {
+              "session_id": "01JP00000000000000000000S2",
+              "agent_actor": "importer"
+            }
+          ],
+          "context_id": "01JP00000000000000000000C2",
+          "approval_basis": {
+            "basis": "grant",
+            "grant_id": "tgdrive/importer",
+            "grant_revision": 3,
+            "mode": "apply"
+          },
+          "reverses_event_id": "01JP0000000000000000000002",
+          "event_time_ms": null,
+          "recorded_at_ms": 2001,
+          "op_count": 1,
+          "delta_digest": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      }
+    ]
   }
 }

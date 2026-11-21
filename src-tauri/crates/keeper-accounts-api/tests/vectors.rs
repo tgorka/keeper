@@ -2,8 +2,9 @@
 //! `syncular/vocabulary.json`'s `roles` is [`Role::ALL`]. keeper-hq's
 //! TypeScript reads the same two files.
 
-use keeper_accounts_api::admin::{AdminAnswer, AdminRequest, Barrier, MapView};
+use keeper_accounts_api::admin::{AdminAnswer, AdminCommand, AdminRequest, Barrier, MapView};
 use keeper_accounts_api::discovery::Discovery;
+use keeper_accounts_api::grant::{AgentGrantRecord, CapabilityClass, GrantMode};
 use keeper_accounts_api::refusal::Refusal;
 use keeper_accounts_api::{DomainKind, FilesWrites, Role};
 use serde::de::DeserializeOwned;
@@ -12,6 +13,7 @@ use serde_json::Value;
 
 const CORPUS: &str = include_str!("../../../../syncular/accounts.vectors.json");
 const VOCABULARY: &str = include_str!("../../../../syncular/vocabulary.json");
+const GRAPH: &str = include_str!("../../../../syncular/knowledge-graph.vectors.json");
 
 fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("vector JSON")
@@ -62,6 +64,10 @@ fn closed_sets_agree() {
             Barrier::StaleRestore,
         ])
     );
+    assert_eq!(v["capability_classes"], names(&CapabilityClass::ALL));
+    assert_eq!(v["grant_modes"], names(&GrantMode::ALL));
+    let graph: Value = serde_json::from_str(GRAPH).expect("graph vector JSON");
+    assert_eq!(graph["approval_bases"]["modes"], v["grant_modes"]);
 }
 
 #[test]
@@ -136,6 +142,89 @@ fn admin_answers_and_map_views_round_trip() {
         let got = round_trip::<MapView>(&entry["json"])
             .unwrap_or_else(|e| panic!("{}: {e}", entry["name"]));
         assert_eq!(got, entry["json"], "{}", entry["name"]);
+    }
+}
+
+#[test]
+fn map_commands_parse_and_name_the_contract_s_codes() {
+    let v = corpus();
+    let fixture = &v["map"];
+    for key in ["domains", "people", "agents"] {
+        let names = fixture[key].as_array().expect(key);
+        assert!(names.iter().all(Value::is_string), "map.{key}");
+    }
+    for entry in entries(&v, "command_refusals") {
+        let got = round_trip::<AdminCommand>(&entry["command"])
+            .unwrap_or_else(|e| panic!("{}: {e}", entry["name"]));
+        assert_eq!(got, entry["command"], "{}", entry["name"]);
+        let code = entry["refusal"].as_str().expect("refusal");
+        assert!(Refusal::from_code(code).is_some(), "{}", entry["name"]);
+    }
+    for entry in entries(&v, "command_applications") {
+        let got = round_trip::<AdminCommand>(&entry["command"])
+            .unwrap_or_else(|e| panic!("{}: {e}", entry["name"]));
+        assert_eq!(got, entry["command"], "{}", entry["name"]);
+        for side in ["before", "after"] {
+            let got = round_trip::<Vec<AgentGrantRecord>>(&entry[side])
+                .unwrap_or_else(|e| panic!("{} {side}: {e}", entry["name"]));
+            assert_eq!(got, entry[side], "{} {side}", entry["name"]);
+        }
+    }
+}
+
+#[test]
+fn a_listed_grant_s_id_and_modes_are_what_its_events_carry() {
+    let v = corpus();
+    let views = entries(&v, "map_views");
+    let grants: Vec<AgentGrantRecord> = views
+        .iter()
+        .filter_map(|entry| entry["json"].get("agent_grants"))
+        .flat_map(|grants| {
+            serde_json::from_value::<Vec<AgentGrantRecord>>(grants.clone()).expect("grants")
+        })
+        .collect();
+    let graph: Value = serde_json::from_str(GRAPH).expect("graph vector JSON");
+    let events = graph["approval_bases"]["events"]
+        .as_array()
+        .expect("events");
+    let granted: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"]["approval_basis"]["basis"] == "grant")
+        .collect();
+    assert!(granted.iter().any(|e| e.get("root").is_some()));
+    assert!(granted.iter().any(|e| e.get("root").is_none()));
+    for event in granted {
+        let name = &event["name"];
+        let basis = &event["event"]["approval_basis"];
+        let grant = grants
+            .iter()
+            .find(|g| g.grant_id() == basis["grant_id"] && g.revision == basis["grant_revision"])
+            .unwrap_or_else(|| panic!("{name}: no listed grant {basis}"));
+        assert_eq!(
+            event["event"]["actor_id"],
+            grant.agent_id.as_str(),
+            "{name}"
+        );
+        let class = if event["event"]["descriptor"] == "graph.reverse" {
+            CapabilityClass::ReverseOwn
+        } else {
+            CapabilityClass::Content
+        };
+        assert!(grant.capability.holds(class), "{name}: no {class:?}");
+        let mode = match event.get("root") {
+            // An agent instance's change: the mode its grant gives the root.
+            Some(root) => grant.capability.mode_of(root.as_str().expect("root")),
+            // A tool's: no mode per root, its whole grant lands `apply`.
+            None => {
+                assert_eq!(grant.capability.fields().root_modes, None, "{name}");
+                GrantMode::Apply
+            }
+        };
+        assert_eq!(
+            basis["mode"],
+            serde_json::to_value(mode).expect("mode"),
+            "{name}"
+        );
     }
 }
 

@@ -182,6 +182,42 @@ revision: a request whose `expected_revision` is not the map's revision is refus
 first, and `seq` is one sequence for the whole map, not one per domain. An answer of
 `confirmation_required`, `unreconciled` or a refusal applies nothing and binds nothing.
 
+**An agent's graph capability** in a domain is written by `set_agent_grant {domain, agent_id,
+capability, expires_at_ms?}`, which replaces any earlier one, and withdrawn by
+`remove_agent_grant {domain, agent_id}`, which needs no agent of that id to exist any more (stories
+114.3, 114.6). Neither names the general domain: one that does is refused `hq.admin.malformed` at
+parse, since no agent holds anything there. `set_agent_grant` names an agent of the credential
+file (`hq.admin.unknown_person` otherwise), and both name a domain the map lists
+(`hq.admin.unknown_domain` otherwise).
+An agent's id is no person's: `add_person` under it is `hq.admin.person_exists`, and a
+`set_membership` naming it `hq.admin.unknown_person`.
+The capability is the graph's grammar, stored as given — an optional member absent stays absent,
+none is ever `null` — and anything the grammar does not admit is `hq.admin.malformed`: `classes`
+(up to 6 distinct of `capability_classes`: `read`, `content`, `vocabulary`, `guidance_body`,
+`guidance_scope`, `reverse_own`; none only beside a non-empty `files`, with `allowedKinds` and
+both root lists empty, `rootModes` absent and `domainWideContent` absent or `false` — a files-only
+grant, which gives no graph change, so no graph event's grant basis cites it), `allowedKinds`
+(distinct reserved kinds, never `Vocabulary`, empty without a write class), `collectionRoots`
+(content or `reverse_own` only) and `guidanceRoots` (needed by, and only with, a guidance class) —
+each at most 256 distinct node ids of at most 128 bytes with no control character, `/` or `:` —
+and `domainWideContent?` (a boolean, `true` only with `content`; `content` needs it or a
+collection root). Two members ride beside them, each non-empty when given. `rootModes?` maps a
+collection root to the mode its `content`-class changes land by, one of `grant_modes` (`ask`,
+`propose`, `apply`); a key that is not a collection root is refused. These modes are an agent
+instance's: in an agent instance's grant a root not named is `ask`, and guidance, vocabulary and
+what `domainWideContent` alone covers stay `ask`. A tool has no mode per root: its change inside
+its whole grant, whichever class covers it, lands `apply`; whether a grant's holder is a tool or
+an agent instance is the credential file's, not the capability's, so the server applies this
+rule and the grammar cannot. `files?` is the file part, a list of `{roots, classes, mode}`, every
+member required and none other: `roots` the directory entry ids it covers and `classes` the file
+classes, each a non-empty list of distinct non-empty strings, and `mode` a non-empty string; the
+words its `classes` and `mode` may hold are the files module's, so the contract carries them as
+given.
+Which modes the server lets the operator store is the server's rule, not a parse. The list answer
+carries `agent_grants` only when a grant exists: each `{domain, agent_id, issuer, revision,
+expires_at_ms?, capability}`, the capability as the request gave it and read with the same
+grammar, so a member this contract does not have fails the reader rather than being dropped.
+
 ## Scopes
 
 A scope variable is one dimension a row is authorised along; a client requests values, the server
@@ -617,7 +653,10 @@ implementation of them.
 `{"version": 1, "request_id": <ULID>, "context_id": <ULID> | null, "payload": {…}}` and nothing
 else. A `version` other than 1 is refused `unsupported_version` before anything else is read. A
 person's device sends `context_id: null`; an agent sends the context the server issued and
-admitted it under. The request's digest is the SHA-256 of the canonical bytes of
+admitted it under. A tool identity (story 114.6) is no third kind of sender: it acts inside a run
+session the server makes for it in the tool's own domain, whose only member is the tool, and
+sends the context the server issued it there, under every rule of an agent's context. The
+request's digest is the SHA-256 of the canonical bytes of
 `{"version", "descriptor", "context_id", "payload"}`, `descriptor` the command's id
 (`graph.<name>`); the actor, client, database and `request_id` are where it is looked up, not
 part of it. A request id once bound to a digest is bound for good: the same id with another
@@ -690,7 +729,8 @@ an edge's never does, and no member is a query symbol:
 
 - **`kg_events`** — one accepted change: `graph_seq` (1, 2, … per graph), `descriptor`,
   `request_id`, `request_digest`, `actor_id` and `client_id` of the request, `origin_class`
-  (`human` | `agent`, from the credential and context, never from the payload), `origin_actor`
+  (`human` | `agent`, from the credential and context, never from the payload; a tool's event is
+  `agent`, told apart by its own `actor_id`, so a client of an older build reads it), `origin_actor`
   (the person an agent acted for, or null), `origin_chain` (JSON, or null: the delegation chain
   from that person to the acting context, server-derived from canonical parent sessions),
   `context_id`, `approval_basis` (JSON, or null),
@@ -877,9 +917,20 @@ revision. `contents` in the vectors pins the update rule; its operation is a `co
 `create` or `update` with the image `{id, owner_node_id, revision, body}`.
 
 An agent's event carries `context_id`, `origin_actor` (the person whose session the chain
-starts from), `origin_chain` `[{"session_id", "agent_actor"}, …]` from that root session down
-to the acting one, and `approval_basis` `{"basis": "approval", "approval_id", "grant_id",
-"origin"}`; a person's has `origin_chain` null and `approval_basis` `{"basis": "direct"}`.
+starts from; null for a tool's run session, which has none), `origin_chain` `[{"session_id",
+"agent_actor"}, …]` from that root session down to the acting one, and `approval_basis`
+`{"basis": "approval", "approval_id", "grant_id", "origin"}`; a person's has `origin_chain` null
+and `approval_basis` `{"basis": "direct"}`. A change accepted with no approval of the call,
+because the actor's graph grant lets it land — a tool's anywhere inside its whole grant, always
+with `mode` `apply` since a tool has no mode per root, an agent instance's under a root its grant
+gives `apply` (story 114.6) — carries `{"basis": "grant", "grant_id", "grant_revision", "mode"}`:
+snake_case, all four always present. `grant_id` is the grant's id in the map, `<domain>/<actor_id>`
+(a domain name holds no `/`, so the id splits at its first);
+`grant_revision` the map revision that wrote the grant, the `revision` the admin path lists for
+it (an integer, 1 to 2^53−1); `mode` the mode that applied, one of `ask`, `propose`, `apply`.
+Every form is closed and every member present, `null` where a value may be absent;
+`approval_bases` in the vectors pins the four, and a client keeps the column as JSON, so a form
+it does not know never stops it reading the event.
 
 **Reads.** Registered queries whose params carry `version` (1) and `context_id` (null for a
 person's device); a caller who may not read the graph is refused alike whatever exists:
@@ -971,7 +1022,8 @@ call.
 target_delta_digest}`, a person with the reviewer role) adds one event of one `review` creation
 (kind `acknowledgement`) and its `kg_reviews` row; the acknowledged event never changes and stays
 reversible; a second acknowledgement is refused `invalid_change`. `graph.unreviewed` pages the
-agent-origin `graph.apply`/`graph.reverse` events no review targets, as `graph.history` pages.
+agent-origin `graph.apply`/`graph.reverse` events no review targets — a tool's among them,
+whatever basis it landed under —, as `graph.history` pages.
 `graph.preview_reversal` answers one event's server-derived inverse (its planned operations, a
 restored membership's id null), the `expected` revisions and whether it applies now (`ready`,
 `approval_required` — ready, but an agent's reversal needs its per-call `approval_id`; a person
