@@ -1,7 +1,8 @@
 //! The accounts contract (story 114.2): what a domain is, the four roles a
 //! membership may carry, the entry `GET /databases` gives for each domain a
 //! credential opens ([`discovery`]), and the requests and answers of the
-//! operator's admin path ([`admin`]) with their refusals ([`refusal`]).
+//! operator's admin path ([`admin`]) with their refusals ([`refusal`]) and
+//! the agent grants it writes ([`grant`], stories 114.3, 114.6).
 //!
 //! The map itself — which domains, people and memberships exist — is the
 //! server's own data, kept in the general domain's schema and never in a
@@ -16,6 +17,7 @@
 
 pub mod admin;
 pub mod discovery;
+pub mod grant;
 pub mod refusal;
 
 use serde::{Deserialize, Serialize};

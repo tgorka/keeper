@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's accounts contract vectors (syncular/README.md, Domains and the map; story 114.2). Every implementation reproduces each entry: roles is vocabulary.json's roles; barrier_reads[] is whether each barrier state admits, a state the contract does not have reading as closed; discovery[] bodies of GET /databases parse, and serialise back to want (an entry field a parser does not know is dropped, an absent optional stays absent, an entry whose kind or files_writes the parser does not know is skipped); discovery_refusals[] do not parse; admin_requests[] parse and serialise back to json exactly; admin_request_refusals[] do not parse and the server answers them with refusal; admin_answers[] and map_views[] parse and serialise back to json exactly; refusals[] is every code the contract adds, with its HTTP status (null: a commit refusal).",
+  "about": "Keeper's accounts contract vectors (syncular/README.md, Domains and the map; story 114.2). Every implementation reproduces each entry: roles is vocabulary.json's roles; barrier_reads[] is whether each barrier state admits, a state the contract does not have reading as closed; discovery[] bodies of GET /databases parse, and serialise back to want (an entry field a parser does not know is dropped, an absent optional stays absent, an entry whose kind or files_writes the parser does not know is skipped); discovery_refusals[] do not parse; capability_classes and grant_modes are an agent grant's closed word sets (story 114.6); admin_requests[] parse and serialise back to json exactly, an agent grant's capability as given; admin_request_refusals[] do not parse and the server answers them with refusal; command_refusals[] parse and the map's own rules refuse them with refusal, given the map named in map (domains listed, people, and the credential file's agents); command_applications[] parse and the map's own rules apply them, given the map named in map holding the agent grants listed in before, leaving the agent grants listed in after (stories 114.3, 114.6); admin_answers[] and map_views[] parse and serialise back to json exactly, a map view's agent_grants present only when a grant exists; refusals[] is every code the contract adds, with its HTTP status (null: a commit refusal).",
   "roles": ["reader", "editor", "reviewer", "owner"],
   "kinds": ["general", "personal", "group"],
   "files_writes": ["shadow", "open"],
@@ -12,6 +12,15 @@
     { "state": "stale_restore", "open": false },
     { "state": "repairing", "open": false }
   ],
+  "capability_classes": [
+    "read",
+    "content",
+    "vocabulary",
+    "guidance_body",
+    "guidance_scope",
+    "reverse_own"
+  ],
+  "grant_modes": ["ask", "propose", "apply"],
   "discovery": [
     {
       "name": "the general domain alone, no optional field",
@@ -406,6 +415,445 @@
           }
         ]
       }
+    },
+    {
+      "name": "give an agent a graph capability in a domain",
+      "json": {
+        "request_id": "req-ag-01",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": ["Concept"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      }
+    },
+    {
+      "name": "give an agent a graph capability that lapses",
+      "json": {
+        "request_id": "req-ag-02",
+        "expected_revision": 5,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": false
+          },
+          "expires_at_ms": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "withdraw an agent's graph capability in a domain",
+      "json": {
+        "request_id": "req-ag-03",
+        "expected_revision": 6,
+        "command": {
+          "op": "remove_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi"
+        }
+      }
+    },
+    {
+      "name": "an agent's graph modes per collection root, one root left to ask",
+      "json": {
+        "request_id": "req-ag-04",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content", "reverse_own"],
+            "allowedKinds": ["Concept", "Resource"],
+            "collectionRoots": ["01JD0000000000000000000ROOT", "01JD00000000000000000ROOT2"],
+            "guidanceRoots": [],
+            "rootModes": {
+              "01JD0000000000000000000ROOT": "apply",
+              "01JD00000000000000000ROOT2": "propose"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "a capability with a file part of two items over two roots and two modes",
+      "json": {
+        "request_id": "req-ag-05",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["read", "write"],
+                "mode": "apply"
+              },
+              {
+                "roots": ["01JF00000000000000000DIR02"],
+                "classes": ["write"],
+                "mode": "propose"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "a file item whose class and mode are words the files module defines, carried as given",
+      "json": {
+        "request_id": "req-ag-06",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["files.extract"],
+                "mode": "later"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "content over the whole domain, no root",
+      "json": {
+        "request_id": "req-ag-07",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": true
+          }
+        }
+      }
+    },
+    {
+      "name": "guidance over a guidance root",
+      "json": {
+        "request_id": "req-ag-08",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["guidance_body", "guidance_scope"],
+            "allowedKinds": ["Guidance"],
+            "collectionRoots": [],
+            "guidanceRoots": ["01JD0000000000000000000ROOT"]
+          }
+        }
+      }
+    },
+    {
+      "name": "256 roots, the most a list holds",
+      "json": {
+        "request_id": "req-ag-09",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [
+              "01JD0000000000000000000000",
+              "01JD0000000000000000000001",
+              "01JD0000000000000000000002",
+              "01JD0000000000000000000003",
+              "01JD0000000000000000000004",
+              "01JD0000000000000000000005",
+              "01JD0000000000000000000006",
+              "01JD0000000000000000000007",
+              "01JD0000000000000000000008",
+              "01JD0000000000000000000009",
+              "01JD0000000000000000000010",
+              "01JD0000000000000000000011",
+              "01JD0000000000000000000012",
+              "01JD0000000000000000000013",
+              "01JD0000000000000000000014",
+              "01JD0000000000000000000015",
+              "01JD0000000000000000000016",
+              "01JD0000000000000000000017",
+              "01JD0000000000000000000018",
+              "01JD0000000000000000000019",
+              "01JD0000000000000000000020",
+              "01JD0000000000000000000021",
+              "01JD0000000000000000000022",
+              "01JD0000000000000000000023",
+              "01JD0000000000000000000024",
+              "01JD0000000000000000000025",
+              "01JD0000000000000000000026",
+              "01JD0000000000000000000027",
+              "01JD0000000000000000000028",
+              "01JD0000000000000000000029",
+              "01JD0000000000000000000030",
+              "01JD0000000000000000000031",
+              "01JD0000000000000000000032",
+              "01JD0000000000000000000033",
+              "01JD0000000000000000000034",
+              "01JD0000000000000000000035",
+              "01JD0000000000000000000036",
+              "01JD0000000000000000000037",
+              "01JD0000000000000000000038",
+              "01JD0000000000000000000039",
+              "01JD0000000000000000000040",
+              "01JD0000000000000000000041",
+              "01JD0000000000000000000042",
+              "01JD0000000000000000000043",
+              "01JD0000000000000000000044",
+              "01JD0000000000000000000045",
+              "01JD0000000000000000000046",
+              "01JD0000000000000000000047",
+              "01JD0000000000000000000048",
+              "01JD0000000000000000000049",
+              "01JD0000000000000000000050",
+              "01JD0000000000000000000051",
+              "01JD0000000000000000000052",
+              "01JD0000000000000000000053",
+              "01JD0000000000000000000054",
+              "01JD0000000000000000000055",
+              "01JD0000000000000000000056",
+              "01JD0000000000000000000057",
+              "01JD0000000000000000000058",
+              "01JD0000000000000000000059",
+              "01JD0000000000000000000060",
+              "01JD0000000000000000000061",
+              "01JD0000000000000000000062",
+              "01JD0000000000000000000063",
+              "01JD0000000000000000000064",
+              "01JD0000000000000000000065",
+              "01JD0000000000000000000066",
+              "01JD0000000000000000000067",
+              "01JD0000000000000000000068",
+              "01JD0000000000000000000069",
+              "01JD0000000000000000000070",
+              "01JD0000000000000000000071",
+              "01JD0000000000000000000072",
+              "01JD0000000000000000000073",
+              "01JD0000000000000000000074",
+              "01JD0000000000000000000075",
+              "01JD0000000000000000000076",
+              "01JD0000000000000000000077",
+              "01JD0000000000000000000078",
+              "01JD0000000000000000000079",
+              "01JD0000000000000000000080",
+              "01JD0000000000000000000081",
+              "01JD0000000000000000000082",
+              "01JD0000000000000000000083",
+              "01JD0000000000000000000084",
+              "01JD0000000000000000000085",
+              "01JD0000000000000000000086",
+              "01JD0000000000000000000087",
+              "01JD0000000000000000000088",
+              "01JD0000000000000000000089",
+              "01JD0000000000000000000090",
+              "01JD0000000000000000000091",
+              "01JD0000000000000000000092",
+              "01JD0000000000000000000093",
+              "01JD0000000000000000000094",
+              "01JD0000000000000000000095",
+              "01JD0000000000000000000096",
+              "01JD0000000000000000000097",
+              "01JD0000000000000000000098",
+              "01JD0000000000000000000099",
+              "01JD0000000000000000000100",
+              "01JD0000000000000000000101",
+              "01JD0000000000000000000102",
+              "01JD0000000000000000000103",
+              "01JD0000000000000000000104",
+              "01JD0000000000000000000105",
+              "01JD0000000000000000000106",
+              "01JD0000000000000000000107",
+              "01JD0000000000000000000108",
+              "01JD0000000000000000000109",
+              "01JD0000000000000000000110",
+              "01JD0000000000000000000111",
+              "01JD0000000000000000000112",
+              "01JD0000000000000000000113",
+              "01JD0000000000000000000114",
+              "01JD0000000000000000000115",
+              "01JD0000000000000000000116",
+              "01JD0000000000000000000117",
+              "01JD0000000000000000000118",
+              "01JD0000000000000000000119",
+              "01JD0000000000000000000120",
+              "01JD0000000000000000000121",
+              "01JD0000000000000000000122",
+              "01JD0000000000000000000123",
+              "01JD0000000000000000000124",
+              "01JD0000000000000000000125",
+              "01JD0000000000000000000126",
+              "01JD0000000000000000000127",
+              "01JD0000000000000000000128",
+              "01JD0000000000000000000129",
+              "01JD0000000000000000000130",
+              "01JD0000000000000000000131",
+              "01JD0000000000000000000132",
+              "01JD0000000000000000000133",
+              "01JD0000000000000000000134",
+              "01JD0000000000000000000135",
+              "01JD0000000000000000000136",
+              "01JD0000000000000000000137",
+              "01JD0000000000000000000138",
+              "01JD0000000000000000000139",
+              "01JD0000000000000000000140",
+              "01JD0000000000000000000141",
+              "01JD0000000000000000000142",
+              "01JD0000000000000000000143",
+              "01JD0000000000000000000144",
+              "01JD0000000000000000000145",
+              "01JD0000000000000000000146",
+              "01JD0000000000000000000147",
+              "01JD0000000000000000000148",
+              "01JD0000000000000000000149",
+              "01JD0000000000000000000150",
+              "01JD0000000000000000000151",
+              "01JD0000000000000000000152",
+              "01JD0000000000000000000153",
+              "01JD0000000000000000000154",
+              "01JD0000000000000000000155",
+              "01JD0000000000000000000156",
+              "01JD0000000000000000000157",
+              "01JD0000000000000000000158",
+              "01JD0000000000000000000159",
+              "01JD0000000000000000000160",
+              "01JD0000000000000000000161",
+              "01JD0000000000000000000162",
+              "01JD0000000000000000000163",
+              "01JD0000000000000000000164",
+              "01JD0000000000000000000165",
+              "01JD0000000000000000000166",
+              "01JD0000000000000000000167",
+              "01JD0000000000000000000168",
+              "01JD0000000000000000000169",
+              "01JD0000000000000000000170",
+              "01JD0000000000000000000171",
+              "01JD0000000000000000000172",
+              "01JD0000000000000000000173",
+              "01JD0000000000000000000174",
+              "01JD0000000000000000000175",
+              "01JD0000000000000000000176",
+              "01JD0000000000000000000177",
+              "01JD0000000000000000000178",
+              "01JD0000000000000000000179",
+              "01JD0000000000000000000180",
+              "01JD0000000000000000000181",
+              "01JD0000000000000000000182",
+              "01JD0000000000000000000183",
+              "01JD0000000000000000000184",
+              "01JD0000000000000000000185",
+              "01JD0000000000000000000186",
+              "01JD0000000000000000000187",
+              "01JD0000000000000000000188",
+              "01JD0000000000000000000189",
+              "01JD0000000000000000000190",
+              "01JD0000000000000000000191",
+              "01JD0000000000000000000192",
+              "01JD0000000000000000000193",
+              "01JD0000000000000000000194",
+              "01JD0000000000000000000195",
+              "01JD0000000000000000000196",
+              "01JD0000000000000000000197",
+              "01JD0000000000000000000198",
+              "01JD0000000000000000000199",
+              "01JD0000000000000000000200",
+              "01JD0000000000000000000201",
+              "01JD0000000000000000000202",
+              "01JD0000000000000000000203",
+              "01JD0000000000000000000204",
+              "01JD0000000000000000000205",
+              "01JD0000000000000000000206",
+              "01JD0000000000000000000207",
+              "01JD0000000000000000000208",
+              "01JD0000000000000000000209",
+              "01JD0000000000000000000210",
+              "01JD0000000000000000000211",
+              "01JD0000000000000000000212",
+              "01JD0000000000000000000213",
+              "01JD0000000000000000000214",
+              "01JD0000000000000000000215",
+              "01JD0000000000000000000216",
+              "01JD0000000000000000000217",
+              "01JD0000000000000000000218",
+              "01JD0000000000000000000219",
+              "01JD0000000000000000000220",
+              "01JD0000000000000000000221",
+              "01JD0000000000000000000222",
+              "01JD0000000000000000000223",
+              "01JD0000000000000000000224",
+              "01JD0000000000000000000225",
+              "01JD0000000000000000000226",
+              "01JD0000000000000000000227",
+              "01JD0000000000000000000228",
+              "01JD0000000000000000000229",
+              "01JD0000000000000000000230",
+              "01JD0000000000000000000231",
+              "01JD0000000000000000000232",
+              "01JD0000000000000000000233",
+              "01JD0000000000000000000234",
+              "01JD0000000000000000000235",
+              "01JD0000000000000000000236",
+              "01JD0000000000000000000237",
+              "01JD0000000000000000000238",
+              "01JD0000000000000000000239",
+              "01JD0000000000000000000240",
+              "01JD0000000000000000000241",
+              "01JD0000000000000000000242",
+              "01JD0000000000000000000243",
+              "01JD0000000000000000000244",
+              "01JD0000000000000000000245",
+              "01JD0000000000000000000246",
+              "01JD0000000000000000000247",
+              "01JD0000000000000000000248",
+              "01JD0000000000000000000249",
+              "01JD0000000000000000000250",
+              "01JD0000000000000000000251",
+              "01JD0000000000000000000252",
+              "01JD0000000000000000000253",
+              "01JD0000000000000000000254",
+              "01JD0000000000000000000255"
+            ],
+            "guidanceRoots": []
+          }
+        }
+      }
     }
   ],
   "admin_request_refusals": [
@@ -535,6 +983,1028 @@
         "command": { "op": "unbind_subject", "actor_id": "ola" }
       },
       "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an agent grant in the general domain",
+      "json": {
+        "request_id": "req-ag-20",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "makidrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an agent grant withdrawn in the general domain",
+      "json": {
+        "request_id": "req-ag-21",
+        "expected_revision": 4,
+        "command": {
+          "op": "remove_agent_grant",
+          "domain": "makidrive",
+          "agent_id": "nixi"
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a class that changes a role",
+      "json": {
+        "request_id": "req-ag-22",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "owner"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a seventh class: policy",
+      "json": {
+        "request_id": "req-ag-23",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["policy"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a capability field KG1's grammar does not have",
+      "json": {
+        "request_id": "req-ag-24",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "role": "owner"
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a role on an agent grant",
+      "json": {
+        "request_id": "req-ag-25",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "role": "reader",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no capability",
+      "json": {
+        "request_id": "req-ag-26",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi"
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an expiry given as null",
+      "json": {
+        "request_id": "req-ag-27",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          },
+          "expires_at_ms": null
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "domainWideContent given as null",
+      "json": {
+        "request_id": "req-ag-40",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": null
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "rootModes given as null",
+      "json": {
+        "request_id": "req-ag-41",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content", "reverse_own"],
+            "allowedKinds": ["Concept", "Resource"],
+            "collectionRoots": ["01JD0000000000000000000ROOT", "01JD00000000000000000ROOT2"],
+            "guidanceRoots": [],
+            "rootModes": null
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "files given as null",
+      "json": {
+        "request_id": "req-ag-42",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": null
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a mode for a root the grant does not list",
+      "json": {
+        "request_id": "req-ag-43",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content", "reverse_own"],
+            "allowedKinds": ["Concept", "Resource"],
+            "collectionRoots": ["01JD0000000000000000000ROOT", "01JD00000000000000000ROOT2"],
+            "guidanceRoots": [],
+            "rootModes": {
+              "01JD00000000000000000OTHER": "apply"
+            }
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a mode for a root with content over the whole domain and no root",
+      "json": {
+        "request_id": "req-ag-44",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": true,
+            "rootModes": {
+              "01JD0000000000000000000ROOT": "apply"
+            }
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a graph mode outside ask, propose and apply",
+      "json": {
+        "request_id": "req-ag-45",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content", "reverse_own"],
+            "allowedKinds": ["Concept", "Resource"],
+            "collectionRoots": ["01JD0000000000000000000ROOT", "01JD00000000000000000ROOT2"],
+            "guidanceRoots": [],
+            "rootModes": {
+              "01JD0000000000000000000ROOT": "auto"
+            }
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item without a mode",
+      "json": {
+        "request_id": "req-ag-46",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["read"]
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item with a member it does not have",
+      "json": {
+        "request_id": "req-ag-47",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["read"],
+                "mode": "ask",
+                "sources": []
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item over no root",
+      "json": {
+        "request_id": "req-ag-48",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": [],
+                "classes": ["read"],
+                "mode": "ask"
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item with no class",
+      "json": {
+        "request_id": "req-ag-49",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": [],
+                "mode": "ask"
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no class",
+      "json": {
+        "request_id": "req-ag-50",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a class listed twice",
+      "json": {
+        "request_id": "req-ag-51",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "the Vocabulary kind, which only the vocabulary class writes",
+      "json": {
+        "request_id": "req-ag-52",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": ["Vocabulary"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a kind that is not reserved",
+      "json": {
+        "request_id": "req-ag-53",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": ["Person"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a kind without a write class",
+      "json": {
+        "request_id": "req-ag-54",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": ["Concept"],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "collection roots without content or reverse_own",
+      "json": {
+        "request_id": "req-ag-55",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "content with neither a root nor the whole domain",
+      "json": {
+        "request_id": "req-ag-56",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "content over the whole domain without the content class",
+      "json": {
+        "request_id": "req-ag-57",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": true
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a guidance class without a guidance root",
+      "json": {
+        "request_id": "req-ag-58",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["guidance_body"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a guidance root without a guidance class",
+      "json": {
+        "request_id": "req-ag-59",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": ["01JD0000000000000000000ROOT"]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a root listed twice",
+      "json": {
+        "request_id": "req-ag-60",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": ["01JD0000000000000000000ROOT", "01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a root that is no node id",
+      "json": {
+        "request_id": "req-ag-61",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": ["drive/root"],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a root longer than 128 bytes",
+      "json": {
+        "request_id": "req-ag-62",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [
+              "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR"
+            ],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "more than 256 roots",
+      "json": {
+        "request_id": "req-ag-63",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [
+              "01JD0000000000000000000000",
+              "01JD0000000000000000000001",
+              "01JD0000000000000000000002",
+              "01JD0000000000000000000003",
+              "01JD0000000000000000000004",
+              "01JD0000000000000000000005",
+              "01JD0000000000000000000006",
+              "01JD0000000000000000000007",
+              "01JD0000000000000000000008",
+              "01JD0000000000000000000009",
+              "01JD0000000000000000000010",
+              "01JD0000000000000000000011",
+              "01JD0000000000000000000012",
+              "01JD0000000000000000000013",
+              "01JD0000000000000000000014",
+              "01JD0000000000000000000015",
+              "01JD0000000000000000000016",
+              "01JD0000000000000000000017",
+              "01JD0000000000000000000018",
+              "01JD0000000000000000000019",
+              "01JD0000000000000000000020",
+              "01JD0000000000000000000021",
+              "01JD0000000000000000000022",
+              "01JD0000000000000000000023",
+              "01JD0000000000000000000024",
+              "01JD0000000000000000000025",
+              "01JD0000000000000000000026",
+              "01JD0000000000000000000027",
+              "01JD0000000000000000000028",
+              "01JD0000000000000000000029",
+              "01JD0000000000000000000030",
+              "01JD0000000000000000000031",
+              "01JD0000000000000000000032",
+              "01JD0000000000000000000033",
+              "01JD0000000000000000000034",
+              "01JD0000000000000000000035",
+              "01JD0000000000000000000036",
+              "01JD0000000000000000000037",
+              "01JD0000000000000000000038",
+              "01JD0000000000000000000039",
+              "01JD0000000000000000000040",
+              "01JD0000000000000000000041",
+              "01JD0000000000000000000042",
+              "01JD0000000000000000000043",
+              "01JD0000000000000000000044",
+              "01JD0000000000000000000045",
+              "01JD0000000000000000000046",
+              "01JD0000000000000000000047",
+              "01JD0000000000000000000048",
+              "01JD0000000000000000000049",
+              "01JD0000000000000000000050",
+              "01JD0000000000000000000051",
+              "01JD0000000000000000000052",
+              "01JD0000000000000000000053",
+              "01JD0000000000000000000054",
+              "01JD0000000000000000000055",
+              "01JD0000000000000000000056",
+              "01JD0000000000000000000057",
+              "01JD0000000000000000000058",
+              "01JD0000000000000000000059",
+              "01JD0000000000000000000060",
+              "01JD0000000000000000000061",
+              "01JD0000000000000000000062",
+              "01JD0000000000000000000063",
+              "01JD0000000000000000000064",
+              "01JD0000000000000000000065",
+              "01JD0000000000000000000066",
+              "01JD0000000000000000000067",
+              "01JD0000000000000000000068",
+              "01JD0000000000000000000069",
+              "01JD0000000000000000000070",
+              "01JD0000000000000000000071",
+              "01JD0000000000000000000072",
+              "01JD0000000000000000000073",
+              "01JD0000000000000000000074",
+              "01JD0000000000000000000075",
+              "01JD0000000000000000000076",
+              "01JD0000000000000000000077",
+              "01JD0000000000000000000078",
+              "01JD0000000000000000000079",
+              "01JD0000000000000000000080",
+              "01JD0000000000000000000081",
+              "01JD0000000000000000000082",
+              "01JD0000000000000000000083",
+              "01JD0000000000000000000084",
+              "01JD0000000000000000000085",
+              "01JD0000000000000000000086",
+              "01JD0000000000000000000087",
+              "01JD0000000000000000000088",
+              "01JD0000000000000000000089",
+              "01JD0000000000000000000090",
+              "01JD0000000000000000000091",
+              "01JD0000000000000000000092",
+              "01JD0000000000000000000093",
+              "01JD0000000000000000000094",
+              "01JD0000000000000000000095",
+              "01JD0000000000000000000096",
+              "01JD0000000000000000000097",
+              "01JD0000000000000000000098",
+              "01JD0000000000000000000099",
+              "01JD0000000000000000000100",
+              "01JD0000000000000000000101",
+              "01JD0000000000000000000102",
+              "01JD0000000000000000000103",
+              "01JD0000000000000000000104",
+              "01JD0000000000000000000105",
+              "01JD0000000000000000000106",
+              "01JD0000000000000000000107",
+              "01JD0000000000000000000108",
+              "01JD0000000000000000000109",
+              "01JD0000000000000000000110",
+              "01JD0000000000000000000111",
+              "01JD0000000000000000000112",
+              "01JD0000000000000000000113",
+              "01JD0000000000000000000114",
+              "01JD0000000000000000000115",
+              "01JD0000000000000000000116",
+              "01JD0000000000000000000117",
+              "01JD0000000000000000000118",
+              "01JD0000000000000000000119",
+              "01JD0000000000000000000120",
+              "01JD0000000000000000000121",
+              "01JD0000000000000000000122",
+              "01JD0000000000000000000123",
+              "01JD0000000000000000000124",
+              "01JD0000000000000000000125",
+              "01JD0000000000000000000126",
+              "01JD0000000000000000000127",
+              "01JD0000000000000000000128",
+              "01JD0000000000000000000129",
+              "01JD0000000000000000000130",
+              "01JD0000000000000000000131",
+              "01JD0000000000000000000132",
+              "01JD0000000000000000000133",
+              "01JD0000000000000000000134",
+              "01JD0000000000000000000135",
+              "01JD0000000000000000000136",
+              "01JD0000000000000000000137",
+              "01JD0000000000000000000138",
+              "01JD0000000000000000000139",
+              "01JD0000000000000000000140",
+              "01JD0000000000000000000141",
+              "01JD0000000000000000000142",
+              "01JD0000000000000000000143",
+              "01JD0000000000000000000144",
+              "01JD0000000000000000000145",
+              "01JD0000000000000000000146",
+              "01JD0000000000000000000147",
+              "01JD0000000000000000000148",
+              "01JD0000000000000000000149",
+              "01JD0000000000000000000150",
+              "01JD0000000000000000000151",
+              "01JD0000000000000000000152",
+              "01JD0000000000000000000153",
+              "01JD0000000000000000000154",
+              "01JD0000000000000000000155",
+              "01JD0000000000000000000156",
+              "01JD0000000000000000000157",
+              "01JD0000000000000000000158",
+              "01JD0000000000000000000159",
+              "01JD0000000000000000000160",
+              "01JD0000000000000000000161",
+              "01JD0000000000000000000162",
+              "01JD0000000000000000000163",
+              "01JD0000000000000000000164",
+              "01JD0000000000000000000165",
+              "01JD0000000000000000000166",
+              "01JD0000000000000000000167",
+              "01JD0000000000000000000168",
+              "01JD0000000000000000000169",
+              "01JD0000000000000000000170",
+              "01JD0000000000000000000171",
+              "01JD0000000000000000000172",
+              "01JD0000000000000000000173",
+              "01JD0000000000000000000174",
+              "01JD0000000000000000000175",
+              "01JD0000000000000000000176",
+              "01JD0000000000000000000177",
+              "01JD0000000000000000000178",
+              "01JD0000000000000000000179",
+              "01JD0000000000000000000180",
+              "01JD0000000000000000000181",
+              "01JD0000000000000000000182",
+              "01JD0000000000000000000183",
+              "01JD0000000000000000000184",
+              "01JD0000000000000000000185",
+              "01JD0000000000000000000186",
+              "01JD0000000000000000000187",
+              "01JD0000000000000000000188",
+              "01JD0000000000000000000189",
+              "01JD0000000000000000000190",
+              "01JD0000000000000000000191",
+              "01JD0000000000000000000192",
+              "01JD0000000000000000000193",
+              "01JD0000000000000000000194",
+              "01JD0000000000000000000195",
+              "01JD0000000000000000000196",
+              "01JD0000000000000000000197",
+              "01JD0000000000000000000198",
+              "01JD0000000000000000000199",
+              "01JD0000000000000000000200",
+              "01JD0000000000000000000201",
+              "01JD0000000000000000000202",
+              "01JD0000000000000000000203",
+              "01JD0000000000000000000204",
+              "01JD0000000000000000000205",
+              "01JD0000000000000000000206",
+              "01JD0000000000000000000207",
+              "01JD0000000000000000000208",
+              "01JD0000000000000000000209",
+              "01JD0000000000000000000210",
+              "01JD0000000000000000000211",
+              "01JD0000000000000000000212",
+              "01JD0000000000000000000213",
+              "01JD0000000000000000000214",
+              "01JD0000000000000000000215",
+              "01JD0000000000000000000216",
+              "01JD0000000000000000000217",
+              "01JD0000000000000000000218",
+              "01JD0000000000000000000219",
+              "01JD0000000000000000000220",
+              "01JD0000000000000000000221",
+              "01JD0000000000000000000222",
+              "01JD0000000000000000000223",
+              "01JD0000000000000000000224",
+              "01JD0000000000000000000225",
+              "01JD0000000000000000000226",
+              "01JD0000000000000000000227",
+              "01JD0000000000000000000228",
+              "01JD0000000000000000000229",
+              "01JD0000000000000000000230",
+              "01JD0000000000000000000231",
+              "01JD0000000000000000000232",
+              "01JD0000000000000000000233",
+              "01JD0000000000000000000234",
+              "01JD0000000000000000000235",
+              "01JD0000000000000000000236",
+              "01JD0000000000000000000237",
+              "01JD0000000000000000000238",
+              "01JD0000000000000000000239",
+              "01JD0000000000000000000240",
+              "01JD0000000000000000000241",
+              "01JD0000000000000000000242",
+              "01JD0000000000000000000243",
+              "01JD0000000000000000000244",
+              "01JD0000000000000000000245",
+              "01JD0000000000000000000246",
+              "01JD0000000000000000000247",
+              "01JD0000000000000000000248",
+              "01JD0000000000000000000249",
+              "01JD0000000000000000000250",
+              "01JD0000000000000000000251",
+              "01JD0000000000000000000252",
+              "01JD0000000000000000000253",
+              "01JD0000000000000000000254",
+              "01JD0000000000000000000255",
+              "01JD0000000000000000000256"
+            ],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an expiry beyond 2^53-1",
+      "json": {
+        "request_id": "req-ag-64",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          },
+          "expires_at_ms": 9007199254740992
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a withdrawal with a member it does not have",
+      "json": {
+        "request_id": "req-ag-65",
+        "expected_revision": 4,
+        "command": {
+          "op": "remove_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    }
+  ],
+  "map": {
+    "domains": ["makidrive", "tgdrive"],
+    "people": ["kuba"],
+    "agents": ["nixi"]
+  },
+  "command_refusals": [
+    {
+      "name": "an agent grant naming no agent of the file",
+      "command": {
+        "op": "set_agent_grant",
+        "domain": "tgdrive",
+        "agent_id": "kuba",
+        "capability": {
+          "classes": ["read"],
+          "allowedKinds": [],
+          "collectionRoots": [],
+          "guidanceRoots": []
+        }
+      },
+      "refusal": "hq.admin.unknown_person"
+    },
+    {
+      "name": "an agent grant in a domain the map does not list",
+      "command": {
+        "op": "set_agent_grant",
+        "domain": "nodrive",
+        "agent_id": "nixi",
+        "capability": {
+          "classes": ["read"],
+          "allowedKinds": [],
+          "collectionRoots": [],
+          "guidanceRoots": []
+        }
+      },
+      "refusal": "hq.admin.unknown_domain"
+    },
+    {
+      "name": "a person added under an agent's id",
+      "command": {
+        "op": "add_person",
+        "actor_id": "nixi",
+        "display_name": "Nixi",
+        "serving_agents": []
+      },
+      "refusal": "hq.admin.person_exists"
+    },
+    {
+      "name": "a membership naming an agent",
+      "command": {
+        "op": "set_membership",
+        "domain": "tgdrive",
+        "actor_id": "nixi",
+        "role": "reader"
+      },
+      "refusal": "hq.admin.unknown_person"
+    }
+  ],
+  "command_applications": [
+    {
+      "name": "a grant withdrawn for an agent no longer in the credential file",
+      "before": [
+        {
+          "domain": "tgdrive",
+          "agent_id": "zola",
+          "issuer": "operator",
+          "revision": 3,
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": []
+          }
+        }
+      ],
+      "command": {
+        "op": "remove_agent_grant",
+        "domain": "tgdrive",
+        "agent_id": "zola"
+      },
+      "after": []
     }
   ],
   "admin_answers": [
@@ -647,6 +2117,127 @@
             "revision": 2,
             "granted_at_ms": 1763427600000,
             "expires_at_ms": 1795000000000
+          }
+        ]
+      }
+    },
+    {
+      "name": "a map with one agent grant",
+      "json": {
+        "revision": 5,
+        "barrier": "open",
+        "domains": [
+          {
+            "name": "makidrive",
+            "kind": "general",
+            "display_name": "makidrive",
+            "provisioned": true
+          },
+          {
+            "name": "tgdrive",
+            "kind": "group",
+            "display_name": "tgdrive",
+            "provisioned": true
+          }
+        ],
+        "people": [
+          {
+            "actor_id": "kuba",
+            "display_name": "Kuba",
+            "serving_agents": []
+          }
+        ],
+        "memberships": [
+          {
+            "domain": "tgdrive",
+            "actor_id": "kuba",
+            "role": "reader",
+            "issuer": "operator",
+            "revision": 4,
+            "granted_at_ms": 1700000000000
+          }
+        ],
+        "agent_grants": [
+          {
+            "domain": "tgdrive",
+            "agent_id": "nixi",
+            "issuer": "operator",
+            "revision": 5,
+            "expires_at_ms": 1800000000000,
+            "capability": {
+              "classes": ["read", "content"],
+              "allowedKinds": ["Concept"],
+              "collectionRoots": ["01JD0000000000000000000ROOT"],
+              "guidanceRoots": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "a map whose agent grant carries graph modes and a file part, listed back as given",
+      "json": {
+        "revision": 6,
+        "barrier": "open",
+        "domains": [
+          {
+            "name": "makidrive",
+            "kind": "general",
+            "display_name": "makidrive",
+            "provisioned": true
+          },
+          {
+            "name": "tgdrive",
+            "kind": "group",
+            "display_name": "tgdrive",
+            "provisioned": true
+          }
+        ],
+        "people": [
+          {
+            "actor_id": "kuba",
+            "display_name": "Kuba",
+            "serving_agents": []
+          }
+        ],
+        "memberships": [
+          {
+            "domain": "tgdrive",
+            "actor_id": "kuba",
+            "role": "reader",
+            "issuer": "operator",
+            "revision": 4,
+            "granted_at_ms": 1700000000000
+          }
+        ],
+        "agent_grants": [
+          {
+            "domain": "tgdrive",
+            "agent_id": "nixi",
+            "issuer": "operator",
+            "revision": 6,
+            "capability": {
+              "classes": ["read", "content", "reverse_own"],
+              "allowedKinds": ["Concept", "Resource"],
+              "collectionRoots": ["01JD0000000000000000000ROOT", "01JD00000000000000000ROOT2"],
+              "guidanceRoots": [],
+              "rootModes": {
+                "01JD0000000000000000000ROOT": "apply",
+                "01JD00000000000000000ROOT2": "propose"
+              },
+              "files": [
+                {
+                  "roots": ["01JF00000000000000000DIR01"],
+                  "classes": ["read", "write"],
+                  "mode": "apply"
+                },
+                {
+                  "roots": ["01JF00000000000000000DIR02"],
+                  "classes": ["write"],
+                  "mode": "propose"
+                }
+              ]
+            }
           }
         ]
       }

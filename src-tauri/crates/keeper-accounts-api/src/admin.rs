@@ -48,6 +48,7 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::grant::{agent_domain, AgentGrantRecord, Capability};
 use crate::{DomainKind, FilesWrites, Role};
 
 /// The largest integer this contract carries, 2^53−1: the largest JCS and a
@@ -155,6 +156,29 @@ pub enum AdminCommand {
     },
     ClearReplacedRepository {
         domain: String,
+    },
+    /// An agent's capability in a domain, replacing any earlier one. Never
+    /// in the general domain; the agent is one of the credential file's.
+    SetAgentGrant {
+        #[serde(deserialize_with = "agent_domain")]
+        domain: String,
+        agent_id: String,
+        capability: Capability,
+        /// When the grant lapses, UTC milliseconds; absent for one that
+        /// does not.
+        #[serde(
+            default,
+            deserialize_with = "present_exact_i64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        expires_at_ms: Option<i64>,
+    },
+    /// An agent's capability in a domain is withdrawn, whether or not the
+    /// agent is still in the credential file.
+    RemoveAgentGrant {
+        #[serde(deserialize_with = "agent_domain")]
+        domain: String,
+        agent_id: String,
     },
     /// Re-applies the map after a failed apply or an old restore. Every
     /// `(person, domain)` that differs from the last applied map must be sent
@@ -306,6 +330,9 @@ pub struct MapView {
     pub domains: Vec<DomainRecord>,
     pub people: Vec<PersonRecord>,
     pub memberships: Vec<MembershipRecord>,
+    /// Present only when a grant exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_grants: Option<Vec<AgentGrantRecord>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,14 +387,16 @@ fn exact_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error
 
 /// An optional request field: absent is `None`, a value is `Some`, and
 /// `null` does not parse, since the canonical form never has it.
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
 }
 
 /// [`present`] for an integer within ±[`MAX_EXACT_INTEGER`].
-fn present_exact_i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+pub(crate) fn present_exact_i64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
     let value = i64::deserialize(deserializer)?;
     if value.unsigned_abs() > MAX_EXACT_INTEGER {
         return Err(D::Error::custom("integer beyond 2^53-1"));
