@@ -854,6 +854,49 @@
           }
         }
       }
+    },
+    {
+      "name": "a tool's grant with a file part and no graph class",
+      "json": {
+        "request_id": "req-ag-66",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "importer",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              { "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "apply" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "a files-only grant that says domainWideContent false",
+      "json": {
+        "request_id": "req-ag-67",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "importer",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": false,
+            "files": [
+              { "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "apply" }
+            ]
+          }
+        }
+      }
     }
   ],
   "admin_request_refusals": [
@@ -1923,6 +1966,246 @@
         }
       },
       "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no class beside an empty file part",
+      "json": {
+        "request_id": "req-ag-68",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no class beside a file part, with a collection root",
+      "json": {
+        "request_id": "req-ag-69",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "files": [
+              { "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "apply" }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no class beside a file part, with a graph mode",
+      "json": {
+        "request_id": "req-ag-70",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "rootModes": { "01JD0000000000000000000ROOT": "apply" },
+            "files": [
+              { "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "apply" }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "no class beside a file part, with content over the whole domain",
+      "json": {
+        "request_id": "req-ag-71",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "domainWideContent": true,
+            "files": [
+              { "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "apply" }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item over a root listed twice",
+      "json": {
+        "request_id": "req-ag-72",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01", "01JF00000000000000000DIR01"],
+                "classes": ["read"],
+                "mode": "apply"
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item with a class listed twice",
+      "json": {
+        "request_id": "req-ag-73",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["read", "read"],
+                "mode": "apply"
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item over an empty root",
+      "json": {
+        "request_id": "req-ag-74",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [{ "roots": [""], "classes": ["read"], "mode": "apply" }]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item with an empty class",
+      "json": {
+        "request_id": "req-ag-75",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [{ "roots": ["01JF00000000000000000DIR01"], "classes": [""], "mode": "apply" }]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a file item with an empty mode",
+      "json": {
+        "request_id": "req-ag-76",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": [{ "roots": ["01JF00000000000000000DIR01"], "classes": ["read"], "mode": "" }]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an empty file part",
+      "json": {
+        "request_id": "req-ag-77",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "files": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "empty graph modes",
+      "json": {
+        "request_id": "req-ag-78",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "nixi",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": [],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "rootModes": {}
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
     }
   ],
   "map": {
@@ -1980,6 +2263,11 @@
         "role": "reader"
       },
       "refusal": "hq.admin.unknown_person"
+    },
+    {
+      "name": "an agent grant withdrawn in a domain the map does not list",
+      "command": { "op": "remove_agent_grant", "domain": "nodrive", "agent_id": "nixi" },
+      "refusal": "hq.admin.unknown_domain"
     }
   ],
   "command_applications": [
@@ -2237,6 +2525,47 @@
                   "mode": "propose"
                 }
               ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "a map with a tool's grant, the one its graph events cite",
+      "json": {
+        "revision": 7,
+        "barrier": "open",
+        "domains": [
+          {
+            "name": "makidrive",
+            "kind": "general",
+            "display_name": "makidrive",
+            "provisioned": true
+          },
+          { "name": "tgdrive", "kind": "group", "display_name": "tgdrive", "provisioned": true }
+        ],
+        "people": [{ "actor_id": "kuba", "display_name": "Kuba", "serving_agents": [] }],
+        "memberships": [
+          {
+            "domain": "tgdrive",
+            "actor_id": "kuba",
+            "role": "reader",
+            "issuer": "operator",
+            "revision": 4,
+            "granted_at_ms": 1700000000000
+          }
+        ],
+        "agent_grants": [
+          {
+            "domain": "tgdrive",
+            "agent_id": "importer",
+            "issuer": "operator",
+            "revision": 3,
+            "capability": {
+              "classes": ["read", "content", "reverse_own"],
+              "allowedKinds": ["Concept", "Resource", "Tag"],
+              "collectionRoots": ["01JD0000000000000000000ROOT"],
+              "guidanceRoots": []
             }
           }
         ]

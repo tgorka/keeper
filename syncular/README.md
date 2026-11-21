@@ -187,24 +187,32 @@ capability, expires_at_ms?}`, which replaces any earlier one, and withdrawn by
 `remove_agent_grant {domain, agent_id}`, which needs no agent of that id to exist any more (stories
 114.3, 114.6). Neither names the general domain: one that does is refused `hq.admin.malformed` at
 parse, since no agent holds anything there. `set_agent_grant` names an agent of the credential
-file (`hq.admin.unknown_person` otherwise) and a domain the map lists (`hq.admin.unknown_domain`).
+file (`hq.admin.unknown_person` otherwise), and both name a domain the map lists
+(`hq.admin.unknown_domain` otherwise).
 An agent's id is no person's: `add_person` under it is `hq.admin.person_exists`, and a
 `set_membership` naming it `hq.admin.unknown_person`.
 The capability is the graph's grammar, stored as given — an optional member absent stays absent,
 none is ever `null` — and anything the grammar does not admit is `hq.admin.malformed`: `classes`
-(1 to 6 distinct of `capability_classes`: `read`, `content`, `vocabulary`, `guidance_body`,
-`guidance_scope`, `reverse_own`), `allowedKinds` (distinct reserved kinds, never `Vocabulary`,
-empty without a write class), `collectionRoots` (content or `reverse_own` only) and
-`guidanceRoots` (needed by, and only with, a guidance class) — each at most 256 distinct node ids
-of at most 128 bytes with no control character, `/` or `:` — and `domainWideContent?` (a
-boolean, `true` only with `content`; `content` needs it or a collection root). Two members ride
-beside them. `rootModes?` maps a collection root to the mode its `content`-class changes land by,
-one of `grant_modes` (`ask`, `propose`, `apply`); a root not named is `ask`, a key that is not a
-collection root is refused, and guidance, vocabulary and what `domainWideContent` alone covers
-stay `ask`. `files?` is the file part, a list of `{roots, classes, mode}`, every member required
-and none other: `roots` the directory entry ids it covers and `classes` the file classes, each a
-non-empty list of distinct non-empty strings, and `mode` a non-empty string; the words its
-`classes` and `mode` may hold are the files module's, so the contract carries them as given.
+(up to 6 distinct of `capability_classes`: `read`, `content`, `vocabulary`, `guidance_body`,
+`guidance_scope`, `reverse_own`; none only beside a non-empty `files`, with `allowedKinds` and
+both root lists empty, `rootModes` absent and `domainWideContent` absent or `false` — a files-only
+grant, which gives no graph change, so no graph event's grant basis cites it), `allowedKinds`
+(distinct reserved kinds, never `Vocabulary`, empty without a write class), `collectionRoots`
+(content or `reverse_own` only) and `guidanceRoots` (needed by, and only with, a guidance class) —
+each at most 256 distinct node ids of at most 128 bytes with no control character, `/` or `:` —
+and `domainWideContent?` (a boolean, `true` only with `content`; `content` needs it or a
+collection root). Two members ride beside them, each non-empty when given. `rootModes?` maps a
+collection root to the mode its `content`-class changes land by, one of `grant_modes` (`ask`,
+`propose`, `apply`); a key that is not a collection root is refused. These modes are an agent
+instance's: in an agent instance's grant a root not named is `ask`, and guidance, vocabulary and
+what `domainWideContent` alone covers stay `ask`. A tool has no mode per root: its change inside
+its whole grant, whichever class covers it, lands `apply`; whether a grant's holder is a tool or
+an agent instance is the credential file's, not the capability's, so the server applies this
+rule and the grammar cannot. `files?` is the file part, a list of `{roots, classes, mode}`, every
+member required and none other: `roots` the directory entry ids it covers and `classes` the file
+classes, each a non-empty list of distinct non-empty strings, and `mode` a non-empty string; the
+words its `classes` and `mode` may hold are the files module's, so the contract carries them as
+given.
 Which modes the server lets the operator store is the server's rule, not a parse. The list answer
 carries `agent_grants` only when a grant exists: each `{domain, agent_id, issuer, revision,
 expires_at_ms?, capability}`, the capability as the request gave it and read with the same
@@ -913,10 +921,11 @@ starts from; null for a tool's run session, which has none), `origin_chain` `[{"
 "agent_actor"}, …]` from that root session down to the acting one, and `approval_basis`
 `{"basis": "approval", "approval_id", "grant_id", "origin"}`; a person's has `origin_chain` null
 and `approval_basis` `{"basis": "direct"}`. A change accepted with no approval of the call,
-because the actor's graph grant lets it land — a tool's inside its grant, an agent instance's
-under a root its grant gives `apply` (story 114.6) — carries `{"basis": "grant", "grant_id",
-"grant_revision", "mode"}`: snake_case, all four always present. `grant_id` is the grant's id in
-the map, `<domain>/<actor_id>` (a domain name holds no `/`, so the id splits at its first);
+because the actor's graph grant lets it land — a tool's anywhere inside its whole grant, always
+with `mode` `apply` since a tool has no mode per root, an agent instance's under a root its grant
+gives `apply` (story 114.6) — carries `{"basis": "grant", "grant_id", "grant_revision", "mode"}`:
+snake_case, all four always present. `grant_id` is the grant's id in the map, `<domain>/<actor_id>`
+(a domain name holds no `/`, so the id splits at its first);
 `grant_revision` the map revision that wrote the grant, the `revision` the admin path lists for
 it (an integer, 1 to 2^53−1); `mode` the mode that applied, one of `ask`, `propose`, `apply`.
 Every form is closed and every member present, `null` where a value may be absent;

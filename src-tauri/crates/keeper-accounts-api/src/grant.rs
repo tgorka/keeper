@@ -4,13 +4,18 @@
 //!
 //! The graph part is the knowledge graph's capability grammar: six classes,
 //! the reserved kinds, collection and guidance roots, `domainWideContent`.
-//! Two members ride beside it:
+//! `classes` is empty only beside a non-empty `files`, every other graph
+//! member then empty or absent: a files-only grant, which gives no graph
+//! change, so no graph event's grant basis cites it. Two members ride
+//! beside the graph part, each non-empty when given:
 //!
 //! - `rootModes`: the mode each collection root's `content`-class changes
 //!   land by — [`GrantMode::Ask`] (a person approves each call, and every
 //!   root not named), [`GrantMode::Propose`] or [`GrantMode::Apply`]. A key
 //!   is one of `collectionRoots`; guidance, vocabulary and what
-//!   `domainWideContent` alone covers stay `ask`.
+//!   `domainWideContent` alone covers stay `ask`. These are an agent
+//!   instance's modes: a tool has no mode per root, and its changes inside
+//!   its whole grant land `apply`.
 //! - `files`: the file part, a list of [`FileItem`]s `{roots, classes,
 //!   mode}`. Its shape is frozen here; the words its `classes` and `mode`
 //!   may hold are the files module's, so they are carried as given.
@@ -140,7 +145,8 @@ pub struct Capability(CapabilityFields);
 /// Why the grammar refuses a capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityError {
-    /// `classes` is empty or lists a class twice.
+    /// `classes` is empty without a non-empty `files`, or lists a class
+    /// twice.
     Classes,
     /// `allowedKinds` lists a kind twice, one that is not reserved, or any
     /// kind without a write class.
@@ -155,9 +161,11 @@ pub enum CapabilityError {
     GuidanceRoots,
     /// `domainWideContent` without `content`.
     DomainWideContent,
-    /// A `rootModes` key that is not one of `collectionRoots`.
+    /// `rootModes` given empty, or a key that is not one of
+    /// `collectionRoots`.
     RootModes,
-    /// A file item with no root, no class, an empty or repeated value.
+    /// `files` given empty, or a file item with no root, no class, an empty
+    /// or repeated value, or an empty mode.
     Files,
 }
 
@@ -192,8 +200,12 @@ impl Capability {
         self.0.classes.contains(&class)
     }
 
-    /// The mode `root`'s `content`-class changes land by: `ask` unless
-    /// `rootModes` names another.
+    /// The mode an agent instance's `content`-class changes under `root`
+    /// land by: `ask` unless `rootModes` names another. A tool's grant has
+    /// no mode per root: its changes inside the whole grant land `apply`.
+    /// Whether the holder is a tool is the credential file's, not the
+    /// capability's, so this type cannot tell; the caller that knows the
+    /// holder picks the rule.
     #[must_use]
     pub fn mode_of(&self, root: &str) -> GrantMode {
         self.0
@@ -243,7 +255,8 @@ fn check(c: &CapabilityFields) -> Result<(), CapabilityError> {
     use CapabilityClass::{Content, GuidanceBody, GuidanceScope, ReverseOwn};
     use CapabilityError as E;
     let has = |class| c.classes.contains(&class);
-    if c.classes.is_empty() || !distinct(&c.classes) {
+    let has_files = c.files.as_ref().is_some_and(|files| !files.is_empty());
+    if (c.classes.is_empty() && !has_files) || !distinct(&c.classes) {
         return Err(E::Classes);
     }
     let writes = c.classes.iter().any(|class| class.writes());
@@ -273,14 +286,15 @@ fn check(c: &CapabilityFields) -> Result<(), CapabilityError> {
         return Err(E::CollectionRoots);
     }
     if let Some(modes) = &c.root_modes {
-        if modes.keys().any(|root| !c.collection_roots.contains(root)) {
+        if modes.is_empty() || modes.keys().any(|root| !c.collection_roots.contains(root)) {
             return Err(E::RootModes);
         }
     }
     if let Some(files) = &c.files {
-        if files
-            .iter()
-            .any(|item| !words(&item.roots) || !words(&item.classes) || item.mode.is_empty())
+        if files.is_empty()
+            || files
+                .iter()
+                .any(|item| !words(&item.roots) || !words(&item.classes) || item.mode.is_empty())
         {
             return Err(E::Files);
         }

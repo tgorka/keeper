@@ -187,18 +187,43 @@ fn a_listed_grant_s_id_and_modes_are_what_its_events_carry() {
     let events = graph["approval_bases"]["events"]
         .as_array()
         .expect("events");
-    let rooted: Vec<&Value> = events.iter().filter(|e| e.get("root").is_some()).collect();
-    assert!(!rooted.is_empty());
-    for event in rooted {
+    let granted: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"]["approval_basis"]["basis"] == "grant")
+        .collect();
+    assert!(granted.iter().any(|e| e.get("root").is_some()));
+    assert!(granted.iter().any(|e| e.get("root").is_none()));
+    for event in granted {
+        let name = &event["name"];
         let basis = &event["event"]["approval_basis"];
         let grant = grants
             .iter()
             .find(|g| g.grant_id() == basis["grant_id"] && g.revision == basis["grant_revision"])
-            .unwrap_or_else(|| panic!("no listed grant {basis}"));
-        let root = event["root"].as_str().expect("root");
+            .unwrap_or_else(|| panic!("{name}: no listed grant {basis}"));
+        assert_eq!(
+            event["event"]["actor_id"],
+            grant.agent_id.as_str(),
+            "{name}"
+        );
+        let class = if event["event"]["descriptor"] == "graph.reverse" {
+            CapabilityClass::ReverseOwn
+        } else {
+            CapabilityClass::Content
+        };
+        assert!(grant.capability.holds(class), "{name}: no {class:?}");
+        let mode = match event.get("root") {
+            // An agent instance's change: the mode its grant gives the root.
+            Some(root) => grant.capability.mode_of(root.as_str().expect("root")),
+            // A tool's: no mode per root, its whole grant lands `apply`.
+            None => {
+                assert_eq!(grant.capability.fields().root_modes, None, "{name}");
+                GrantMode::Apply
+            }
+        };
         assert_eq!(
             basis["mode"],
-            serde_json::to_value(grant.capability.mode_of(root)).expect("mode")
+            serde_json::to_value(mode).expect("mode"),
+            "{name}"
         );
     }
 }
