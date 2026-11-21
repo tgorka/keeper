@@ -266,8 +266,8 @@ impl Replica for Server {
     fn close(&self) {
         self.inner.close();
     }
-    fn join(&self) {
-        self.inner.join();
+    fn join(&self) -> bool {
+        self.inner.join()
     }
 }
 

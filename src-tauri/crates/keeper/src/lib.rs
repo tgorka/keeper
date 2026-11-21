@@ -1011,6 +1011,8 @@ pub fn run() {
                 // pairs and syncs its agents' databases the same way.
                 hq_ipc::hq_status_subscribe,
                 hq_ipc::hq_status_unsubscribe,
+                hq_ipc::hq_domains_subscribe,
+                hq_ipc::hq_domains_unsubscribe,
                 hq_ipc::hq_server_set,
                 hq_ipc::hq_server_forget,
                 hq_ipc::hq_pair_start,

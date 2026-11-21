@@ -3970,3 +3970,234 @@ async fn sign_in_enrols_adopts_announces_and_attests() {
         logged.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 114.5: joining, leaving and a restored map, on a device that keeps
+// running. The epic's closing run on delectra runs these once 114.4's
+// keeper-hq rung (credentials copied on join, revoked on leave) is deployed.
+// Besides the variables above:
+//
+//   KEEPER_HQ_LIVE_SCRATCH=<a scratch group domain KEEPER_HQ_LIVE_ACTOR is not in yet>
+//   KEEPER_HQ_LIVE_ADMIN_JOIN=<a URL that, POSTed, adds the person to the scratch domain
+//       through the operator's admin path and answers once the admin request is answered>
+//   KEEPER_HQ_LIVE_ADMIN_LEAVE=<the same, removing the person from it>
+//   KEEPER_HQ_LIVE_RESTORE=<for the restore leg: a URL that restores the `makidrive` domain
+//       from a dump taken before the join (114.2 #5(e))>
+//   KEEPER_HQ_LIVE_RECONCILE=<for the restore leg: a URL running the operator's reconcile>
+//
+// Each leg lists the device's data directory before and after, and reads the
+// view `keeper-cli accounts domains --json` prints (`domains.json`).
+
+/// NFR-E114-4: from the admin request's answer to the device listing the
+/// joined domain with its first pull done.
+const JOIN_BOUND: Duration = Duration::from_secs(60);
+
+async fn post(url: &str) {
+    reqwest::Client::new()
+        .post(url)
+        .send()
+        .await
+        .expect("the admin hook answers")
+        .error_for_status()
+        .expect("the admin hook succeeds");
+}
+
+fn listing(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(relative) = path.strip_prefix(dir) {
+                found.push(relative.display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn lists(device: &Hq, domain: &str) -> bool {
+    device
+        .domains()
+        .borrow()
+        .domains
+        .iter()
+        .any(|d| d.name == domain)
+}
+
+/// A device paired, running and linked for longer than one discovery
+/// interval, and the scratch domain it will be added to.
+async fn running_device(scratch_dir: &Path) -> (Arc<Device>, Arc<Hq>, String, String, String) {
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let dbs = env("KEEPER_HQ_LIVE_DATABASES").split(',').count();
+    let scratch = env("KEEPER_HQ_LIVE_SCRATCH");
+    let platform = device(scratch_dir);
+    let running = paired(&platform, &server, &operator, &actor, dbs).await;
+    // Linked for at least one discovery interval, never restarted.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert!(
+        !lists(&running, &scratch),
+        "the person is in {scratch} already"
+    );
+    (platform, running, server, actor, scratch)
+}
+
+fn replica_of(platform: &Device, server: &str, domain: &str, actor: &str) -> PathBuf {
+    let server = keeper_ports::server::ServerUrl::parse(server)
+        .expect("parses")
+        .expect("an address");
+    keeper_core::hq::databases::replica(&platform.data_dir, &server, domain, actor)
+}
+
+/// 114.5-AC2: added to a group while it runs, the device lists it, its
+/// replica file appears and its first pull completes within the bound — no
+/// restart, pairing or sign-in.
+async fn join_leg(platform: &Device, running: &Hq, server: &str, actor: &str, scratch: &str) {
+    let before = listing(&platform.data_dir);
+    post(&env("KEEPER_HQ_LIVE_ADMIN_JOIN")).await;
+    let answered = Instant::now();
+    wait_status(
+        running,
+        "the joined domain connects",
+        |s| {
+            s.databases
+                .iter()
+                .any(|db| db.name == scratch && db.state == HqDatabaseState::Connected)
+        },
+        JOIN_BOUND,
+    )
+    .await;
+    let directory = running.replica(scratch).expect("held");
+    let deadline = answered + JOIN_BOUND;
+    while query(
+        &directory,
+        "SELECT id FROM actors WHERE id = ?1",
+        vec![json!(actor)],
+    )
+    .await
+    .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the first pull did not complete in time"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(lists(running, scratch));
+    assert!(replica_of(platform, server, scratch, actor).is_file());
+    eprintln!(
+        "joined {scratch} in {:?}\nbefore: {before:#?}\nafter: {:#?}",
+        answered.elapsed(),
+        listing(&platform.data_dir)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server with 114.4's admin path; see the 114.5 notes above"]
+async fn a_running_device_joins_a_domain_within_the_bound() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (platform, running, server, actor, scratch) = running_device(dir.path()).await;
+    join_leg(&platform, &running, &server, &actor, &scratch).await;
+    post(&env("KEEPER_HQ_LIVE_ADMIN_LEAVE")).await;
+    running.shutdown().await;
+}
+
+/// 114.5-AC3: removed from it while it runs, the device stops syncing it and
+/// says it was left; with nothing unsent its replica and `blob-access` files
+/// are gone, and with writes only it holds the copy is kept, unopened, and
+/// said so. Its other domains keep syncing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server with 114.4's admin path; see the 114.5 notes above"]
+async fn a_running_device_leaves_a_domain_and_deletes_its_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (platform, running, server, actor, scratch) = running_device(dir.path()).await;
+    join_leg(&platform, &running, &server, &actor, &scratch).await;
+    let replica = replica_of(&platform, &server, &scratch, &actor);
+    let before = listing(&platform.data_dir);
+    let outbox = running
+        .replica(&scratch)
+        .map_or(0, |held| held.state().outbox);
+    post(&env("KEEPER_HQ_LIVE_ADMIN_LEAVE")).await;
+    let deadline = Instant::now() + JOIN_BOUND;
+    let left = loop {
+        let view = running.domains().borrow().clone();
+        let left = view.left.iter().find(|left| left.name == scratch).cloned();
+        if let (false, Some(left)) = (lists(&running, &scratch), left) {
+            break left;
+        }
+        assert!(Instant::now() < deadline, "the domain was not left in time");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(running.replica(&scratch).is_none(), "a left copy is served");
+    let after = listing(&platform.data_dir);
+    if left.kept {
+        assert!(
+            outbox > 0 || left.graph_intents > 0,
+            "kept with nothing unsent: {left:#?}"
+        );
+        assert!(replica.is_file(), "a kept copy was deleted: {after:#?}");
+    } else {
+        assert_eq!(outbox, 0, "unsent writes were deleted: {left:#?}");
+        assert!(
+            after
+                .iter()
+                .all(|file| !file.contains(&format!("/{scratch}/"))),
+            "{after:#?}"
+        );
+    }
+    let status = running.status().borrow().clone();
+    assert!(status
+        .databases
+        .iter()
+        .all(|db| db.state == HqDatabaseState::Connected));
+    eprintln!("left {scratch}\nbefore: {before:#?}\nafter: {after:#?}");
+    running.shutdown().await;
+}
+
+/// 114.5-AC10 with 114.2-AC5 (e)'s real restore: after `makidrive` is
+/// restored from a dump older than the join, the joined device keeps
+/// discovering the joined domain and its replica stays until the operator
+/// reconciles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server with 114.4's admin path and a pre-join dump; see the 114.5 notes above"]
+async fn a_restored_map_removes_no_copy_until_it_is_reconciled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (platform, running, server, actor, scratch) = running_device(dir.path()).await;
+    join_leg(&platform, &running, &server, &actor, &scratch).await;
+    let replica = replica_of(&platform, &server, &scratch, &actor);
+    let before = listing(&platform.data_dir);
+    post(&env("KEEPER_HQ_LIVE_RESTORE")).await;
+    // Three rediscoveries at least, with the barrier closed.
+    let watch_until = Instant::now() + Duration::from_secs(95);
+    while Instant::now() < watch_until {
+        assert!(lists(&running, &scratch), "the joined domain was dropped");
+        assert!(
+            replica.is_file(),
+            "the replica was deleted before the reconcile"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        listing(&platform.data_dir)
+            .iter()
+            .filter(|f| f.contains(&format!("/{scratch}/")))
+            .count(),
+        before
+            .iter()
+            .filter(|f| f.contains(&format!("/{scratch}/")))
+            .count()
+    );
+    post(&env("KEEPER_HQ_LIVE_RECONCILE")).await;
+    eprintln!(
+        "restored and reconciled\nbefore: {before:#?}\nafter: {:#?}\nview: {:#?}",
+        listing(&platform.data_dir),
+        running.domains().borrow()
+    );
+    post(&env("KEEPER_HQ_LIVE_ADMIN_LEAVE")).await;
+    running.shutdown().await;
+}

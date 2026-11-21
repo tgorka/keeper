@@ -20,6 +20,10 @@ workspace = true
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 keeper-graph = { path = "../keeper-graph", features = ["human-reads"] }
 keeper-ports = { path = "../keeper-ports" }
+# `accounts domains` (story 114.5): the view model it prints, and the
+# contract's entry types its tests read the vectors with.
+keeper-accounts = { path = "../keeper-accounts" }
+keeper-accounts-api = { path = "../keeper-accounts-api" }
 keeper-replica = { path = "../keeper-replica" }
 clap = { workspace = true }
 serde_json = { workspace = true }

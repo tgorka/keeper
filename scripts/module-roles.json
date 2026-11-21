@@ -1,5 +1,6 @@
 {
   "keeper": "composition-root",
+  "keeper-accounts": "implementation",
   "keeper-accounts-api": "contract",
   "keeper-agent": "legacy",
   "keeper-cli": "composition-root",

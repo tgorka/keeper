@@ -50,7 +50,15 @@ pub enum RouteError {
 pub struct Discovery {
     pub actor_id: String,
     pub client_id: String,
+    /// Every database the token opens, whatever its entry says: what the
+    /// device opens and links, and the only list a domain is left by.
     pub databases: Vec<String>,
+    /// The entries `GET /databases` describes them with (story 114.2's
+    /// fields), less any whose `kind` or `files_writes` this client does not
+    /// know: what the person is shown (114.5). Empty from the routes that
+    /// carry no entry (a redemption, an enrolment) and from a server that
+    /// sends none.
+    pub entries: Vec<keeper_accounts_api::discovery::DomainEntry>,
 }
 
 /// A redeemed code: the token (shown once) and what it opens.
@@ -233,6 +241,7 @@ fn discovery_of(
         actor_id,
         client_id,
         databases,
+        entries: Vec::new(),
     })
 }
 
@@ -440,15 +449,33 @@ async fn body<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|error| RouteError::Unexpected(error.to_string()))
 }
 
-/// `GET /databases`: whom the token was issued to and the databases it opens.
+/// `GET /databases`: whom the token was issued to, the databases it opens
+/// and their entries. The names are read from every entry; the entries
+/// through the accounts contract, which skips one it cannot describe — that
+/// domain is still opened, only not shown — and reads none from a body
+/// that does not carry them.
 async fn discover(
     http: &reqwest::Client,
     server: &ServerUrl,
     token: &str,
 ) -> Result<Discovery, RouteError> {
     let response = send(http.get(server.route("/databases")).bearer_auth(token)).await?;
-    let found: DiscoveryBody = body(response).await?;
-    discovery_of(found.actor_id, found.client_id, found.databases)
+    let raw: serde_json::Value = body(response).await?;
+    discovery_of_body(raw)
+}
+
+fn discovery_of_body(raw: serde_json::Value) -> Result<Discovery, RouteError> {
+    let entries = serde_json::from_value::<keeper_accounts_api::discovery::Discovery>(raw.clone())
+        .map(|described| described.databases)
+        .unwrap_or_default();
+    let found: DiscoveryBody =
+        serde_json::from_value(raw).map_err(|error| RouteError::Unexpected(error.to_string()))?;
+    let mut discovery = discovery_of(found.actor_id, found.client_id, found.databases)?;
+    discovery.entries = entries
+        .into_iter()
+        .filter(|entry| discovery.databases.contains(&entry.name))
+        .collect();
+    Ok(discovery)
 }
 
 /// `POST /pair/redeem`: the code is the credential; `name` is how the
@@ -716,8 +743,42 @@ mod tests {
                 actor_id: "t".to_owned(),
                 client_id: "t.1".to_owned(),
                 databases: vec![],
+                entries: vec![],
             },
         };
         assert!(!format!("{redeemed:?}").contains("01234567"));
+    }
+
+    /// Story 114.5: a domain whose entry this client cannot describe is
+    /// still listed — it is opened, never left — and only not shown.
+    #[test]
+    fn an_entry_the_contract_skips_is_still_a_listed_database() {
+        let found = discovery_of_body(serde_json::json!({
+            "actorId": "marta", "clientId": "marta.01",
+            "databases": [
+                {"name": "makidrive", "mount": "/makidrive", "kind": "general",
+                 "display_name": "Makidrive"},
+                {"name": "scratch-team", "mount": "/scratch-team", "kind": "team",
+                 "display_name": "Team"},
+            ],
+        }))
+        .expect("parses");
+        assert_eq!(found.databases, ["makidrive", "scratch-team"]);
+        assert_eq!(
+            found
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["makidrive"]
+        );
+        // A body with no entry fields still lists its databases.
+        let bare = discovery_of_body(serde_json::json!({
+            "actorId": "marta", "clientId": "marta.01",
+            "databases": [{"name": "makidrive"}],
+        }))
+        .expect("parses");
+        assert_eq!(bare.databases, ["makidrive"]);
+        assert!(bare.entries.is_empty());
     }
 }

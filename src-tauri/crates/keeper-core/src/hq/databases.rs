@@ -119,17 +119,96 @@ pub fn held(data_dir: &Path, server: &ServerUrl, actor: &str) -> Vec<String> {
     names
 }
 
-/// Every database this device shows: the ones the server opens to it, in the
-/// server's order, then the ones it holds that the server no longer opens.
-/// Each with whether it is open.
-pub fn plan(held: &[String], open: &[String]) -> Vec<(String, bool)> {
-    let mut shown: Vec<(String, bool)> = open.iter().map(|name| (name.clone(), true)).collect();
-    for name in held {
-        if !open.contains(name) {
-            shown.push((name.clone(), false));
-        }
+/// One database's graph intent queue for `actor`, beside its replica (the
+/// queue's place is `keeper_graph::queue::beside`'s, pinned by a test below).
+pub fn graph_queue(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str) -> PathBuf {
+    replica(data_dir, server, database, actor).with_file_name(format!("{actor}.graph-queue"))
+}
+
+/// What else of one database's copy for `actor` lies beside its replica:
+/// the graph's query projection and intent queue. The replica's own files
+/// are the opener's ([`keeper_ports::Opener::remove`]).
+pub fn beside_replica(
+    data_dir: &Path,
+    server: &ServerUrl,
+    database: &str,
+    actor: &str,
+) -> [PathBuf; 2] {
+    [
+        projection(data_dir, server, database, actor),
+        graph_queue(data_dir, server, database, actor),
+    ]
+}
+
+/// The stored names of a graph intent's terminal states
+/// (`keeper_graph::queue::State::is_terminal`, pinned by a test below). A
+/// state not named here counts as unsent: a name added later keeps a copy
+/// rather than deleting one.
+const GRAPH_TERMINAL: [&str; 9] = [
+    "accepted",
+    "proposed",
+    "conflict",
+    "rejected",
+    "technical_refusal",
+    "idempotency_mismatch",
+    "unsupported",
+    "withdrawn",
+    "refused_locally",
+];
+
+/// How many graph intents in the queue at `path` the server has not
+/// resolved (114.5), read-only; no queue there is none. keeper-core does not
+/// link the graph client, so this reads the file's one table itself.
+pub fn unresolved_graph_intents(path: &Path) -> Result<u32, String> {
+    if !path.exists() {
+        return Ok(0);
     }
-    shown
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+    let terminal = GRAPH_TERMINAL
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM graph_intents WHERE state NOT IN ({terminal})"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// The person's domains as this device last showed them (114.5): kept so an
+/// offline device, a restart and `keeper-cli accounts domains` show the last
+/// known. Nothing secret.
+pub fn domains_file(data_dir: &Path, server: &ServerUrl) -> PathBuf {
+    server_dir(data_dir, server).join("domains.json")
+}
+
+/// The view kept for `server`; nothing kept (or unreadable) is an empty one.
+pub fn load_domains(data_dir: &Path, server: &ServerUrl) -> keeper_accounts::DomainsVm {
+    std::fs::read(domains_file(data_dir, server))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_domains(
+    data_dir: &Path,
+    server: &ServerUrl,
+    domains: &keeper_accounts::DomainsVm,
+) -> std::io::Result<()> {
+    let path = domains_file(data_dir, server);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(domains).map_err(std::io::Error::other)?;
+    let staged = path.with_extension("json.new");
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(staged, path)
 }
 
 /// What the server last said about this device: whether it was removed, and
@@ -208,6 +287,59 @@ mod tests {
         assert_eq!(queue.parent(), at.parent());
         assert_eq!(queue.file_name(), Some("ana.graph-queue".as_ref()));
         assert!(queue.starts_with(server_dir(data, &a)));
+        // What a left domain's removal deletes beside the replica (114.5).
+        assert_eq!(beside_replica(data, &a, "alpha", "ana")[1], queue);
+    }
+
+    /// The terminal names counted as resolved are exactly the graph
+    /// client's terminal states; a state added there fails the match below.
+    #[test]
+    fn the_graph_terminal_states_are_the_graph_clients() {
+        use keeper_graph::queue::State;
+        let every = [
+            State::AwaitingApproval,
+            State::Queued,
+            State::Submitting,
+            State::PendingVisibility,
+            State::Unresolved,
+            State::Suspended,
+            State::Disabled,
+            State::Accepted,
+            State::Proposed,
+            State::Conflict,
+            State::Rejected,
+            State::TechnicalRefusal,
+            State::IdempotencyMismatch,
+            State::Unsupported,
+            State::Withdrawn,
+            State::RefusedLocally,
+        ];
+        for state in every {
+            // Exhaustive: a new state must be placed in `every`.
+            match state {
+                State::AwaitingApproval
+                | State::Queued
+                | State::Submitting
+                | State::PendingVisibility
+                | State::Unresolved
+                | State::Suspended
+                | State::Disabled
+                | State::Accepted
+                | State::Proposed
+                | State::Conflict
+                | State::Rejected
+                | State::TechnicalRefusal
+                | State::IdempotencyMismatch
+                | State::Unsupported
+                | State::Withdrawn
+                | State::RefusedLocally => {}
+            }
+            assert_eq!(
+                GRAPH_TERMINAL.contains(&state.as_str()),
+                state.is_terminal(),
+                "{state:?}"
+            );
+        }
     }
 
     #[test]
@@ -222,15 +354,6 @@ mod tests {
         std::fs::create_dir_all(server_dir(dir.path(), &a).join("Not A Name")).expect("mkdir");
         assert_eq!(held(dir.path(), &a, "ana"), ["alpha", "beta"]);
         assert!(held(dir.path(), &server("https://x.example.org"), "ana").is_empty());
-    }
-
-    #[test]
-    fn a_database_the_server_dropped_is_still_shown_not_open() {
-        let held = ["beta".to_owned(), "alpha".to_owned()];
-        assert_eq!(
-            plan(&held, &["alpha".to_owned()]),
-            [("alpha".to_owned(), true), ("beta".to_owned(), false)]
-        );
     }
 
     #[test]
