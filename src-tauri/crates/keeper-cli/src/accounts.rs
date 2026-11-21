@@ -255,5 +255,13 @@ mod tests {
             "left crew (crew): its copy is kept here with 2 unsent write(s) and 1 graph change(s)"
         ));
         assert!(text.contains("left scratch (scratch): its copy is deleted here"));
+        assert!(text.contains(
+            "left lost (lost): its copy is kept here because its unsent changes could not be \
+             counted"
+        ));
+        assert!(
+            !text.contains("lost (lost): its copy is kept here with"),
+            "{text}"
+        );
     }
 }
