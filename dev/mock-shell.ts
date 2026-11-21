@@ -9917,7 +9917,25 @@ function hqDomainsFixture(): DomainsVm {
             name: "scratch-crew",
             displayName: "Scratch crew",
             kind: "group",
+            unsent: 0,
+            graphIntents: 0,
+            kept: false,
+            leftAtMs: Date.now() - 30_000,
+          },
+        ],
+      };
+    case "kept":
+      return {
+        ...listed,
+        domains: listed.domains.slice(0, 3),
+        left: [
+          {
+            name: "scratch-crew",
+            displayName: "Scratch crew",
+            kind: "group",
             unsent: 2,
+            graphIntents: 1,
+            kept: true,
             leftAtMs: Date.now() - 30_000,
           },
         ],
@@ -9944,8 +9962,8 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
     return null;
   },
   // Settings › Agents › Server › Your domains (114.5): `?domains=` walks the view's states —
-  // listed (the default), reading, empty, offline, left, removed. A viewing aid: Rust decides
-  // every state; this draws each once.
+  // listed (the default), reading, empty, offline, left (copy deleted), kept (copy kept with its
+  // unsent writes), removed. A viewing aid: Rust decides every state; this draws each once.
   hq_domains_subscribe: (payload) => {
     const channel = payload.channel as MockChannel<DomainsVm>;
     channel.onmessage?.(hqDomainsFixture());

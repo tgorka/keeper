@@ -87,20 +87,31 @@ describe("AgentsDomains (114.5-AC1, AC3, AC4, AC6, AC9)", () => {
     expect(screen.getAllByRole("listitem")).toHaveLength(4);
   });
 
-  it("says a domain was left, what remains and the writes that went with it", () => {
-    const left = {
+  it("says a domain was left: its copy deleted, or kept with the writes only it holds", () => {
+    const kept = {
       name: "scratch",
       displayName: "Scratch",
       kind: "group" as const,
       unsent: 2,
+      graphIntents: 1,
+      kept: true,
       leftAtMs: 5,
     };
-    shows({ ...LISTED, left: [left] });
+    const deleted = { ...kept, name: "old", displayName: "Old", unsent: 0, graphIntents: 0 };
+    shows({ ...LISTED, left: [kept, { ...deleted, kept: false }] });
     const leftList = screen.getByRole("list", { name: LEFT_TITLE });
     const row = within(leftList).getByRole("listitem", { name: "Scratch" });
     expect(row).toHaveTextContent("You left Scratch");
-    expect(row).toHaveTextContent("2 writes not yet sent went with it");
-    expect(leftNote({ ...left, unsent: 0 })).not.toMatch(/not yet sent/);
+    expect(row).toHaveTextContent(
+      "Its copy is kept on this device with 2 writes and 1 graph change not yet sent.",
+    );
+    expect(row).toHaveTextContent("are sent if you are added to it again");
+    const gone = within(leftList).getByRole("listitem", { name: "Old" });
+    expect(gone).toHaveTextContent("Its copy was deleted from this device.");
+    expect(gone).not.toHaveTextContent(/kept|not yet sent/);
+    expect(leftNote({ ...kept, unsent: 0 })).toMatch(/with 1 graph change not yet sent/);
+    expect(leftNote({ ...kept, graphIntents: 0 })).toMatch(/with 2 writes not yet sent/);
+    expect(leftNote({ ...deleted, kept: true })).toMatch(/could not be counted/);
   });
 
   it("reads, is empty, renders nothing unconnected, and says when it cannot read", async () => {

@@ -26,8 +26,9 @@
 //! While a replica is linked, discovery is asked again every
 //! [`REDISCOVERY`], so a domain the person joins opens without a restart, and
 //! a held domain a successful answer no longer lists was left: its replica
-//! stops and its copy is deleted (114.5, DF/AD-13; [`keeper_accounts`]
-//! decides which, and keeps the view of the person's domains).
+//! stops and its copy is deleted, or kept unopened while it holds writes
+//! only this device has (114.5, DF/AD-13; [`keeper_accounts`] decides
+//! which, and keeps the view of the person's domains).
 //!
 //! The Agents window reads only the replicas (AD-424, AD-433; [`window`]):
 //! the sessions of every held database in one list, each labelled with its
@@ -95,7 +96,7 @@ use crate::hq::vm::{
     HqSignInState, HqSignInVm, HqStatusVm, HqThisDeviceVm,
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
-use keeper_accounts::{Answer, DomainsState, DomainsVm, Fate};
+use keeper_accounts::{Answer, DomainsState, DomainsVm, Fate, Unsent};
 use keeper_ports::server::ServerUrl;
 use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Unit};
 
@@ -788,9 +789,15 @@ impl Hq {
                 watch_presence: None,
             });
         }
-        let held = match (&holding, &pairing) {
+        // A kept copy of a domain the person left is not opened (114.5): it
+        // waits, with its writes, for a discovery that lists it again.
+        let held: Vec<String> = match (&holding, &pairing) {
             (Some(holding), Some(pairing)) => {
+                let inner = lock(&self.inner);
                 databases::held(&data_dir, holding, &pairing.actor_id)
+                    .into_iter()
+                    .filter(|name| !inner.domains.is_kept(name))
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -1017,9 +1024,10 @@ impl Hq {
     /// linking what it does not, remember what it said. A replica being
     /// replaced stays readable until its successor is in place. A held
     /// domain a successful answer no longer lists was left (114.5,
-    /// DF/AD-13): its replica stops and its copy is deleted; a removed
-    /// device keeps every copy readable. While a replica is linked the
-    /// server is asked again every [`REDISCOVERY`].
+    /// DF/AD-13): its replica stops; its copy is deleted when nothing in it
+    /// is unsent, else kept unopened with its writes until an answer lists
+    /// it again. A removed device keeps every copy readable. While a
+    /// replica is linked the server is asked again every [`REDISCOVERY`].
     async fn apply_discovery(
         &self,
         generation: u64,
@@ -1094,7 +1102,7 @@ impl Hq {
             let held: Vec<String> = inner.dbs.iter().map(|db| db.name.clone()).collect();
             let mut reopen: Vec<(String, bool)> = Vec::new();
             let mut retired: Vec<Arc<dyn Replica>> = Vec::new();
-            // A left domain's replica and the writes that go with it.
+            // A left domain's replica and the commits waiting in its outbox.
             let mut leaving: Vec<(String, Arc<dyn Replica>, u32)> = Vec::new();
             let mut next_retry: Option<Duration> = None;
             for (name, fate) in keeper_accounts::plan(&held, answer) {
@@ -1150,10 +1158,42 @@ impl Hq {
             contact: None,
         })
         .await;
-        // Every left replica's owner has stopped: its copy goes.
-        for (name, _, _) in &leaving {
-            self.delete_copy(&data_dir, &server, name, &pairing.actor_id)
-                .await;
+        // Every left replica's owner has stopped: its copy goes, unless it
+        // holds writes only this device has (its outbox or its graph queue).
+        let mut left: Vec<(String, Unsent)> = Vec::with_capacity(leaving.len());
+        for (name, _, outbox) in &leaving {
+            let queue = databases::graph_queue(&data_dir, &server, name, &pairing.actor_id);
+            let counted =
+                tokio::task::spawn_blocking(move || databases::unresolved_graph_intents(&queue))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+            let unsent = match counted {
+                Ok(graph_intents) => Unsent {
+                    outbox: *outbox,
+                    graph_intents,
+                    unreadable: false,
+                },
+                Err(error) => {
+                    tracing::warn!(%error, database = name.as_str(), "a left domain's graph queue could not be read; its copy is kept");
+                    Unsent {
+                        outbox: *outbox,
+                        graph_intents: 0,
+                        unreadable: true,
+                    }
+                }
+            };
+            if unsent.keeps_copy() {
+                tracing::info!(
+                    database = name.as_str(),
+                    outbox = unsent.outbox,
+                    graph_intents = unsent.graph_intents,
+                    "a domain the person left holds unsent writes; its copy is kept on this device"
+                );
+            } else {
+                self.delete_copy(&data_dir, &server, name, &pairing.actor_id)
+                    .await;
+            }
+            left.push((name.clone(), unsent));
         }
         let specs = reopen
             .iter()
@@ -1169,7 +1209,7 @@ impl Hq {
                 return Ok(());
             }
             let left_at = sessions::now_ms();
-            for (name, _, unsent) in &leaving {
+            for (name, unsent) in &left {
                 inner.dbs.retain(|db| db.name != *name);
                 inner.refusals.remove(name);
                 inner.domains.leave(name, *unsent, left_at);
@@ -1720,7 +1760,7 @@ impl Hq {
                 held,
                 // The general domain's directory has no `clients` (114.2: it
                 // would show each person the others' devices), so it is never
-                // asked for this device's row (C-114.2-8). By its discovery
+                // asked for this device's row (114.5). By its discovery
                 // kind, never by its name.
                 inner
                     .authorization

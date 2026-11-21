@@ -119,10 +119,15 @@ pub fn held(data_dir: &Path, server: &ServerUrl, actor: &str) -> Vec<String> {
     names
 }
 
+/// One database's graph intent queue for `actor`, beside its replica (the
+/// queue's place is `keeper_graph::queue::beside`'s, pinned by a test below).
+pub fn graph_queue(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str) -> PathBuf {
+    replica(data_dir, server, database, actor).with_file_name(format!("{actor}.graph-queue"))
+}
+
 /// What else of one database's copy for `actor` lies beside its replica:
-/// the graph's query projection and intent queue (the queue's place is
-/// `keeper_graph::queue::beside`'s, pinned by a test below). The replica's
-/// own files are the opener's ([`keeper_ports::Opener::remove`]).
+/// the graph's query projection and intent queue. The replica's own files
+/// are the opener's ([`keeper_ports::Opener::remove`]).
 pub fn beside_replica(
     data_dir: &Path,
     server: &ServerUrl,
@@ -131,8 +136,49 @@ pub fn beside_replica(
 ) -> [PathBuf; 2] {
     [
         projection(data_dir, server, database, actor),
-        replica(data_dir, server, database, actor).with_file_name(format!("{actor}.graph-queue")),
+        graph_queue(data_dir, server, database, actor),
     ]
+}
+
+/// The stored names of a graph intent's terminal states
+/// (`keeper_graph::queue::State::is_terminal`, pinned by a test below). A
+/// state not named here counts as unsent: a name added later keeps a copy
+/// rather than deleting one.
+const GRAPH_TERMINAL: [&str; 9] = [
+    "accepted",
+    "proposed",
+    "conflict",
+    "rejected",
+    "technical_refusal",
+    "idempotency_mismatch",
+    "unsupported",
+    "withdrawn",
+    "refused_locally",
+];
+
+/// How many graph intents in the queue at `path` the server has not
+/// resolved (114.5), read-only; no queue there is none. keeper-core does not
+/// link the graph client, so this reads the file's one table itself.
+pub fn unresolved_graph_intents(path: &Path) -> Result<u32, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+    let terminal = GRAPH_TERMINAL
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM graph_intents WHERE state NOT IN ({terminal})"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// The person's domains as this device last showed them (114.5): kept so an
@@ -243,6 +289,57 @@ mod tests {
         assert!(queue.starts_with(server_dir(data, &a)));
         // What a left domain's removal deletes beside the replica (114.5).
         assert_eq!(beside_replica(data, &a, "alpha", "ana")[1], queue);
+    }
+
+    /// The terminal names counted as resolved are exactly the graph
+    /// client's terminal states; a state added there fails the match below.
+    #[test]
+    fn the_graph_terminal_states_are_the_graph_clients() {
+        use keeper_graph::queue::State;
+        let every = [
+            State::AwaitingApproval,
+            State::Queued,
+            State::Submitting,
+            State::PendingVisibility,
+            State::Unresolved,
+            State::Suspended,
+            State::Disabled,
+            State::Accepted,
+            State::Proposed,
+            State::Conflict,
+            State::Rejected,
+            State::TechnicalRefusal,
+            State::IdempotencyMismatch,
+            State::Unsupported,
+            State::Withdrawn,
+            State::RefusedLocally,
+        ];
+        for state in every {
+            // Exhaustive: a new state must be placed in `every`.
+            match state {
+                State::AwaitingApproval
+                | State::Queued
+                | State::Submitting
+                | State::PendingVisibility
+                | State::Unresolved
+                | State::Suspended
+                | State::Disabled
+                | State::Accepted
+                | State::Proposed
+                | State::Conflict
+                | State::Rejected
+                | State::TechnicalRefusal
+                | State::IdempotencyMismatch
+                | State::Unsupported
+                | State::Withdrawn
+                | State::RefusedLocally => {}
+            }
+            assert_eq!(
+                GRAPH_TERMINAL.contains(&state.as_str()),
+                state.is_terminal(),
+                "{state:?}"
+            );
+        }
     }
 
     #[test]

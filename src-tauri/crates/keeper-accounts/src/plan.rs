@@ -4,7 +4,8 @@
 //! - a domain a successful discovery lists is **open**: opened, and linked
 //!   once its refusal backoff allows;
 //! - a held domain a successful discovery no longer lists was **left**: the
-//!   device stops syncing it and deletes its copy (DF/AD-13). Only a
+//!   device stops syncing it and deletes its copy (DF/AD-13), or keeps it
+//!   unopened while it holds unsent writes ([`crate::Unsent`]). Only a
 //!   discovery that answered can leave a domain: an unreachable server, a
 //!   refusal or a map the server has not reconciled (503 `hq.map_closed`,
 //!   an unknown barrier state) is no answer, and changes nothing (114.5-AC10);
@@ -29,7 +30,8 @@ pub enum Fate {
     Open,
     /// Held, readable and unlinked; nothing is deleted.
     Keep,
-    /// The person left it: stop serving it and delete its copy.
+    /// The person left it: stop serving it; delete its copy unless it holds
+    /// unsent writes ([`crate::Unsent::keeps_copy`]).
     Leave,
 }
 

@@ -4107,9 +4107,10 @@ async fn a_running_device_joins_a_domain_within_the_bound() {
     running.shutdown().await;
 }
 
-/// 114.5-AC3: removed from it while it runs, the device stops syncing it,
-/// says it was left, and its replica and `blob-access` files are gone; its
-/// other domains keep syncing.
+/// 114.5-AC3: removed from it while it runs, the device stops syncing it and
+/// says it was left; with nothing unsent its replica and `blob-access` files
+/// are gone, and with writes only it holds the copy is kept, unopened, and
+/// said so. Its other domains keep syncing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a running agents server with 114.4's admin path; see the 114.5 notes above"]
 async fn a_running_device_leaves_a_domain_and_deletes_its_copy() {
@@ -4118,24 +4119,37 @@ async fn a_running_device_leaves_a_domain_and_deletes_its_copy() {
     join_leg(&platform, &running, &server, &actor, &scratch).await;
     let replica = replica_of(&platform, &server, &scratch, &actor);
     let before = listing(&platform.data_dir);
+    let outbox = running
+        .replica(&scratch)
+        .map_or(0, |held| held.state().outbox);
     post(&env("KEEPER_HQ_LIVE_ADMIN_LEAVE")).await;
     let deadline = Instant::now() + JOIN_BOUND;
-    while lists(&running, &scratch) || replica.exists() {
+    let left = loop {
+        let view = running.domains().borrow().clone();
+        let left = view.left.iter().find(|left| left.name == scratch).cloned();
+        if let (false, Some(left)) = (lists(&running, &scratch), left) {
+            break left;
+        }
         assert!(Instant::now() < deadline, "the domain was not left in time");
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let view = running.domains().borrow().clone();
-    assert!(
-        view.left.iter().any(|left| left.name == scratch),
-        "{view:#?}"
-    );
+    };
+    assert!(running.replica(&scratch).is_none(), "a left copy is served");
     let after = listing(&platform.data_dir);
-    assert!(
-        after
-            .iter()
-            .all(|file| !file.contains(&format!("/{scratch}/"))),
-        "{after:#?}"
-    );
+    if left.kept {
+        assert!(
+            outbox > 0 || left.graph_intents > 0,
+            "kept with nothing unsent: {left:#?}"
+        );
+        assert!(replica.is_file(), "a kept copy was deleted: {after:#?}");
+    } else {
+        assert_eq!(outbox, 0, "unsent writes were deleted: {left:#?}");
+        assert!(
+            after
+                .iter()
+                .all(|file| !file.contains(&format!("/{scratch}/"))),
+            "{after:#?}"
+        );
+    }
     let status = running.status().borrow().clone();
     assert!(status
         .databases

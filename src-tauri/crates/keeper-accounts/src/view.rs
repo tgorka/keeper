@@ -89,9 +89,13 @@ pub struct DomainMemberVm {
     pub me: bool,
 }
 
-/// A domain the person left. Its copy is deleted from this device: files
-/// already opened elsewhere and links not yet expired are what remains
-/// (DF/AD-13), and `unsent` writes went with it.
+/// A domain the person left, as the answer that omitted it was read (114.5).
+///
+/// A copy with nothing unsent is deleted from this device: files already
+/// opened elsewhere and links not yet expired are what remains (DF/AD-13).
+/// A copy holding writes only this device has is **kept**: stopped and
+/// unlinked, never opened, its files untouched; if a later discovery lists
+/// the domain again, that copy opens and its writes go out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -100,13 +104,40 @@ pub struct LeftDomainVm {
     pub display_name: String,
     #[ts(type = "\"general\" | \"personal\" | \"group\"")]
     pub kind: DomainKind,
-    /// Writes made here the server never took, deleted with the copy.
+    /// Commits made here the server never took (the replica's outbox).
     pub unsent: u32,
+    /// Graph changes asked for here the server has not resolved.
+    #[serde(default)]
+    pub graph_intents: u32,
+    /// The copy, with those writes, is still on this device.
+    #[serde(default)]
+    pub kept: bool,
     #[ts(type = "number")]
     pub left_at_ms: i64,
 }
 
-/// How many left domains the view keeps.
+/// What a left domain's copy holds that only this device has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unsent {
+    /// Commits waiting in its outbox.
+    pub outbox: u32,
+    /// Graph intents not yet resolved in its `<actor>.graph-queue`.
+    pub graph_intents: u32,
+    /// The graph queue is there but could not be read.
+    pub unreadable: bool,
+}
+
+impl Unsent {
+    /// Whether the copy must be kept: anything unsent, or anything that
+    /// could not be counted. A copy the server holds all of is deleted; a
+    /// wrong leave then costs a pull, never a write.
+    pub fn keeps_copy(self) -> bool {
+        self.outbox > 0 || self.graph_intents > 0 || self.unreadable
+    }
+}
+
+/// How many left domains whose copy is deleted the view keeps; a kept copy
+/// is always shown.
 const LEFT_KEPT: usize = 20;
 
 impl DomainVm {
@@ -147,9 +178,10 @@ impl DomainsVm {
         self.read_at_ms = Some(at_ms);
     }
 
-    /// The person left `name` at `at_ms`, and `unsent` writes went with its
-    /// copy. A name discovery never described is shown as itself.
-    pub fn leave(&mut self, name: &str, unsent: u32, at_ms: i64) {
+    /// The person left `name` at `at_ms` and its copy held `unsent`: kept
+    /// with it when [`Unsent::keeps_copy`], else deleted. A name discovery
+    /// never described is shown as itself.
+    pub fn leave(&mut self, name: &str, unsent: Unsent, at_ms: i64) {
         let known = self.domains.iter().position(|domain| domain.name == name);
         let (display_name, kind) = match known {
             Some(at) => {
@@ -171,11 +203,26 @@ impl DomainsVm {
                 name: name.to_owned(),
                 display_name,
                 kind,
-                unsent,
+                unsent: unsent.outbox,
+                graph_intents: unsent.graph_intents,
+                kept: unsent.keeps_copy(),
                 left_at_ms: at_ms,
             },
         );
-        self.left.truncate(LEFT_KEPT);
+        let mut deleted = 0;
+        self.left.retain(|left| {
+            if left.kept {
+                return true;
+            }
+            deleted += 1;
+            deleted <= LEFT_KEPT
+        });
+    }
+
+    /// Whether this device keeps `name`'s copy of a domain the person left:
+    /// it is not opened until a discovery lists the domain again.
+    pub fn is_kept(&self, name: &str) -> bool {
+        self.left.iter().any(|left| left.name == name && left.kept)
     }
 
     /// The members read for `name` now; `None` keeps the last known.
@@ -361,7 +408,8 @@ mod tests {
     }
 
     /// 114.5-AC3's view: a left domain moves to `left` with its unsent
-    /// writes; joining it again takes it out of `left`.
+    /// writes, kept when there are any; joining it again takes it out of
+    /// `left`. Kept copies are never dropped from the view.
     #[test]
     fn a_left_domain_is_shown_as_left_until_it_is_joined_again() {
         let mut vm = DomainsVm::default();
@@ -370,7 +418,12 @@ mod tests {
             entry("crew", DomainKind::Group),
         ];
         vm.discovered(&both, 1);
-        vm.leave("crew", 3, 2);
+        let held = Unsent {
+            outbox: 3,
+            graph_intents: 1,
+            unreadable: false,
+        };
+        vm.leave("crew", held, 2);
         assert_eq!(
             vm.domains
                 .iter()
@@ -385,16 +438,35 @@ mod tests {
                 display_name: "CREW".to_owned(),
                 kind: DomainKind::Group,
                 unsent: 3,
+                graph_intents: 1,
+                kept: true,
                 left_at_ms: 2,
             }]
         );
+        assert!(vm.is_kept("crew"));
         assert_eq!(vm.kind_of("crew"), None);
         vm.discovered(&both, 3);
         assert!(vm.left.is_empty());
+        assert!(!vm.is_kept("crew"));
         assert_eq!(vm.kind_of("crew"), Some(DomainKind::Group));
-        // A name discovery never described is shown as itself.
-        vm.leave("scratch", 0, 4);
+        // A name discovery never described is shown as itself; nothing
+        // unsent is not kept.
+        vm.leave("scratch", Unsent::default(), 4);
         assert_eq!(vm.left[0].display_name, "scratch");
+        assert!(!vm.left[0].kept);
+        // A queue that could not be read keeps the copy uncounted.
+        let unread = Unsent {
+            unreadable: true,
+            ..Unsent::default()
+        };
+        assert!(unread.keeps_copy());
+        // Many deleted ones later, the kept copy is still shown.
+        vm.leave("crew", held, 5);
+        for at in 0..(LEFT_KEPT as i64 + 5) {
+            vm.leave(&format!("gone{at}"), Unsent::default(), 10 + at);
+        }
+        assert!(vm.is_kept("crew"));
+        assert_eq!(vm.left.len(), LEFT_KEPT + 1);
     }
 
     /// 114.5-AC9 over the contract's vectors: `replaced_repository`,

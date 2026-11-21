@@ -8,7 +8,7 @@
  * directory: whether a domain is listed, left or held after this device was removed, and who is
  * in it, are Rust's. This file only words the states — reading, empty, offline (the last known,
  * with its time), removed (every copy stays, none syncs), a domain of one person, and a left
- * domain with what went with it.
+ * domain: its copy deleted, or kept on this device with the writes only it holds.
  */
 import { useEffect, useState } from "react";
 import { logFailure } from "@/lib/failure";
@@ -45,15 +45,26 @@ export function replacesNote(repository: string): string {
   return `Replaces the git repository ${repository}.`;
 }
 
+function counted(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
 export function leftNote(left: LeftDomainVm): string {
-  const unsent =
-    left.unsent === 0
-      ? ""
-      : ` ${left.unsent} ${left.unsent === 1 ? "write" : "writes"} not yet sent went with it.`;
-  return (
-    `Its copy was deleted from this device.${unsent} ` +
-    "Files already opened elsewhere and links not yet expired may remain."
-  );
+  if (!left.kept) {
+    return (
+      "Its copy was deleted from this device. " +
+      "Files already opened elsewhere and links not yet expired may remain."
+    );
+  }
+  const held = [
+    left.unsent > 0 ? counted(left.unsent, "write", "writes") : null,
+    left.graphIntents > 0 ? counted(left.graphIntents, "graph change", "graph changes") : null,
+  ].filter((part) => part !== null);
+  const what =
+    held.length === 0
+      ? "Its copy is kept on this device: its unsent changes could not be counted."
+      : `Its copy is kept on this device with ${held.join(" and ")} not yet sent.`;
+  return `${what} They stay on this device and are sent if you are added to it again.`;
 }
 
 function people(domain: DomainVm): string {
@@ -144,7 +155,12 @@ export function AgentsDomains({ open }: { open: boolean }) {
           <h4 className="font-medium">{LEFT_TITLE}</h4>
           <ul aria-label={LEFT_TITLE} className="flex min-w-0 flex-col gap-2">
             {view.left.map((left) => (
-              <li key={left.name} aria-label={left.displayName} className="flex min-w-0 flex-col">
+              <li
+                key={left.name}
+                aria-label={left.displayName}
+                data-kept={left.kept}
+                className="flex min-w-0 flex-col"
+              >
                 <span className="font-medium [overflow-wrap:anywhere]">
                   You left {left.displayName}
                 </span>

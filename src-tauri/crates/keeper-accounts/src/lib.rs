@@ -7,8 +7,9 @@
 //! that domain's own directory (`actors` on `dir:<domain>`), read through the
 //! replica port; never from the map, which no device holds. A domain a
 //! successful discovery no longer lists was left: the device stops serving
-//! it and deletes its copy. A device the server removed keeps every copy
-//! readable, as before.
+//! it and deletes its copy, unless the copy holds writes only this device
+//! has, which keeps it, unopened, until a discovery lists the domain again.
+//! A device the server removed keeps every copy readable, as before.
 //!
 //! keeper-core's `Hq` owns the lifecycle, the paths, the authorization file
 //! and the HTTP route (DW-E114-9) and asks this crate what to do; the shell
@@ -18,4 +19,4 @@ pub mod plan;
 pub mod view;
 
 pub use plan::{plan, Answer, Fate};
-pub use view::{members, DomainMemberVm, DomainVm, DomainsState, DomainsVm, LeftDomainVm};
+pub use view::{members, DomainMemberVm, DomainVm, DomainsState, DomainsVm, LeftDomainVm, Unsent};

@@ -3190,6 +3190,17 @@ fn held_here(hq: &Hq, database: &str) -> bool {
     lock(&hq.inner).dbs.iter().any(|db| db.name == database)
 }
 
+/// `database` is no longer held and the published view says it was left.
+fn left_shown(hq: &Hq, database: &str) -> bool {
+    !held_here(hq, database)
+        && hq
+            .domains()
+            .borrow()
+            .left
+            .iter()
+            .any(|left| left.name == database)
+}
+
 /// 114.5-AC2: a device linked and running is added to a domain; the next
 /// rediscovery — no restart, pairing or sign-in — opens it linked, with the
 /// units its first pull subscribes, and the view lists it. What it already
@@ -3269,7 +3280,8 @@ fn person(id: &str, dir: &str) -> RowOp {
 }
 
 /// Real replica files of `databases` for `ana`, each with its directory's
-/// people and a write waiting in its outbox, and the access log beside it.
+/// people as a write waiting in its outbox (none when it lists nobody), and
+/// the access log beside it.
 fn seeded(world: &World, server: &ServerUrl, databases: &[(&str, &[&str])]) {
     for (database, people) in databases {
         let path = databases::replica(&world.data_dir(), server, database, "ana");
@@ -3283,11 +3295,21 @@ fn seeded(world: &World, server: &ServerUrl, databases: &[(&str, &[&str])]) {
             watch_presence: None,
         })
         .expect("opens");
-        seed.mutate(people.iter().map(|id| person(id, database)).collect())
-            .expect("seeds");
+        if !people.is_empty() {
+            seed.mutate(people.iter().map(|id| person(id, database)).collect())
+                .expect("seeds");
+        }
         seed.close();
         seed.join();
     }
+}
+
+/// The directories under `dir`: one per database copy.
+fn dirs_of(dir: &std::path::Path) -> Vec<String> {
+    files_of(dir)
+        .into_iter()
+        .filter(|name| dir.join(name).is_dir())
+        .collect()
 }
 
 fn files_of(dir: &std::path::Path) -> Vec<String> {
@@ -3304,10 +3326,10 @@ fn files_of(dir: &std::path::Path) -> Vec<String> {
 }
 
 /// 114.5-AC3 over real replica files: a successful discovery without
-/// `crew` stops it and deletes its replica, the access log beside it and
-/// its directory; the view says it was left and how many writes went with
-/// it; `makidrive` keeps its files and its link, unreopened. The view's
-/// people come from each domain's own directory.
+/// `crew`, whose copy holds nothing unsent, stops it and deletes its
+/// replica, the access log beside it and its directory; the view says it
+/// was left and its copy deleted; `makidrive` keeps its files and its link,
+/// unreopened. The view's people come from each domain's own directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
     use keeper_accounts_api::DomainKind::{General, Group};
@@ -3316,7 +3338,7 @@ async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
     seeded(
         &world,
         &server,
-        &[("makidrive", &["ana", "bo"]), ("crew", &["ana"])],
+        &[("makidrive", &["ana", "bo"]), ("crew", &[])],
     );
     let crew_dir = databases::server_dir(&world.data_dir(), &server).join("crew");
     let maki_dir = databases::server_dir(&world.data_dir(), &server).join("makidrive");
@@ -3348,7 +3370,7 @@ async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
             .borrow_and_update()
             .domains
             .iter()
-            .all(|d| d.members.is_some())
+            .any(|d| d.name == "makidrive" && d.members.is_some())
     })
     .await;
     let people = |name: &str| -> Vec<String> {
@@ -3364,11 +3386,10 @@ async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
             .collect()
     };
     assert_eq!(people("makidrive"), ["ana", "bo"]);
-    assert_eq!(people("crew"), ["ana"], "a domain of one person");
     let maki = hq.replica("makidrive").expect("held");
 
     *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
-    until("crew left", || !held_here(&hq, "crew")).await;
+    until("crew left", || left_shown(&hq, "crew")).await;
     assert!(
         !crew_dir.exists(),
         "crew remains: {:?}",
@@ -3406,7 +3427,8 @@ async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
     );
     assert_eq!(view.left.len(), 1);
     assert_eq!(view.left[0].name, "crew");
-    assert_eq!(view.left[0].unsent, 1, "the seeded write went with it");
+    assert_eq!(view.left[0].unsent, 0);
+    assert!(!view.left[0].kept, "nothing unsent: deleted");
     let status = hq.status().borrow().clone();
     assert!(status.databases.iter().all(|d| d.name != "crew"));
     hq.shutdown().await;
@@ -3417,6 +3439,217 @@ async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
     assert!(!held_here(&again, "crew"));
     assert_eq!(again.domains().borrow().left.len(), 1);
     again.shutdown().await;
+}
+
+/// The files of a kept copy that must stay: the replica, its access log
+/// and, when there is one, its graph queue (SQLite's side files come and go).
+fn kept_files(dir: &std::path::Path, queue: bool) {
+    let files = files_of(dir);
+    let mut want = vec!["ana.blob-access.sqlite", "ana.sqlite"];
+    if queue {
+        want.push("ana.graph-queue");
+    }
+    for file in want {
+        assert!(files.contains(&file.to_owned()), "{file} gone: {files:?}");
+    }
+}
+
+/// A graph change asked for in `crew` and never sent, queued beside its
+/// replica as the graph client queues it.
+fn graph_intent(world: &World, server: &ServerUrl, database: &str) {
+    use keeper_graph::protocol::change::ChangeOp;
+    let path = databases::replica(&world.data_dir(), server, database, "ana");
+    let source = keeper_ports::Source {
+        database: database.to_owned(),
+        replica: FakeOpener::default()
+            .open(ReplicaSpec {
+                database: database.to_owned(),
+                path: path.clone(),
+                client_id: Some("ana.1".to_owned()),
+                link: None,
+                units: Vec::new(),
+                watch_presence: None,
+            })
+            .expect("opens"),
+        actor: "ana".to_owned(),
+        client: "ana.1".to_owned(),
+    };
+    let client = keeper_graph::client::GraphClient::new(source);
+    let change = client
+        .change(
+            vec![ChangeOp::CreateNode {
+                id: "01JF0000000000000000000001".to_owned(),
+                kind: "Concept".into(),
+                title: "N".into(),
+                description: None,
+                properties: serde_json::Map::new(),
+            }],
+            None,
+        )
+        .expect("change");
+    let prepared = client.mint(&change).expect("minted");
+    let mut queue = keeper_graph::queue::GraphQueue::open(
+        &keeper_graph::queue::beside(&path, "ana"),
+        keeper_graph::queue::Binding {
+            server: server.as_str().to_owned(),
+            domain: database.to_owned(),
+            actor: "ana".to_owned(),
+            client: "ana.1".to_owned(),
+        },
+    )
+    .expect("queue opens");
+    queue.enqueue(&prepared, 10).expect("queued");
+}
+
+/// 114.5, a copy with writes only this device has: a successful discovery
+/// that omits `crew` stops it and unlinks it, deletes nothing, and the view
+/// says it is kept with its unsent write. A restart keeps it kept, shown and
+/// unopened. Listed again, that same copy opens and links with its write
+/// still queued, and no second copy is made beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_left_domain_with_an_unsent_write_is_kept_and_opens_again_when_listed() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &[]);
+    seeded(
+        &world,
+        &server,
+        &[("makidrive", &["ana", "bo"]), ("crew", &["ana"])],
+    );
+    let server_dir = databases::server_dir(&world.data_dir(), &server);
+    let crew_dir = server_dir.join("crew");
+    let both = described(&[entry("makidrive", General), entry("crew", Group)]);
+    *lock(&world.routes.discovery) = Some(Ok(both.clone()));
+    let opener = Arc::new(Unlinked::default());
+    let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+    hq.rediscovery_ms.store(100, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("both linked", || {
+        linked(&hq, "makidrive") && linked(&hq, "crew")
+    })
+    .await;
+    let mut domains = hq.domains();
+    until("people read", || {
+        domains
+            .borrow_and_update()
+            .domains
+            .iter()
+            .all(|d| d.members.is_some())
+    })
+    .await;
+    let crew_people: Vec<String> = hq
+        .domains()
+        .borrow()
+        .domains
+        .iter()
+        .find(|d| d.name == "crew")
+        .and_then(|d| d.members.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.actor_id)
+        .collect();
+    assert_eq!(crew_people, ["ana"], "a domain of one person");
+    assert_eq!(hq.replica("crew").expect("held").state().outbox, 1);
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+    until("crew left", || left_shown(&hq, "crew")).await;
+    assert!(lock(&opener.0).is_empty(), "something was deleted");
+    kept_files(&crew_dir, false);
+    assert!(hq.replica("crew").is_none(), "a kept copy is not served");
+    let status = hq.status().borrow().clone();
+    assert!(status.databases.iter().all(|d| d.name != "crew"));
+    let left = hq.domains().borrow().left.clone();
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        (
+            left[0].name.as_str(),
+            left[0].unsent,
+            left[0].graph_intents,
+            left[0].kept
+        ),
+        ("crew", 1, 0, true)
+    );
+    hq.shutdown().await;
+
+    // A restart: still kept, still shown, not opened, even before the
+    // server answers.
+    let again = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+    again.rediscovery_ms.store(100, Ordering::Relaxed);
+    again.start().await.expect("restarts");
+    assert!(!held_here(&again, "crew"), "a kept copy was opened");
+    assert!(again.domains().borrow().is_kept("crew"));
+    until("makidrive links", || linked(&again, "makidrive")).await;
+    assert!(!held_here(&again, "crew"));
+    assert!(again.domains().borrow().is_kept("crew"));
+    kept_files(&crew_dir, false);
+    let directories = dirs_of(&server_dir);
+
+    // Listed again: the kept copy links, its write still queued.
+    *lock(&world.routes.discovery) = Some(Ok(both));
+    until("crew links again", || {
+        linked(&again, "crew") && again.domains().borrow().left.is_empty()
+    })
+    .await;
+    let crew = again.replica("crew").expect("held");
+    assert_eq!(crew.state().outbox, 1, "the kept write is still queued");
+    assert_eq!(dirs_of(&server_dir), directories, "a second copy was made");
+    kept_files(&crew_dir, false);
+    assert!(lock(&opener.0).is_empty());
+    assert!(again.domains().borrow().left.is_empty());
+    again.shutdown().await;
+}
+
+/// 114.5: a graph change queued and unresolved keeps the copy on its own,
+/// with an empty outbox; listed again, the queue is still there with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_left_domain_with_only_a_queued_graph_change_is_kept() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &[]);
+    seeded(&world, &server, &[("makidrive", &["ana"]), ("crew", &[])]);
+    graph_intent(&world, &server, "crew");
+    let queue = databases::graph_queue(&world.data_dir(), &server, "crew", "ana");
+    assert_eq!(databases::unresolved_graph_intents(&queue), Ok(1));
+    let server_dir = databases::server_dir(&world.data_dir(), &server);
+    let crew_dir = server_dir.join("crew");
+    let both = described(&[entry("makidrive", General), entry("crew", Group)]);
+    *lock(&world.routes.discovery) = Some(Ok(both.clone()));
+    let opener = Arc::new(Unlinked::default());
+    let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+    hq.rediscovery_ms.store(100, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("both linked", || {
+        linked(&hq, "makidrive") && linked(&hq, "crew")
+    })
+    .await;
+    assert_eq!(hq.replica("crew").expect("held").state().outbox, 0);
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+    until("crew left", || left_shown(&hq, "crew")).await;
+    assert!(lock(&opener.0).is_empty(), "something was deleted");
+    kept_files(&crew_dir, true);
+    assert_eq!(databases::unresolved_graph_intents(&queue), Ok(1));
+    let left = hq.domains().borrow().left.clone();
+    assert_eq!(
+        (
+            left[0].name.as_str(),
+            left[0].unsent,
+            left[0].graph_intents,
+            left[0].kept
+        ),
+        ("crew", 0, 1, true)
+    );
+    let directories = dirs_of(&server_dir);
+
+    *lock(&world.routes.discovery) = Some(Ok(both));
+    until("crew links again", || {
+        linked(&hq, "crew") && hq.domains().borrow().left.is_empty()
+    })
+    .await;
+    assert_eq!(dirs_of(&server_dir), directories, "a second copy was made");
+    kept_files(&crew_dir, true);
+    assert_eq!(databases::unresolved_graph_intents(&queue), Ok(1));
+    hq.shutdown().await;
 }
 
 /// 114.5-AC3 (a device offline at the removal) and AC10: no answer — the
@@ -3455,6 +3688,24 @@ async fn only_a_successful_discovery_that_omits_a_domain_leaves_it() {
             .expect("applies");
         assert!(held_here(&hq, "crew"));
     }
+    // What the server answers while its map is closed: a 200 from the
+    // credential rows that still lists the domain. Nothing changes.
+    let crew = hq.replica("crew").expect("held");
+    let opened = world.opened("crew");
+    hq.apply_discovery(
+        generation(&hq),
+        Ok(described(&[
+            entry("makidrive", General),
+            entry("crew", Group),
+        ])),
+    )
+    .await
+    .expect("applies");
+    assert!(Arc::ptr_eq(&crew, &hq.replica("crew").expect("held")));
+    assert_eq!(world.opened("crew"), opened, "crew was reopened");
+    assert!(world.opener.removed().is_empty());
+    assert!(hq.domains().borrow().left.is_empty());
+    let read_at = hq.domains().borrow().read_at_ms;
     // The task's own failures never reach `apply_discovery`: an unreachable
     // server, and 503 `hq.map_closed` read as an unexpected answer.
     *lock(&world.routes.discovery) = Some(Err(RouteError::Unexpected(
@@ -3524,7 +3775,7 @@ async fn a_removed_device_deletes_nothing() {
     hq.shutdown().await;
 }
 
-/// C-114.2-8: the general domain's directory has no `clients` rows, so a
+/// 114.5: the general domain's directory has no `clients` rows, so a
 /// device that lists it is never read as unread for it; a group domain
 /// still needs this device's own row.
 #[tokio::test]
@@ -3563,5 +3814,94 @@ async fn the_general_domain_is_not_asked_for_this_devices_row() {
     );
     world.live("crew")[0].replicate(vec![me]);
     assert!(hq.device_directory().is_ok(), "{:?}", hq.device_directory());
+    hq.shutdown().await;
+}
+
+/// 114.5-AC10 over HTTP: while its map is closed the server answers
+/// `GET /databases` with a real 503; keeper reads it as no answer, goes
+/// offline, and leaves and deletes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_503_on_discovery_leaves_nothing() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+    let port = listener.local_addr().expect("addr").port();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+            }
+            if bytes.starts_with(b"GET /databases ") {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            let body = r#"{"error":"hq.map_closed"}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let world = World::new();
+    world.paired(&format!("http://127.0.0.1:{port}"), &["makidrive", "crew"]);
+    let hq = Hq::new(
+        Arc::clone(&world.platform) as Arc<dyn Platform>,
+        Arc::clone(&world.opener) as Arc<dyn Opener>,
+        Arc::new(routes::HttpRoutes::new()),
+        Arc::new(signin::NoAccount),
+        "keeper on test".to_owned(),
+        || DeviceHosts::same("test"),
+    );
+    hq.start().await.expect("starts");
+    let mut domains = hq.domains();
+    until("offline", || {
+        domains.borrow_and_update().state == keeper_accounts::DomainsState::Offline
+    })
+    .await;
+    assert!(
+        asked.load(Ordering::SeqCst) >= 1,
+        "the server was not asked"
+    );
+    assert!(world.opener.removed().is_empty(), "something was deleted");
+    assert!(held_here(&hq, "makidrive") && held_here(&hq, "crew"));
+    assert!(hq.domains().borrow().left.is_empty());
+    hq.shutdown().await;
+}
+
+/// 114.5: a refused link asks the server at once, replacing the periodic
+/// rediscovery still waiting to start, rather than waiting for it.
+#[tokio::test]
+async fn a_refused_link_asks_again_at_once_over_a_pending_rediscovery() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["crew"]);
+    *lock(&world.routes.discovery) = Some(Ok(found(&["crew"])));
+    let hq = world.hq();
+    hq.rediscovery_ms.store(600_000, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("crew links", || linked(&hq, "crew")).await;
+    until("the periodic rediscovery waits", || {
+        lock(&hq.inner).discovery_wait.is_some()
+    })
+    .await;
+    let asked = world.routes.discovered.load(Ordering::SeqCst);
+    let crew = hq.replica("crew").expect("held");
+    hq.on_link(
+        "crew",
+        &Arc::downgrade(&crew),
+        LinkState::Refused,
+        generation(&hq),
+    );
+    until("asked again", || {
+        world.routes.discovered.load(Ordering::SeqCst) > asked
+    })
+    .await;
     hq.shutdown().await;
 }
