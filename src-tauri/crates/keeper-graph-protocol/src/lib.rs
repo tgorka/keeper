@@ -18,6 +18,7 @@
 //! acceptance is the server's graph command.
 
 pub mod assertion;
+pub mod basis;
 pub mod candidate;
 pub mod change;
 pub mod content;

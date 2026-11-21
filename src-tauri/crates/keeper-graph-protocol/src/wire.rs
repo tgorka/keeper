@@ -440,8 +440,8 @@ pub struct EventHeader {
     /// `[{"session_id", "agent_actor"}…]` down to the acting session.
     pub origin_chain: Option<Value>,
     pub context_id: Option<String>,
-    /// `{"basis": "direct"}` for a person's own write; an agent's
-    /// `{"basis": "approval", "approval_id", "grant_id", "origin"}`.
+    /// One of [`crate::basis::ApprovalBasis`]'s forms, kept as JSON so a
+    /// client reads an event whose form it does not know.
     pub approval_basis: Option<Value>,
     pub reverses_event_id: Option<String>,
     pub event_time_ms: Option<u64>,
