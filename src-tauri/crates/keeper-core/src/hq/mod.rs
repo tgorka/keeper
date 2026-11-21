@@ -1102,16 +1102,15 @@ impl Hq {
             let held: Vec<String> = inner.dbs.iter().map(|db| db.name.clone()).collect();
             let mut reopen: Vec<(String, bool)> = Vec::new();
             let mut retired: Vec<Arc<dyn Replica>> = Vec::new();
-            // A left domain's replica and the commits waiting in its outbox.
-            let mut leaving: Vec<(String, Arc<dyn Replica>, u32)> = Vec::new();
+            // A left domain's replica. What it holds unsent is read only once
+            // its owner has stopped: until then it still accepts writes.
+            let mut leaving: Vec<(String, Arc<dyn Replica>)> = Vec::new();
             let mut next_retry: Option<Duration> = None;
             for (name, fate) in keeper_accounts::plan(&held, answer) {
                 let current = inner.dbs.iter().position(|db| db.name == name);
                 if fate == Fate::Leave {
                     if let Some(at) = current {
-                        let replica = Arc::clone(&inner.dbs[at].replica);
-                        let unsent = u32::try_from(replica.state().outbox).unwrap_or(u32::MAX);
-                        leaving.push((name, replica, unsent));
+                        leaving.push((name, Arc::clone(&inner.dbs[at].replica)));
                     }
                     continue;
                 }
@@ -1153,15 +1152,18 @@ impl Hq {
         retire(Retired {
             replicas: retired
                 .into_iter()
-                .chain(leaving.iter().map(|(_, replica, _)| Arc::clone(replica)))
+                .chain(leaving.iter().map(|(_, replica)| Arc::clone(replica)))
                 .collect(),
             contact: None,
         })
         .await;
         // Every left replica's owner has stopped: its copy goes, unless it
         // holds writes only this device has (its outbox or its graph queue).
+        // The outbox is the count the stopped owner published last: a write
+        // it accepted before the stop is in it, and none is accepted after.
         let mut left: Vec<(String, Unsent)> = Vec::with_capacity(leaving.len());
-        for (name, _, outbox) in &leaving {
+        for (name, replica) in &leaving {
+            let outbox = u32::try_from(replica.state().outbox).unwrap_or(u32::MAX);
             let queue = databases::graph_queue(&data_dir, &server, name, &pairing.actor_id);
             let counted =
                 tokio::task::spawn_blocking(move || databases::unresolved_graph_intents(&queue))
@@ -1169,14 +1171,14 @@ impl Hq {
                     .unwrap_or_else(|error| Err(error.to_string()));
             let unsent = match counted {
                 Ok(graph_intents) => Unsent {
-                    outbox: *outbox,
+                    outbox,
                     graph_intents,
                     unreadable: false,
                 },
                 Err(error) => {
                     tracing::warn!(%error, database = name.as_str(), "a left domain's graph queue could not be read; its copy is kept");
                     Unsent {
-                        outbox: *outbox,
+                        outbox,
                         graph_intents: 0,
                         unreadable: true,
                     }

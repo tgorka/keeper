@@ -3652,6 +3652,265 @@ async fn a_left_domain_with_only_a_queued_graph_change_is_kept() {
     hq.shutdown().await;
 }
 
+/// 114.5: what the leave counts is what the stopped replica holds.
+mod leave_counts_the_stopped_replica {
+    use super::*;
+    use keeper_accounts::LeftDomainVm;
+    use keeper_ports::{
+        BlobBody, CommandResult, Covered, Delivery, Peer, RefusedCommit, ReplicaError,
+        ReplicaState, RowWrites, UploadRefusal, WindowBase, WindowState,
+    };
+    use serde_json::{Map, Value};
+    use std::sync::atomic::AtomicBool;
+
+    /// A real replica that, once armed, accepts one write as it is asked to
+    /// stop: an app thread's write landing after the published count.
+    struct Late {
+        inner: Arc<dyn Replica>,
+        armed: Arc<AtomicBool>,
+        wrote: Arc<AtomicUsize>,
+    }
+
+    impl Replica for Late {
+        fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
+            self.inner.mutate(ops)
+        }
+        fn query(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            self.inner.query(sql, params)
+        }
+        fn query_covered(
+            &self,
+            sql: &str,
+            params: &[Value],
+            base: &WindowBase,
+            units: &[String],
+        ) -> Result<Covered, ReplicaError> {
+            self.inner.query_covered(sql, params, base, units)
+        }
+        fn subscribe(&self, unit: Unit) -> Result<(), ReplicaError> {
+            self.inner.subscribe(unit)
+        }
+        fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
+            self.inner.set_window(base, units)
+        }
+        fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError> {
+            self.inner.window_state(base)
+        }
+        fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError> {
+            self.inner.set_presence(scope_key, doc)
+        }
+        fn presence(&self, scope_key: &str) -> Result<Vec<Peer>, ReplicaError> {
+            self.inner.presence(scope_key)
+        }
+        fn commit_with_blobs(
+            &self,
+            blobs: Vec<BlobBody>,
+            ops: Vec<RowOp>,
+        ) -> Result<String, ReplicaError> {
+            self.inner.commit_with_blobs(blobs, ops)
+        }
+        fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+            self.inner.fetch_blob(blob)
+        }
+        fn cached_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+            self.inner.cached_blob(blob)
+        }
+        fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError> {
+            self.inner.delivery(commit_id)
+        }
+        fn row_writes(
+            &self,
+            table: &str,
+            row_id: &str,
+            field: Option<&str>,
+        ) -> Result<RowWrites, ReplicaError> {
+            self.inner.row_writes(table, row_id, field)
+        }
+        fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+            self.inner.refused_commits(table)
+        }
+        fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
+            self.inner.granted(table, variable)
+        }
+        fn revoked_units(&self, base: &WindowBase) -> Result<Vec<String>, ReplicaError> {
+            self.inner.revoked_units(base)
+        }
+        fn upload_refusals(&self) -> Vec<UploadRefusal> {
+            self.inner.upload_refusals()
+        }
+        fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
+            self.inner.blob_cache_bytes()
+        }
+        fn mutate_superseding(
+            &self,
+            ops: Vec<RowOp>,
+            earlier: Vec<String>,
+        ) -> Result<String, ReplicaError> {
+            self.inner.mutate_superseding(ops, earlier)
+        }
+        fn remote_query(
+            &self,
+            operation_id: &str,
+            params: Value,
+        ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            self.inner.remote_query(operation_id, params)
+        }
+        fn remote_command(
+            &self,
+            operation_id: &str,
+            request_id: &str,
+            params: Value,
+        ) -> Result<CommandResult, ReplicaError> {
+            self.inner.remote_command(operation_id, request_id, params)
+        }
+        fn sync_now(&self) {
+            self.inner.sync_now();
+        }
+        fn state(&self) -> ReplicaState {
+            self.inner.state()
+        }
+        fn watch(&self) -> watch::Receiver<ReplicaState> {
+            self.inner.watch()
+        }
+        fn close(&self) {
+            if self.armed.swap(false, Ordering::SeqCst)
+                && self.inner.mutate(vec![person("zed", "crew")]).is_ok()
+            {
+                self.wrote.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.close();
+        }
+        fn join(&self) {
+            self.inner.join();
+        }
+    }
+
+    /// Real, unlinked replicas; `crew`'s is a [`Late`].
+    #[derive(Default)]
+    struct Racing {
+        armed: Arc<AtomicBool>,
+        wrote: Arc<AtomicUsize>,
+        removed: Unlinked,
+    }
+
+    impl Opener for Racing {
+        fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError> {
+            let crew = spec.database == "crew";
+            let inner = self.removed.open(spec)?;
+            if !crew {
+                return Ok(inner);
+            }
+            Ok(Arc::new(Late {
+                inner,
+                armed: Arc::clone(&self.armed),
+                wrote: Arc::clone(&self.wrote),
+            }))
+        }
+        fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+            self.removed.remove(replica)
+        }
+    }
+
+    /// `crew` (nothing unsent) and `makidrive` running, then a 200 that
+    /// omits `crew` with `crew`'s replica armed: the left entry as shown.
+    async fn leave_crew() -> (World, Arc<Racing>, LeftDomainVm, std::path::PathBuf) {
+        use keeper_accounts_api::DomainKind::{General, Group};
+        let world = World::new();
+        let server = world.paired("https://hq.example.org", &[]);
+        seeded(&world, &server, &[("makidrive", &["ana"]), ("crew", &[])]);
+        let crew_dir = databases::server_dir(&world.data_dir(), &server).join("crew");
+        *lock(&world.routes.discovery) = Some(Ok(described(&[
+            entry("makidrive", General),
+            entry("crew", Group),
+        ])));
+        let opener = Arc::new(Racing::default());
+        let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+        hq.rediscovery_ms.store(100, Ordering::Relaxed);
+        hq.start().await.expect("starts");
+        until("both linked", || {
+            linked(&hq, "makidrive") && linked(&hq, "crew")
+        })
+        .await;
+        assert_eq!(hq.replica("crew").expect("held").state().outbox, 0);
+
+        opener.armed.store(true, Ordering::SeqCst);
+        *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+        until("crew left", || left_shown(&hq, "crew")).await;
+        let left = hq.domains().borrow().left[0].clone();
+        hq.shutdown().await;
+        (world, opener, left, crew_dir)
+    }
+
+    /// A write the replica accepted after the published count and before
+    /// its stop is counted, and its copy kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_accepted_just_before_the_stop_keeps_the_copy() {
+        let (_world, opener, left, crew_dir) = leave_crew().await;
+        assert_eq!(opener.wrote.load(Ordering::SeqCst), 1, "no write accepted");
+        assert!(
+            lock(&opener.removed.0).is_empty(),
+            "a write the replica accepted was deleted with the copy: {left:?}"
+        );
+        kept_files(&crew_dir, false);
+        assert_eq!(
+            (
+                left.name.as_str(),
+                left.unsent,
+                left.graph_intents,
+                left.kept
+            ),
+            ("crew", 1, 0, true)
+        );
+    }
+}
+
+/// 114.5: a graph queue that cannot be read keeps the copy; the view shows
+/// it kept with nothing counted, which it says could not be counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_left_domain_whose_graph_queue_cannot_be_read_is_kept() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &[]);
+    seeded(&world, &server, &[("makidrive", &["ana"]), ("crew", &[])]);
+    let queue = databases::graph_queue(&world.data_dir(), &server, "crew", "ana");
+    std::fs::write(&queue, b"not a queue, not sqlite either").expect("queue");
+    assert!(databases::unresolved_graph_intents(&queue).is_err());
+    let crew_dir = databases::server_dir(&world.data_dir(), &server).join("crew");
+    *lock(&world.routes.discovery) = Some(Ok(described(&[
+        entry("makidrive", General),
+        entry("crew", Group),
+    ])));
+    let opener = Arc::new(Unlinked::default());
+    let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+    hq.rediscovery_ms.store(100, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("both linked", || {
+        linked(&hq, "makidrive") && linked(&hq, "crew")
+    })
+    .await;
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+    until("crew left", || left_shown(&hq, "crew")).await;
+    assert!(lock(&opener.0).is_empty(), "something was deleted");
+    kept_files(&crew_dir, true);
+    assert!(queue.is_file(), "the queue is gone");
+    let left = hq.domains().borrow().left[0].clone();
+    assert_eq!(
+        (
+            left.name.as_str(),
+            left.unsent,
+            left.graph_intents,
+            left.kept
+        ),
+        ("crew", 0, 0, true)
+    );
+    hq.shutdown().await;
+}
+
 /// 114.5-AC3 (a device offline at the removal) and AC10: no answer — the
 /// server unreachable, an answer keeper cannot read such as 503
 /// `hq.map_closed`, or a refusal — leaves nothing; the view shows the last

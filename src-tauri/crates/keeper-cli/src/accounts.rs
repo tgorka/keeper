@@ -136,16 +136,23 @@ fn human(view: &DomainsVm) -> String {
         lines.push(line);
     }
     for left in &view.left {
-        lines.push(if left.kept {
+        lines.push(if !left.kept {
+            format!(
+                "left {} ({}): its copy is deleted here",
+                left.display_name, left.name
+            )
+        } else if left.unsent == 0 && left.graph_intents == 0 {
+            // Kept with nothing counted: what it holds could not be counted.
+            format!(
+                "left {} ({}): its copy is kept here because its unsent changes could not be \
+                 counted, sent if it is listed again",
+                left.display_name, left.name
+            )
+        } else {
             format!(
                 "left {} ({}): its copy is kept here with {} unsent write(s) and {} graph \
                  change(s), sent if it is listed again",
                 left.display_name, left.name, left.unsent, left.graph_intents
-            )
-        } else {
-            format!(
-                "left {} ({}): its copy is deleted here",
-                left.display_name, left.name
             )
         });
     }
@@ -234,6 +241,14 @@ mod tests {
             3,
         );
         view.leave("scratch", keeper_accounts::Unsent::default(), 4);
+        view.leave(
+            "lost",
+            keeper_accounts::Unsent {
+                unreadable: true,
+                ..keeper_accounts::Unsent::default()
+            },
+            5,
+        );
         let text = human(&view);
         assert!(text.contains("replaces the git repository https://forge.example/tgdrive.git"));
         assert!(text.contains(
