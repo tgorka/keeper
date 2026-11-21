@@ -148,8 +148,9 @@ prost = "0.14"
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-# `outcome-journal`: the outcome journal's test writer (`journal_refused`).
-keeper-replica = { path = "../keeper-replica", features = ["outcome-journal"] }
+# `outcome-journal`: the outcome journal's test writer (`journal_refused`);
+# `owner-fault`: an owner that ends after a write (the `hq` leave tests).
+keeper-replica = { path = "../keeper-replica", features = ["outcome-journal", "owner-fault"] }
 keeper-testkit = { path = "../keeper-testkit" }
 # The queue rule's place beside the replica layout (`hq::databases` tests).
 keeper-graph = { path = "../keeper-graph" }

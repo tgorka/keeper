@@ -952,8 +952,8 @@ impl Replica for Staged {
     fn close(&self) {
         self.inner.close();
     }
-    fn join(&self) {
-        self.inner.join();
+    fn join(&self) -> bool {
+        self.inner.join()
     }
 }
 
@@ -3784,8 +3784,8 @@ mod leave_counts_the_stopped_replica {
             }
             self.inner.close();
         }
-        fn join(&self) {
-            self.inner.join();
+        fn join(&self) -> bool {
+            self.inner.join()
         }
     }
 
@@ -3864,6 +3864,80 @@ mod leave_counts_the_stopped_replica {
                 left.kept
             ),
             ("crew", 1, 0, true)
+        );
+    }
+
+    /// Real, unlinked replicas; `crew`'s is kept to end its owner by hand.
+    #[derive(Default)]
+    struct Faulting {
+        crew: Mutex<Option<Arc<keeper_replica::SyncularReplica>>>,
+        removed: Unlinked,
+    }
+
+    impl Opener for Faulting {
+        fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError> {
+            if spec.database != "crew" {
+                return self.removed.open(spec);
+            }
+            let crew = Arc::new(keeper_replica::SyncularReplica::open(ReplicaSpec {
+                link: None,
+                ..spec
+            })?);
+            *lock(&self.crew) = Some(Arc::clone(&crew));
+            Ok(crew)
+        }
+        fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+            self.removed.remove(replica)
+        }
+    }
+
+    /// An owner that ended after answering a write, before it published
+    /// again, leaves a count without that write; a later leave keeps the
+    /// copy and counts nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_that_ended_after_a_write_keeps_the_copy() {
+        use keeper_accounts_api::DomainKind::{General, Group};
+        let world = World::new();
+        let server = world.paired("https://hq.example.org", &[]);
+        seeded(&world, &server, &[("makidrive", &["ana"]), ("crew", &[])]);
+        let crew_dir = databases::server_dir(&world.data_dir(), &server).join("crew");
+        *lock(&world.routes.discovery) = Some(Ok(described(&[
+            entry("makidrive", General),
+            entry("crew", Group),
+        ])));
+        let opener = Arc::new(Faulting::default());
+        let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+        hq.rediscovery_ms.store(100, Ordering::Relaxed);
+        hq.start().await.expect("starts");
+        until("both linked", || {
+            linked(&hq, "makidrive") && linked(&hq, "crew")
+        })
+        .await;
+        let crew = lock(&opener.crew).clone().expect("crew opened");
+        assert_eq!(crew.state().outbox, 0);
+
+        crew.write_then_fault(vec![person("zed", "crew")])
+            .expect("the write is answered");
+        until("crew's owner gone", || crew.watch().has_changed().is_err()).await;
+        assert_eq!(crew.state().outbox, 0, "the dead owner published again");
+
+        *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+        until("crew left", || left_shown(&hq, "crew")).await;
+        let left = hq.domains().borrow().left[0].clone();
+        hq.shutdown().await;
+        assert!(
+            lock(&opener.removed.0).is_empty(),
+            "a write the replica accepted was deleted with the copy: {left:?}"
+        );
+        kept_files(&crew_dir, false);
+        assert_eq!(
+            (
+                left.name.as_str(),
+                left.unsent,
+                left.graph_intents,
+                left.kept
+            ),
+            ("crew", 0, 0, true)
         );
     }
 }

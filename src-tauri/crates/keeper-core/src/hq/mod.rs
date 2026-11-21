@@ -420,22 +420,27 @@ fn sentence(error: impl std::fmt::Display) -> HqError {
 }
 
 /// Close every replica's network at once, then wait for every owner to stop.
-async fn retire(retired: Retired) {
+/// Whether each owner returned from its stop, in `retired.replicas`' order.
+async fn retire(retired: Retired) -> Vec<bool> {
     for replica in &retired.replicas {
         replica.close();
     }
     let replicas = retired.replicas;
+    let count = replicas.len();
     let joined = tokio::task::spawn_blocking(move || {
-        for replica in &replicas {
-            replica.join();
-        }
+        replicas
+            .iter()
+            .map(|replica| replica.join())
+            .collect::<Vec<bool>>()
     })
     .await;
-    if let Err(error) = joined {
+    let stopped = joined.unwrap_or_else(|error| {
         tracing::warn!(%error, "an agents replica did not stop cleanly");
-    }
+        vec![false; count]
+    });
     // Only now is the server no longer contacted.
     drop(retired.contact);
+    stopped
 }
 
 impl Hq {
@@ -1149,7 +1154,8 @@ impl Hq {
             }
             (reopen, retired, leaving, next_retry)
         };
-        retire(Retired {
+        let before_leaving = retired.len();
+        let stopped = retire(Retired {
             replicas: retired
                 .into_iter()
                 .chain(leaving.iter().map(|(_, replica)| Arc::clone(replica)))
@@ -1161,26 +1167,42 @@ impl Hq {
         // holds writes only this device has (its outbox or its graph queue).
         // The outbox is the count the stopped owner published last: a write
         // it accepted before the stop is in it, and none is accepted after.
+        // An owner that ended without its stop (a fault) may have accepted a
+        // write it never published: nothing it holds is counted, and its
+        // copy is kept.
         let mut left: Vec<(String, Unsent)> = Vec::with_capacity(leaving.len());
-        for (name, replica) in &leaving {
-            let outbox = u32::try_from(replica.state().outbox).unwrap_or(u32::MAX);
-            let queue = databases::graph_queue(&data_dir, &server, name, &pairing.actor_id);
-            let counted =
-                tokio::task::spawn_blocking(move || databases::unresolved_graph_intents(&queue))
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
-            let unsent = match counted {
-                Ok(graph_intents) => Unsent {
-                    outbox,
-                    graph_intents,
-                    unreadable: false,
-                },
-                Err(error) => {
-                    tracing::warn!(%error, database = name.as_str(), "a left domain's graph queue could not be read; its copy is kept");
-                    Unsent {
+        for (at, (name, replica)) in leaving.iter().enumerate() {
+            let unsent = if !stopped.get(before_leaving + at).copied().unwrap_or(false) {
+                tracing::warn!(
+                    database = name.as_str(),
+                    "a left domain's replica ended without its stop; its copy is kept"
+                );
+                Unsent {
+                    outbox: 0,
+                    graph_intents: 0,
+                    unreadable: true,
+                }
+            } else {
+                let outbox = u32::try_from(replica.state().outbox).unwrap_or(u32::MAX);
+                let queue = databases::graph_queue(&data_dir, &server, name, &pairing.actor_id);
+                let counted = tokio::task::spawn_blocking(move || {
+                    databases::unresolved_graph_intents(&queue)
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+                match counted {
+                    Ok(graph_intents) => Unsent {
                         outbox,
-                        graph_intents: 0,
-                        unreadable: true,
+                        graph_intents,
+                        unreadable: false,
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, database = name.as_str(), "a left domain's graph queue could not be read; its copy is kept");
+                        Unsent {
+                            outbox,
+                            graph_intents: 0,
+                            unreadable: true,
+                        }
                     }
                 }
             };

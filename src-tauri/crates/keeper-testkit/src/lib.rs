@@ -356,8 +356,10 @@ impl Replica for FakeReplica {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
-    fn join(&self) {
+    /// Answers as a real replica whose owner stopped cleanly.
+    fn join(&self) -> bool {
         self.joined.store(true, Ordering::SeqCst);
+        true
     }
 }
 

@@ -123,7 +123,8 @@ pub struct Unsent {
     pub outbox: u32,
     /// Graph intents not yet resolved in its `<actor>.graph-queue`.
     pub graph_intents: u32,
-    /// The graph queue is there but could not be read.
+    /// Something it holds could not be counted: its graph queue is there but
+    /// could not be read, or its replica ended without its stop.
     pub unreadable: bool,
 }
 

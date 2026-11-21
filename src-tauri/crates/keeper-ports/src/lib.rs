@@ -589,8 +589,11 @@ pub trait Replica: Send + Sync {
     fn close(&self);
     /// Wait until the owner has stopped and released the file. A request
     /// already on the wire when [`Replica::close`] ran ends within the
-    /// transport's request timeout.
-    fn join(&self);
+    /// transport's request timeout. `true` when the owner returned from its
+    /// stop, which publishes what it holds last; `false` when it ended any
+    /// other way (a fault), and [`Replica::state`] may then miss a write it
+    /// accepted. A later call answers the same.
+    fn join(&self) -> bool;
 }
 
 /// Opens a replica, and removes a retired one's files. Never touches the

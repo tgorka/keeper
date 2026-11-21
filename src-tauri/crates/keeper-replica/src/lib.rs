@@ -1019,6 +1019,9 @@ enum Command {
     /// A socket frame arrived.
     Wake,
     Stop,
+    /// Test seam: commit, answer, then end as a fault would.
+    #[cfg(feature = "owner-fault")]
+    WriteThenFault(Vec<Mutation>, Reply<String>),
 }
 
 fn mutation(op: RowOp) -> Mutation {
@@ -1373,6 +1376,11 @@ impl Owner {
             Command::SyncNow => self.dirty = true,
             Command::Wake => {}
             Command::Stop => return false,
+            #[cfg(feature = "owner-fault")]
+            Command::WriteThenFault(ops, reply) => {
+                self.handle(Command::Mutate(ops, Vec::new(), reply));
+                panic!("owner-fault: the owner ends after answering a write");
+            }
         }
         true
     }
@@ -1939,6 +1947,8 @@ pub struct SyncularReplica {
     commands: Sender<Command>,
     gate: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Set once the owner has returned from [`Owner::stop`].
+    stopped: Arc<AtomicBool>,
     reader: Mutex<FileQuerySnapshotReader>,
     state: watch::Receiver<ReplicaState>,
     remote: Option<Remote>,
@@ -1961,6 +1971,8 @@ impl SyncularReplica {
         let wake = commands.clone();
         let gate = Arc::new(AtomicBool::new(true));
         let owner_gate = Arc::clone(&gate);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let owner_stopped = Arc::clone(&stopped);
         let remote = match (&spec.link, &spec.client_id) {
             (Some(link), Some(client_id)) => {
                 let (config, origin) = link_config(link)?;
@@ -1982,6 +1994,8 @@ impl SyncularReplica {
                         Arc::clone(&owner.superseded_waiting),
                     )));
                     owner.run(inbox);
+                    // `run` ends in `stop`; a fault unwinds past this.
+                    owner_stopped.store(true, Ordering::SeqCst);
                 }
                 Err(error) => {
                     let _ = ready.send(Err(error));
@@ -1994,6 +2008,7 @@ impl SyncularReplica {
             commands,
             gate,
             thread: Mutex::new(Some(thread)),
+            stopped,
             reader: Mutex::new(FileQuerySnapshotReader::new(path)),
             state,
             remote,
@@ -2017,6 +2032,14 @@ impl SyncularReplica {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(commit_id)
+    }
+
+    /// Test seam (`owner-fault`): the owner commits `ops`, answers, then
+    /// panics before it publishes again, as a fault after a write would.
+    #[cfg(feature = "owner-fault")]
+    pub fn write_then_fault(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
+        let ops = ops.into_iter().map(mutation).collect();
+        self.ask(|reply| Command::WriteThenFault(ops, reply))
     }
 }
 
@@ -2463,13 +2486,14 @@ impl Replica for SyncularReplica {
         let _ = self.commands.send(Command::Stop);
     }
 
-    fn join(&self) {
+    fn join(&self) -> bool {
         let thread = self.thread.lock().ok().and_then(|mut slot| slot.take());
         if let Some(thread) = thread {
             if thread.join().is_err() {
                 tracing::warn!("an agents replica's owner thread panicked");
             }
         }
+        self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -3436,6 +3460,7 @@ pub(crate) mod tests {
             commands,
             gate: Arc::new(AtomicBool::new(true)),
             thread: Mutex::new(None),
+            stopped: Arc::new(AtomicBool::new(false)),
             reader: Mutex::new(FileQuerySnapshotReader::new(
                 spec.path.to_str().expect("UTF-8 path"),
             )),
