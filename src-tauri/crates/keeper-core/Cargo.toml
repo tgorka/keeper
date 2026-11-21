@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 keeper-ports = { path = "../keeper-ports" }
+# The accounts module (story 114.5): `Hq` asks keeper-accounts what to do with
+# each held domain and keeps its view; the entry types are the contract's.
+keeper-accounts = { path = "../keeper-accounts" }
+keeper-accounts-api = { path = "../keeper-accounts-api" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

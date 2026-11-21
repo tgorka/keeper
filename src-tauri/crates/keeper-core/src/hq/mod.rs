@@ -23,6 +23,11 @@
 //! a refused replica is retried on a growing backoff that outlives the
 //! replica; a device the server removed stays removed across restarts until
 //! it is paired again, and stays readable until the person removes it.
+//! While a replica is linked, discovery is asked again every
+//! [`REDISCOVERY`], so a domain the person joins opens without a restart, and
+//! a held domain a successful answer no longer lists was left: its replica
+//! stops and its copy is deleted (114.5, DF/AD-13; [`keeper_accounts`]
+//! decides which, and keeps the view of the person's domains).
 //!
 //! The Agents window reads only the replicas (AD-424, AD-433; [`window`]):
 //! the sessions of every held database in one list, each labelled with its
@@ -90,6 +95,7 @@ use crate::hq::vm::{
     HqSignInState, HqSignInVm, HqStatusVm, HqThisDeviceVm,
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
+use keeper_accounts::{Answer, DomainsState, DomainsVm, Fate};
 use keeper_ports::server::ServerUrl;
 use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Unit};
 
@@ -98,6 +104,13 @@ const KEYCHAIN_PREFIX: &str = "agents-server/";
 
 /// The longest wait before a refused database is tried again.
 const MAX_REFUSAL_BACKOFF: Duration = Duration::from_secs(600);
+
+/// How often a device with a linked replica asks `GET /databases` again, so
+/// a domain the person joined opens, and one they left stops, while keeper
+/// runs (114.5, NFR-E114-4): half the 60 s bound from the admin request's
+/// answer to the joined domain's first pull, leaving the other half to open,
+/// link and pull it. One request per interval per linked device.
+const REDISCOVERY: Duration = Duration::from_secs(30);
 
 /// The wait before a database refused `streak` times in a row is linked again.
 fn refusal_backoff(streak: u32) -> Duration {
@@ -242,7 +255,17 @@ struct Inner {
     tasks: Vec<JoinHandle<()>>,
     /// A discovery is pending or running.
     discovering: bool,
+    /// The pending discovery still waiting to start: when, and how to
+    /// replace it with an earlier one.
+    discovery_wait: Option<(Instant, tokio::task::AbortHandle)>,
     refusals: HashMap<String, Refusal>,
+    /// The person's domains as this device knows them (114.5), kept beside
+    /// the replicas ([`databases::load_domains`]).
+    domains: DomainsVm,
+    /// This configuration's discovery answered.
+    answered: bool,
+    /// The last discovery attempt got no answer.
+    offline: bool,
     /// A pairing link opened here, waiting for the person to confirm it.
     offer: Option<(ServerUrl, PairingCode)>,
     /// Held while any replica of `server` is linked.
@@ -337,6 +360,12 @@ pub struct Hq {
     /// One push target request at a time, so the last wish is the one the
     /// server keeps.
     push_turn: tokio::sync::Mutex<()>,
+    /// The person's domains, now and at every change (114.5).
+    domains: watch::Sender<DomainsVm>,
+    /// The view last kept on disk, and the turn to keep it.
+    domains_kept: Mutex<Option<DomainsVm>>,
+    /// [`REDISCOVERY`], shortened by tests.
+    rediscovery_ms: AtomicU64,
 }
 
 fn no_server() -> HqStatusVm {
@@ -452,7 +481,19 @@ impl Hq {
             carry_again: std::sync::Arc::default(),
             prefs: Mutex::default(),
             push_turn: tokio::sync::Mutex::new(()),
+            domains: watch::channel(DomainsVm::default()).0,
+            domains_kept: Mutex::new(None),
+            rediscovery_ms: AtomicU64::new(REDISCOVERY.as_millis() as u64),
         })
+    }
+
+    /// The person's domains, now and at every change (114.5).
+    pub fn domains(&self) -> watch::Receiver<DomainsVm> {
+        self.domains.subscribe()
+    }
+
+    fn rediscovery(&self) -> Duration {
+        Duration::from_millis(self.rediscovery_ms.load(Ordering::Relaxed))
     }
 
     /// The status, now and at every change.
@@ -640,6 +681,7 @@ impl Hq {
         // nothing more (R1096-02); one already sent keeps what it is answered.
         inner.sign_in.cancel();
         inner.discovering = false;
+        inner.discovery_wait = None;
         let mut replicas: Vec<Arc<dyn Replica>> =
             inner.dbs.drain(..).map(|db| db.replica).collect();
         replicas.extend(inner.local.take());
@@ -699,10 +741,15 @@ impl Hq {
                 tracing::warn!(%error, "which agents server this device syncs with could not be kept");
             }
         }
-        let authorization = match (&holding, &pairing) {
-            (Some(holding), Some(_)) => Authorization::load(&data_dir, holding),
-            _ => Authorization::default(),
+        let (authorization, domains) = match (&holding, &pairing) {
+            (Some(holding), Some(_)) => (
+                Authorization::load(&data_dir, holding),
+                databases::load_domains(&data_dir, holding),
+            ),
+            _ => (Authorization::default(), DomainsVm::default()),
         };
+        // The view is kept again under this configuration's server.
+        *lock(&self.domains_kept) = None;
         let host = known_host(&hosts.name);
         let (retired, generation) = {
             let mut inner = lock(&self.inner);
@@ -715,6 +762,9 @@ impl Hq {
             inner.address_refused = address_refused;
             inner.pairing = pairing.clone();
             inner.authorization = authorization.clone();
+            inner.domains = domains;
+            inner.answered = false;
+            inner.offline = false;
             inner.sign_in = signin::SignInMemo::default();
             inner.host = host;
             (retired, inner.generation)
@@ -883,21 +933,40 @@ impl Hq {
         }
     }
 
-    /// `GET /databases` after `delay`, unless one is already pending.
+    /// `GET /databases` after `delay`, unless one is already pending. One
+    /// still waiting to start later than `delay` — the periodic rediscovery —
+    /// is replaced, so a refused link still asks at once.
     fn schedule_discovery(&self, inner: &mut Inner, delay: Duration) {
         if inner.discovering {
-            return;
+            match inner.discovery_wait.take() {
+                Some((due, waiting)) if Instant::now() + delay < due => {
+                    waiting.abort();
+                    inner.discovering = false;
+                }
+                kept => {
+                    inner.discovery_wait = kept;
+                    return;
+                }
+            }
         }
         let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone()) else {
             return;
         };
         inner.discovering = true;
+        inner.tasks.retain(|task| !task.is_finished());
         let generation = inner.generation;
         let me = self.me.clone();
         let routes = Arc::clone(&self.routes);
         let contacts = Arc::clone(&self.contacts);
-        inner.tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
+            // Asking now: no longer replaced by an earlier one.
+            if let Some(hq) = me.upgrade() {
+                let mut inner = lock(&hq.inner);
+                if inner.generation == generation {
+                    inner.discovery_wait = None;
+                }
+            }
             let mut failures: u32 = 0;
             loop {
                 let answer = {
@@ -910,6 +979,12 @@ impl Hq {
                         let exponent = failures.saturating_sub(1).min(6);
                         let wait = Duration::from_secs((1u64 << exponent).min(60));
                         tracing::info!(%why, retry_in_ms = wait.as_millis() as u64, "agents server discovery failed");
+                        // No answer — unreachable, or one keeper cannot read,
+                        // such as 503 `hq.map_closed`: the view shows the last
+                        // known, and nothing is left on it (114.5-AC10).
+                        if let Some(hq) = me.upgrade() {
+                            hq.no_answer(generation);
+                        }
                         tokio::time::sleep(wait).await;
                     }
                     other => {
@@ -921,12 +996,30 @@ impl Hq {
                     }
                 }
             }
-        }));
+        });
+        inner.discovery_wait = Some((Instant::now() + delay, task.abort_handle()));
+        inner.tasks.push(task);
+    }
+
+    /// A discovery attempt of configuration `generation` got no answer.
+    fn no_answer(&self, generation: u64) {
+        {
+            let mut inner = lock(&self.inner);
+            if inner.generation != generation || inner.offline {
+                return;
+            }
+            inner.offline = true;
+        }
+        self.publish();
     }
 
     /// Link what the answer opens (and whose refusal backoff is over), stop
     /// linking what it does not, remember what it said. A replica being
-    /// replaced stays readable until its successor is in place.
+    /// replaced stays readable until its successor is in place. A held
+    /// domain a successful answer no longer lists was left (114.5,
+    /// DF/AD-13): its replica stops and its copy is deleted; a removed
+    /// device keeps every copy readable. While a replica is linked the
+    /// server is asked again every [`REDISCOVERY`].
     async fn apply_discovery(
         &self,
         generation: u64,
@@ -934,55 +1027,93 @@ impl Hq {
     ) -> Result<(), HqError> {
         let _lifecycle = self.lifecycle.lock().await;
         let data_dir = self.data_dir()?;
-        let (server, pairing, authorization) = {
+        let decided = {
             let mut inner = lock(&self.inner);
             if inner.generation != generation {
                 return Ok(());
             }
             inner.discovering = false;
+            inner.discovery_wait = None;
             let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone())
             else {
                 return Ok(());
             };
-            let authorization = match answer {
-                Ok(found) => Authorization {
-                    removed: false,
-                    open: found.databases,
-                },
+            match answer {
+                Ok(found) => {
+                    inner.domains.discovered(&found.entries, sessions::now_ms());
+                    inner.answered = true;
+                    inner.offline = false;
+                    Some(Authorization {
+                        removed: false,
+                        open: found.databases,
+                    })
+                }
                 Err(RouteError::Unauthorized) => {
                     tracing::warn!("the agents server no longer knows this device; every replica stops syncing");
-                    Authorization {
+                    Some(Authorization {
                         removed: true,
                         open: inner.authorization.open.clone(),
-                    }
+                    })
                 }
                 Err(error) => {
+                    // No answer about this device: nothing is left on it
+                    // (114.5-AC10); a linked device asks again later.
                     tracing::warn!(%error, "agents server discovery refused");
-                    return Ok(());
+                    inner.offline = true;
+                    if inner.dbs.iter().any(|db| db.linked) {
+                        let wait = self.rediscovery();
+                        self.schedule_discovery(&mut inner, wait);
+                    }
+                    None
                 }
-            };
-            inner.authorization = authorization.clone();
-            (server, pairing, authorization)
+            }
+            .map(|authorization| {
+                inner.authorization = authorization.clone();
+                (server, pairing, authorization)
+            })
+        };
+        let Some((server, pairing, authorization)) = decided else {
+            self.publish();
+            return Ok(());
         };
         if let Err(error) = authorization.save(&data_dir, &server) {
             tracing::warn!(%error, "what the agents server said about this device could not be kept");
         }
 
         let now = Instant::now();
+        let answer = if authorization.removed {
+            Answer::Removed {
+                last_listed: &authorization.open,
+            }
+        } else {
+            Answer::Listed(&authorization.open)
+        };
         // What changes, decided under the lock; done outside it.
-        let (reopen, retired, next_retry) = {
+        let (reopen, retired, leaving, next_retry) = {
             let inner = lock(&self.inner);
             let held: Vec<String> = inner.dbs.iter().map(|db| db.name.clone()).collect();
             let mut reopen: Vec<(String, bool)> = Vec::new();
             let mut retired: Vec<Arc<dyn Replica>> = Vec::new();
+            // A left domain's replica and the writes that go with it.
+            let mut leaving: Vec<(String, Arc<dyn Replica>, u32)> = Vec::new();
             let mut next_retry: Option<Duration> = None;
-            for (name, open) in databases::plan(&held, &authorization.open) {
+            for (name, fate) in keeper_accounts::plan(&held, answer) {
+                let current = inner.dbs.iter().position(|db| db.name == name);
+                if fate == Fate::Leave {
+                    if let Some(at) = current {
+                        let replica = Arc::clone(&inner.dbs[at].replica);
+                        let unsent = u32::try_from(replica.state().outbox).unwrap_or(u32::MAX);
+                        leaving.push((name, replica, unsent));
+                    }
+                    continue;
+                }
+                let open = fate == Fate::Open;
                 let ready = inner
                     .refusals
                     .get(&name)
                     .and_then(|refusal| refusal.until)
                     .is_none_or(|until| now >= until);
-                if !ready && open && !authorization.removed {
+                if !ready && open {
                     let wait = inner
                         .refusals
                         .get(&name)
@@ -990,15 +1121,14 @@ impl Hq {
                         .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
                     next_retry = Some(next_retry.map_or(wait, |w: Duration| w.min(wait)));
                 }
-                let link = open && !authorization.removed && ready;
-                let current = inner.dbs.iter().position(|db| db.name == name);
+                let link = open && ready;
                 let keep = current.is_some_and(|at| {
                     let db = &inner.dbs[at];
                     db.linked == link && !(link && db.replica.state().link == LinkState::Refused)
                 }) || current.is_some_and(|at| {
                     // A refused replica waits for its backoff rather than reopening.
                     let db = &inner.dbs[at];
-                    db.linked && !ready && open && !authorization.removed
+                    db.linked && !ready && open
                 });
                 if keep {
                     continue;
@@ -1010,13 +1140,21 @@ impl Hq {
                 }
                 reopen.push((name, link));
             }
-            (reopen, retired, next_retry)
+            (reopen, retired, leaving, next_retry)
         };
         retire(Retired {
-            replicas: retired,
+            replicas: retired
+                .into_iter()
+                .chain(leaving.iter().map(|(_, replica, _)| Arc::clone(replica)))
+                .collect(),
             contact: None,
         })
         .await;
+        // Every left replica's owner has stopped: its copy goes.
+        for (name, _, _) in &leaving {
+            self.delete_copy(&data_dir, &server, name, &pairing.actor_id)
+                .await;
+        }
         let specs = reopen
             .iter()
             .map(|(name, link)| Self::spec(&data_dir, &server, &pairing, name, *link))
@@ -1030,6 +1168,12 @@ impl Hq {
                 }
                 return Ok(());
             }
+            let left_at = sessions::now_ms();
+            for (name, _, unsent) in &leaving {
+                inner.dbs.retain(|db| db.name != *name);
+                inner.refusals.remove(name);
+                inner.domains.leave(name, *unsent, left_at);
+            }
             for ((name, linked), replica) in reopen.into_iter().zip(opened) {
                 inner.dbs.retain(|db| db.name != name);
                 let task = self.watch_replica(Some(name.clone()), &replica, generation);
@@ -1041,17 +1185,14 @@ impl Hq {
                     refusal_counted: false,
                 });
             }
-            let order = databases::plan(
-                &inner
-                    .dbs
+            // The server's order; what it does not list after, as held.
+            inner.dbs.sort_by_key(|db| {
+                authorization
+                    .open
                     .iter()
-                    .map(|db| db.name.clone())
-                    .collect::<Vec<_>>(),
-                &authorization.open,
-            );
-            inner
-                .dbs
-                .sort_by_key(|db| order.iter().position(|(name, _)| *name == db.name));
+                    .position(|name| *name == db.name)
+                    .unwrap_or(usize::MAX)
+            });
             let any_linked = inner.dbs.iter().any(|db| db.linked);
             let stale = if any_linked {
                 if inner.linked_contact.is_none() {
@@ -1061,7 +1202,12 @@ impl Hq {
             } else {
                 inner.linked_contact.take()
             };
-            if let Some(wait) = next_retry {
+            let rediscover = (any_linked && !authorization.removed).then(|| self.rediscovery());
+            let wait = match (next_retry, rediscover) {
+                (Some(retry), Some(again)) => Some(retry.min(again)),
+                (retry, again) => retry.or(again),
+            };
+            if let Some(wait) = wait {
                 self.schedule_discovery(&mut inner, wait);
             }
             stale
@@ -1076,6 +1222,56 @@ impl Hq {
             self.tell_push_target();
         }
         Ok(())
+    }
+
+    /// Delete this device's copy of `database` for `actor`, whose replica is
+    /// closed and joined: the replica's files through the opener, then the
+    /// graph's projection and queue beside it, then its directory if nothing
+    /// else is in it. A failure is logged; the replica file left behind is
+    /// held again at the next start and left again at the next answer.
+    async fn delete_copy(
+        &self,
+        data_dir: &std::path::Path,
+        server: &ServerUrl,
+        database: &str,
+        actor: &str,
+    ) {
+        let replica = databases::replica(data_dir, server, database, actor);
+        let beside = databases::beside_replica(data_dir, server, database, actor);
+        let opener = Arc::clone(&self.opener);
+        let deleted = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            opener.remove(&replica)?;
+            for path in beside {
+                let gone = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(error) = gone {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            if let Some(directory) = replica.parent() {
+                // Another actor's replica of it may still be there.
+                let _ = std::fs::remove_dir(directory);
+            }
+            Ok(())
+        })
+        .await;
+        match deleted {
+            Ok(Ok(())) => tracing::info!(
+                database,
+                "a domain the person left was deleted from this device"
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, database, "a left domain's copy could not be deleted")
+            }
+            Err(error) => {
+                tracing::warn!(%error, database, "a left domain's copy could not be deleted")
+            }
+        }
     }
 
     /// Recompute the status from the replicas' states and their directory.
@@ -1164,8 +1360,76 @@ impl Hq {
             *current = status;
             changed
         });
+        self.publish_domains();
         // A replica's rows or the replicas themselves changed.
         self.touch();
+    }
+
+    /// Recompute the person's domains (114.5): each held domain's people
+    /// from its own directory, through the replica port, and how current
+    /// the view is; keep it beside the replicas whenever it moved.
+    fn publish_domains(&self) {
+        let (held, actor, keep_at) = {
+            let inner = lock(&self.inner);
+            let held: Vec<(String, Arc<dyn Replica>)> = inner
+                .dbs
+                .iter()
+                .map(|db| (db.name.clone(), Arc::clone(&db.replica)))
+                .collect();
+            let actor = inner
+                .pairing
+                .as_ref()
+                .map(|pairing| pairing.actor_id.clone());
+            let keep_at = inner.server.clone().filter(|_| inner.pairing.is_some());
+            (held, actor, keep_at)
+        };
+        let read: Vec<(String, Option<Vec<keeper_accounts::DomainMemberVm>>)> = match &actor {
+            Some(actor) => held
+                .iter()
+                .map(|(name, replica)| {
+                    (
+                        name.clone(),
+                        keeper_accounts::members(replica.as_ref(), name, actor),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let view = {
+            let mut inner = lock(&self.inner);
+            for (name, members) in read {
+                inner.domains.set_members(&name, members);
+            }
+            inner.domains.state = if inner.server.is_none() || inner.pairing.is_none() {
+                DomainsState::NotConnected
+            } else if inner.authorization.removed {
+                DomainsState::Removed
+            } else if inner.offline {
+                DomainsState::Offline
+            } else if inner.answered {
+                DomainsState::Current
+            } else {
+                DomainsState::Reading
+            };
+            inner.domains.clone()
+        };
+        let kept_view = view.clone();
+        self.domains.send_if_modified(|current| {
+            let changed = *current != view;
+            *current = view;
+            changed
+        });
+        let (Some(server), Ok(data_dir)) = (keep_at, self.data_dir()) else {
+            return;
+        };
+        let mut kept = lock(&self.domains_kept);
+        if kept.as_ref() == Some(&kept_view) {
+            return;
+        }
+        match databases::save_domains(&data_dir, &server, &kept_view) {
+            Ok(()) => *kept = Some(kept_view),
+            Err(error) => tracing::warn!(%error, "the person's domains could not be kept"),
+        }
     }
 
     /// Set `agents.server_url` and follow it. A refused address is returned
@@ -1454,7 +1718,20 @@ impl Hq {
                 .collect();
             (
                 held,
-                inner.authorization.open.clone(),
+                // The general domain's directory has no `clients` (114.2: it
+                // would show each person the others' devices), so it is never
+                // asked for this device's row (C-114.2-8). By its discovery
+                // kind, never by its name.
+                inner
+                    .authorization
+                    .open
+                    .iter()
+                    .filter(|name| {
+                        inner.domains.kind_of(name)
+                            != Some(keeper_accounts_api::DomainKind::General)
+                    })
+                    .cloned()
+                    .collect::<Vec<String>>(),
                 inner.pairing.clone(),
                 matches!(inner.local_open, LocalOpen::Open) && !inner.authorization.removed,
                 inner.server.as_ref().map(|server| server.host().to_owned()),

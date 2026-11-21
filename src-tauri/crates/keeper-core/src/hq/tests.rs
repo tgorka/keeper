@@ -28,6 +28,7 @@ fn found(databases: &[&str]) -> Discovery {
         actor_id: "ana".to_owned(),
         client_id: "ana.1".to_owned(),
         databases: databases.iter().map(|d| (*d).to_owned()).collect(),
+        entries: Vec::new(),
     }
 }
 
@@ -341,10 +342,10 @@ async fn held_replicas_open_local_and_link_only_what_discovery_opens() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(linked, "alpha links");
-    let status = status_until(&hq, "beta not open", |s| {
-        s.databases
-            .iter()
-            .any(|d| d.name == "beta" && d.state == HqDatabaseState::NotOpen)
+    // beta, which the answer no longer lists, was left (114.5, DF/AD-13):
+    // stopped, deleted, and no longer shown as a database.
+    let status = status_until(&hq, "beta left", |s| {
+        s.databases.iter().all(|d| d.name != "beta")
     })
     .await;
     assert_eq!(status.phase, HqPhase::Paired);
@@ -354,7 +355,8 @@ async fn held_replicas_open_local_and_link_only_what_discovery_opens() {
         alpha[0].spec.link.as_ref().map(|l| l.base_url.clone()),
         Some(server.mount("alpha"))
     );
-    assert!(world.live("beta")[0].spec.link.is_none());
+    assert!(world.live("beta").is_empty());
+    assert!(!databases::replica(&world.data_dir(), &server, "beta", "ana").exists());
     assert_eq!(hq.contacting(), [server.as_str().to_owned()]);
     assert!(!serde_json::to_string(&status)
         .expect("json")
@@ -3139,4 +3141,427 @@ async fn cached_registry_rows_do_not_authorize_a_rename_before_discovery() {
         "freshness does not survive restart"
     );
     again.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Story 114.5: rediscovery, leaving, and the view of the person's domains.
+
+fn entry(
+    name: &str,
+    kind: keeper_accounts_api::DomainKind,
+) -> keeper_accounts_api::discovery::DomainEntry {
+    keeper_accounts_api::discovery::DomainEntry {
+        name: name.to_owned(),
+        mount: format!("/{name}"),
+        kind,
+        display_name: name.to_uppercase(),
+        replaced_repository: None,
+        graph_root: None,
+        files_writes: None,
+    }
+}
+
+/// A discovery listing `entries`, each described.
+fn described(entries: &[keeper_accounts_api::discovery::DomainEntry]) -> Discovery {
+    Discovery {
+        entries: entries.to_vec(),
+        ..found(&entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>())
+    }
+}
+
+async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("never: {what}");
+}
+
+fn linked(hq: &Hq, database: &str) -> bool {
+    lock(&hq.inner)
+        .dbs
+        .iter()
+        .any(|db| db.name == database && db.linked)
+}
+
+fn held_here(hq: &Hq, database: &str) -> bool {
+    lock(&hq.inner).dbs.iter().any(|db| db.name == database)
+}
+
+/// 114.5-AC2: a device linked and running is added to a domain; the next
+/// rediscovery — no restart, pairing or sign-in — opens it linked, with the
+/// units its first pull subscribes, and the view lists it. What it already
+/// held is not reopened.
+#[tokio::test]
+async fn a_running_device_opens_a_domain_it_joined_without_a_restart() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    world.paired("https://hq.example.org", &["makidrive"]);
+    *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+    let hq = world.hq();
+    hq.rediscovery_ms.store(100, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("makidrive links", || linked(&hq, "makidrive")).await;
+    let makidrive_opens = world.opened("makidrive");
+    let asked = world.routes.discovered.load(Ordering::SeqCst);
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[
+        entry("makidrive", General),
+        entry("crew", Group),
+    ])));
+    until("crew links", || linked(&hq, "crew")).await;
+    assert!(
+        world.routes.discovered.load(Ordering::SeqCst) > asked,
+        "asked again"
+    );
+    let crew = world.live("crew");
+    assert_eq!(crew.len(), 1);
+    // The directory unit its first pull subscribes.
+    assert!(
+        crew[0].spec.units.contains(&Unit::of("dir", "crew")),
+        "{:?}",
+        crew[0].spec.units
+    );
+    assert!(crew[0].spec.link.is_some());
+    assert_eq!(
+        world.opened("makidrive"),
+        makidrive_opens,
+        "makidrive reopened"
+    );
+    let mut domains = hq.domains();
+    let view = domains.borrow_and_update().clone();
+    assert_eq!(view.state, keeper_accounts::DomainsState::Current);
+    assert_eq!(
+        view.domains
+            .iter()
+            .map(|d| (d.name.as_str(), d.kind))
+            .collect::<Vec<_>>(),
+        [("makidrive", General), ("crew", Group)]
+    );
+    hq.shutdown().await;
+}
+
+/// An opener of real, unlinked replica files: nothing here reaches a network.
+#[derive(Default)]
+struct Unlinked(Mutex<Vec<std::path::PathBuf>>);
+
+impl Opener for Unlinked {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
+        keeper_replica::SyncularOpener.open(ReplicaSpec { link: None, ..spec })
+    }
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        lock(&self.0).push(replica.to_path_buf());
+        keeper_replica::SyncularOpener.remove(replica)
+    }
+}
+
+fn person(id: &str, dir: &str) -> RowOp {
+    RowOp::Upsert {
+        table: "actors".to_owned(),
+        values: sessions::object(serde_json::json!({
+            "id": id, "kind": "person", "display_name": id.to_uppercase(), "family": null,
+            "dir": dir, "created_at_ms": 1, "author_actor": "server",
+            "author_client": "server"})),
+        base_version: None,
+    }
+}
+
+/// Real replica files of `databases` for `ana`, each with its directory's
+/// people and a write waiting in its outbox, and the access log beside it.
+fn seeded(world: &World, server: &ServerUrl, databases: &[(&str, &[&str])]) {
+    for (database, people) in databases {
+        let path = databases::replica(&world.data_dir(), server, database, "ana");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let seed = keeper_replica::SyncularReplica::open(ReplicaSpec {
+            database: (*database).to_owned(),
+            path,
+            client_id: Some("ana.1".to_owned()),
+            link: None,
+            units: Vec::new(),
+            watch_presence: None,
+        })
+        .expect("opens");
+        seed.mutate(people.iter().map(|id| person(id, database)).collect())
+            .expect("seeds");
+        seed.close();
+        seed.join();
+    }
+}
+
+fn files_of(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// 114.5-AC3 over real replica files: a successful discovery without
+/// `crew` stops it and deletes its replica, the access log beside it and
+/// its directory; the view says it was left and how many writes went with
+/// it; `makidrive` keeps its files and its link, unreopened. The view's
+/// people come from each domain's own directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_left_on_a_running_device_is_stopped_and_its_copy_deleted() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &[]);
+    seeded(
+        &world,
+        &server,
+        &[("makidrive", &["ana", "bo"]), ("crew", &["ana"])],
+    );
+    let crew_dir = databases::server_dir(&world.data_dir(), &server).join("crew");
+    let maki_dir = databases::server_dir(&world.data_dir(), &server).join("makidrive");
+    let crew_before = files_of(&crew_dir);
+    assert!(
+        crew_before.contains(&"ana.sqlite".to_owned()),
+        "{crew_before:?}"
+    );
+    assert!(
+        crew_before.contains(&"ana.blob-access.sqlite".to_owned()),
+        "{crew_before:?}"
+    );
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[
+        entry("makidrive", General),
+        entry("crew", Group),
+    ])));
+    let opener = Arc::new(Unlinked::default());
+    let hq = real_hq(&world, Arc::clone(&opener) as Arc<dyn Opener>);
+    hq.rediscovery_ms.store(100, Ordering::Relaxed);
+    hq.start().await.expect("starts");
+    until("both linked", || {
+        linked(&hq, "makidrive") && linked(&hq, "crew")
+    })
+    .await;
+    let mut domains = hq.domains();
+    until("people read", || {
+        domains
+            .borrow_and_update()
+            .domains
+            .iter()
+            .all(|d| d.members.is_some())
+    })
+    .await;
+    let people = |name: &str| -> Vec<String> {
+        hq.domains()
+            .borrow()
+            .domains
+            .iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.members.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.actor_id)
+            .collect()
+    };
+    assert_eq!(people("makidrive"), ["ana", "bo"]);
+    assert_eq!(people("crew"), ["ana"], "a domain of one person");
+    let maki = hq.replica("makidrive").expect("held");
+
+    *lock(&world.routes.discovery) = Some(Ok(described(&[entry("makidrive", General)])));
+    until("crew left", || !held_here(&hq, "crew")).await;
+    assert!(
+        !crew_dir.exists(),
+        "crew remains: {:?}",
+        files_of(&crew_dir)
+    );
+    assert_eq!(
+        *lock(&opener.0),
+        [databases::replica(
+            &world.data_dir(),
+            &server,
+            "crew",
+            "ana"
+        )],
+        "deleted through the port"
+    );
+    // makidrive's own files stay (its SQLite side files come and go).
+    for kept in ["ana.sqlite", "ana.blob-access.sqlite"] {
+        assert!(
+            files_of(&maki_dir).contains(&kept.to_owned()),
+            "{kept} of makidrive"
+        );
+    }
+    assert!(linked(&hq, "makidrive"));
+    assert!(
+        Arc::ptr_eq(&maki, &hq.replica("makidrive").expect("held")),
+        "makidrive was reopened"
+    );
+    let view = hq.domains().borrow().clone();
+    assert_eq!(
+        view.domains
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["makidrive"]
+    );
+    assert_eq!(view.left.len(), 1);
+    assert_eq!(view.left[0].name, "crew");
+    assert_eq!(view.left[0].unsent, 1, "the seeded write went with it");
+    let status = hq.status().borrow().clone();
+    assert!(status.databases.iter().all(|d| d.name != "crew"));
+    hq.shutdown().await;
+
+    // A restart holds nothing of it, and the view still says it was left.
+    let again = real_hq(&world, Arc::new(Unlinked::default()));
+    again.start().await.expect("restarts");
+    assert!(!held_here(&again, "crew"));
+    assert_eq!(again.domains().borrow().left.len(), 1);
+    again.shutdown().await;
+}
+
+/// 114.5-AC3 (a device offline at the removal) and AC10: no answer — the
+/// server unreachable, an answer keeper cannot read such as 503
+/// `hq.map_closed`, or a refusal — leaves nothing; the view shows the last
+/// known, offline. The next successful discovery that omits the domain
+/// leaves it.
+#[tokio::test]
+async fn only_a_successful_discovery_that_omits_a_domain_leaves_it() {
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &["makidrive", "crew"]);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    hq.apply_discovery(
+        generation(&hq),
+        Ok(described(&[
+            entry("makidrive", General),
+            entry("crew", Group),
+        ])),
+    )
+    .await
+    .expect("applies");
+    let read_at = hq.domains().borrow().read_at_ms;
+    assert!(read_at.is_some());
+
+    for refused in [
+        RouteError::Forbidden("hq.devices_only".to_owned()),
+        RouteError::Refused {
+            status: 503,
+            code: "hq.map_closed".to_owned(),
+        },
+    ] {
+        hq.apply_discovery(generation(&hq), Err(refused))
+            .await
+            .expect("applies");
+        assert!(held_here(&hq, "crew"));
+    }
+    // The task's own failures never reach `apply_discovery`: an unreachable
+    // server, and 503 `hq.map_closed` read as an unexpected answer.
+    *lock(&world.routes.discovery) = Some(Err(RouteError::Unexpected(
+        "503 {\"error\":\"hq.map_closed\"}".to_owned(),
+    )));
+    {
+        let mut inner = lock(&hq.inner);
+        hq.schedule_discovery(&mut inner, Duration::ZERO);
+    }
+    let mut domains = hq.domains();
+    until("offline", || {
+        domains.borrow_and_update().state == keeper_accounts::DomainsState::Offline
+    })
+    .await;
+    let view = hq.domains().borrow().clone();
+    assert_eq!(view.read_at_ms, read_at, "the last known, as of its read");
+    assert_eq!(view.domains.len(), 2);
+    assert!(world.opener.removed().is_empty(), "something was deleted");
+    assert!(held_here(&hq, "crew"));
+
+    // The server answers again, without crew: the running task applies it.
+    *lock(&world.routes.discovery) = Some(Ok(found(&["makidrive"])));
+    for _ in 0..1000 {
+        if !held_here(&hq, "crew") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        world.opener.removed(),
+        [databases::replica(
+            &world.data_dir(),
+            &server,
+            "crew",
+            "ana"
+        )]
+    );
+    assert!(!held_here(&hq, "crew"));
+    assert_eq!(
+        hq.domains().borrow().state,
+        keeper_accounts::DomainsState::Current
+    );
+    hq.shutdown().await;
+}
+
+/// 114.5-AC4: a device the server removed (401 on discovery) keeps today's
+/// rule: every replica stays, readable and unlinked, and nothing is deleted.
+#[tokio::test]
+async fn a_removed_device_deletes_nothing() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["makidrive", "crew"]);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    hq.apply_discovery(generation(&hq), Ok(found(&["makidrive", "crew"])))
+        .await
+        .expect("applies");
+    hq.apply_discovery(generation(&hq), Err(RouteError::Unauthorized))
+        .await
+        .expect("applies");
+    assert!(world.opener.removed().is_empty());
+    assert!(held_here(&hq, "makidrive") && held_here(&hq, "crew"));
+    assert!(!linked(&hq, "makidrive") && !linked(&hq, "crew"));
+    assert_eq!(
+        hq.domains().borrow().state,
+        keeper_accounts::DomainsState::Removed
+    );
+    hq.shutdown().await;
+}
+
+/// C-114.2-8: the general domain's directory has no `clients` rows, so a
+/// device that lists it is never read as unread for it; a group domain
+/// still needs this device's own row.
+#[tokio::test]
+async fn the_general_domain_is_not_asked_for_this_devices_row() {
+    use crate::device_name::Unread;
+    use keeper_accounts_api::DomainKind::{General, Group};
+    let world = World::new();
+    world.paired("https://hq.example.org", &["makidrive", "crew"]);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    hq.apply_discovery(
+        generation(&hq),
+        Ok(described(&[
+            entry("makidrive", General),
+            entry("crew", Group),
+        ])),
+    )
+    .await
+    .expect("applies");
+    let Value::Object(me) = serde_json::json!({
+        "id": "ana.1", "actor_id": "ana", "kind": "device", "host": "test",
+        "created_at_ms": 1, "revoked_at_ms": null,
+    }) else {
+        unreachable!("an object literal")
+    };
+    // makidrive's directory holds people and no clients.
+    world.live("makidrive")[0].replicate(Vec::new());
+    world.live("crew")[0].replicate(Vec::new());
+    assert_eq!(
+        hq.device_directory(),
+        Err(Unread {
+            database: Some("crew".to_owned()),
+            ..Default::default()
+        }),
+        "a group domain still needs this device's row"
+    );
+    world.live("crew")[0].replicate(vec![me]);
+    assert!(hq.device_directory().is_ok(), "{:?}", hq.device_directory());
+    hq.shutdown().await;
 }

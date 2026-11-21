@@ -119,17 +119,50 @@ pub fn held(data_dir: &Path, server: &ServerUrl, actor: &str) -> Vec<String> {
     names
 }
 
-/// Every database this device shows: the ones the server opens to it, in the
-/// server's order, then the ones it holds that the server no longer opens.
-/// Each with whether it is open.
-pub fn plan(held: &[String], open: &[String]) -> Vec<(String, bool)> {
-    let mut shown: Vec<(String, bool)> = open.iter().map(|name| (name.clone(), true)).collect();
-    for name in held {
-        if !open.contains(name) {
-            shown.push((name.clone(), false));
-        }
+/// What else of one database's copy for `actor` lies beside its replica:
+/// the graph's query projection and intent queue (the queue's place is
+/// `keeper_graph::queue::beside`'s, pinned by a test below). The replica's
+/// own files are the opener's ([`keeper_ports::Opener::remove`]).
+pub fn beside_replica(
+    data_dir: &Path,
+    server: &ServerUrl,
+    database: &str,
+    actor: &str,
+) -> [PathBuf; 2] {
+    [
+        projection(data_dir, server, database, actor),
+        replica(data_dir, server, database, actor).with_file_name(format!("{actor}.graph-queue")),
+    ]
+}
+
+/// The person's domains as this device last showed them (114.5): kept so an
+/// offline device, a restart and `keeper-cli accounts domains` show the last
+/// known. Nothing secret.
+pub fn domains_file(data_dir: &Path, server: &ServerUrl) -> PathBuf {
+    server_dir(data_dir, server).join("domains.json")
+}
+
+/// The view kept for `server`; nothing kept (or unreadable) is an empty one.
+pub fn load_domains(data_dir: &Path, server: &ServerUrl) -> keeper_accounts::DomainsVm {
+    std::fs::read(domains_file(data_dir, server))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_domains(
+    data_dir: &Path,
+    server: &ServerUrl,
+    domains: &keeper_accounts::DomainsVm,
+) -> std::io::Result<()> {
+    let path = domains_file(data_dir, server);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    shown
+    let bytes = serde_json::to_vec(domains).map_err(std::io::Error::other)?;
+    let staged = path.with_extension("json.new");
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(staged, path)
 }
 
 /// What the server last said about this device: whether it was removed, and
@@ -208,6 +241,8 @@ mod tests {
         assert_eq!(queue.parent(), at.parent());
         assert_eq!(queue.file_name(), Some("ana.graph-queue".as_ref()));
         assert!(queue.starts_with(server_dir(data, &a)));
+        // What a left domain's removal deletes beside the replica (114.5).
+        assert_eq!(beside_replica(data, &a, "alpha", "ana")[1], queue);
     }
 
     #[test]
@@ -222,15 +257,6 @@ mod tests {
         std::fs::create_dir_all(server_dir(dir.path(), &a).join("Not A Name")).expect("mkdir");
         assert_eq!(held(dir.path(), &a, "ana"), ["alpha", "beta"]);
         assert!(held(dir.path(), &server("https://x.example.org"), "ana").is_empty());
-    }
-
-    #[test]
-    fn a_database_the_server_dropped_is_still_shown_not_open() {
-        let held = ["beta".to_owned(), "alpha".to_owned()];
-        assert_eq!(
-            plan(&held, &["alpha".to_owned()]),
-            [("alpha".to_owned(), true), ("beta".to_owned(), false)]
-        );
     }
 
     #[test]
