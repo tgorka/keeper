@@ -1,0 +1,24 @@
+[package]
+name = "keeper-accounts"
+description = "The accounts module's client half: what a device does with each domain it holds, and the view of the person's domains"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# An implementation (story 114.5): its first-party edges are the contract and
+# the port only (`bun run check:module-edges`). Paths, the authorization file
+# and the HTTP route stay in keeper-core (DW-E114-9).
+[dependencies]
+keeper-accounts-api = { path = "../keeper-accounts-api" }
+keeper-ports = { path = "../keeper-ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { workspace = true }
+
+[dev-dependencies]
+keeper-testkit = { path = "../keeper-testkit" }

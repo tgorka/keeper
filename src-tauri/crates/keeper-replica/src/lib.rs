@@ -2486,6 +2486,31 @@ impl Opener for SyncularOpener {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError> {
         Ok(Arc::new(SyncularReplica::open(spec)?))
     }
+
+    fn remove(&self, replica: &Path) -> std::io::Result<()> {
+        replica_files(replica)
+            .iter()
+            .try_for_each(|file| match std::fs::remove_file(file) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            })
+    }
+}
+
+/// Every file a replica at `replica` may have on disk: the client's file
+/// (its rows and its cached bodies) with SQLite's side files, and keeper's
+/// access log beside it with its own.
+fn replica_files(replica: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for base in [replica.to_path_buf(), AccessLog::beside(replica)] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut side = base.clone().into_os_string();
+            side.push(suffix);
+            files.push(side.into());
+        }
+        files.push(base);
+    }
+    files
 }
 
 #[cfg(test)]
@@ -4230,5 +4255,43 @@ pub(crate) mod tests {
                 message: "[]".into()
             }
         );
+    }
+
+    /// Story 114.5: a left domain's replica is deleted with its side files
+    /// and its access log; a replica beside it keeps every file.
+    #[test]
+    fn removing_a_retired_replica_deletes_its_files_and_nothing_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut alpha = local(dir.path().join("alpha.sqlite"));
+        alpha.database = "alpha".to_owned();
+        let beta = local(dir.path().join("beta.sqlite"));
+        for spec in [&alpha, &beta] {
+            let replica = SyncularOpener.open(spec.clone()).expect("opens");
+            replica
+                .mutate(vec![prefs_row("ana/nixie")])
+                .expect("commits");
+            replica.close();
+            replica.join();
+        }
+        assert!(alpha.path.is_file());
+        assert!(
+            AccessLog::beside(&alpha.path).is_file(),
+            "the access log exists"
+        );
+        SyncularOpener.remove(&alpha.path).expect("removes");
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("lists")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        assert!(
+            left.iter().all(|name| !name.starts_with("alpha")),
+            "alpha's files remain: {left:?}"
+        );
+        assert!(beta.path.is_file());
+        assert!(AccessLog::beside(&beta.path).is_file());
+        SyncularOpener
+            .remove(&alpha.path)
+            .expect("a second removal finds nothing");
     }
 }

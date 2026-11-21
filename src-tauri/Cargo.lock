@@ -4608,6 +4608,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-accounts"
+version = "0.11.0"
+dependencies = [
+ "keeper-accounts-api",
+ "keeper-ports",
+ "keeper-testkit",
+ "serde",
+ "serde_json",
+ "ts-rs",
+]
+
+[[package]]
 name = "keeper-accounts-api"
 version = "0.11.0"
 dependencies = [

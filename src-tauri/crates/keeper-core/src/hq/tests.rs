@@ -975,6 +975,9 @@ impl Opener for StagedOpener {
         *lock(&self.0) = Some(Arc::clone(&staged));
         Ok(staged)
     }
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        keeper_replica::SyncularOpener.remove(replica)
+    }
 }
 
 /// A started service on one staged replica holding `ana`'s session
@@ -1581,6 +1584,9 @@ impl Opener for HeldOpener {
         }
         keeper_replica::SyncularOpener.open(spec)
     }
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        keeper_replica::SyncularOpener.remove(replica)
+    }
 }
 
 /// The audit's round-2 case (A106-03): paired, the address cleared, a
@@ -1658,6 +1664,9 @@ impl Opener for LocalOpener {
             })?);
         lock(&self.0).insert(database, Arc::clone(&replica));
         Ok(replica)
+    }
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        keeper_replica::SyncularOpener.remove(replica)
     }
 }
 
@@ -2174,6 +2183,9 @@ struct Shared(Arc<LocalOpener>);
 impl Opener for Shared {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
         Ok(self.0.replica(&spec.database))
+    }
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        keeper_replica::SyncularOpener.remove(replica)
     }
 }
 

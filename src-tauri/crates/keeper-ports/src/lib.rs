@@ -593,9 +593,15 @@ pub trait Replica: Send + Sync {
     fn join(&self);
 }
 
-/// Opens a replica. Never touches the network.
+/// Opens a replica, and removes a retired one's files. Never touches the
+/// network.
 pub trait Opener: Send + Sync {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError>;
+    /// Delete every file of the replica at `replica` — the replica itself,
+    /// which holds its cached bodies, its SQLite side files and the access
+    /// log beside it — once it is closed and joined (story 114.5: a domain
+    /// the person left). A file already gone is not an error.
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()>;
 }
 
 /// One database this device holds, and who this device is in it.
