@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
+use keeper_accounts::DomainsVm;
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm, ShownApprovalVm};
 use keeper_core::hq::default_agent::DefaultAgentVm;
 use keeper_core::hq::grants::{AgentGrantsVm, AlwaysAllow};
@@ -271,6 +272,35 @@ pub fn hq_status_subscribe(channel: Channel<HqStatusVm>) -> Result<String, IpcEr
 /// End an [`hq_status_subscribe`] stream. An unknown id is a no-op.
 #[tauri::command]
 pub fn hq_status_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Stream the person's domains (114.5) — each one's kind, name and people,
+/// the ones left, and how current the view is — at once, then every change.
+/// Rust decides all of it; this is a call site.
+#[tauri::command]
+pub fn hq_domains_subscribe(channel: Channel<DomainsVm>) -> Result<String, IpcError> {
+    let mut domains = hq()?.domains();
+    let current = domains.borrow_and_update().clone();
+    if let Err(error) = channel.send(current) {
+        tracing::warn!(%error, "the domains subscription could not start");
+    }
+    let start = move |_: String| {
+        tauri::async_runtime::spawn(async move {
+            while domains.changed().await.is_ok() {
+                let current = domains.borrow_and_update().clone();
+                if channel.send(current).is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`hq_domains_subscribe`] stream. An unknown id is a no-op.
+#[tauri::command]
+pub fn hq_domains_unsubscribe(subscription_id: String) {
     end(&subscription_id);
 }
 

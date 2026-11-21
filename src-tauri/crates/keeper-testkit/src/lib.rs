@@ -116,6 +116,10 @@ impl FakeReplica {
     pub fn set_presence_known(&self, known: bool) {
         self.state.send_modify(|state| state.presence_known = known);
     }
+    /// Say `outbox` commits wait to be taken by the server.
+    pub fn set_outbox(&self, outbox: usize) {
+        self.state.send_modify(|state| state.outbox = outbox);
+    }
     /// Replace the rows every query answers, as a round would, and say
     /// the directory changed.
     pub fn replicate(&self, rows: Vec<Map<String, Value>>) {
@@ -352,8 +356,10 @@ impl Replica for FakeReplica {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
-    fn join(&self) {
+    /// Answers as a real replica whose owner stopped cleanly.
+    fn join(&self) -> bool {
         self.joined.store(true, Ordering::SeqCst);
+        true
     }
 }
 
@@ -363,9 +369,14 @@ pub struct FakeOpener {
     pub opened: Mutex<Vec<Arc<FakeReplica>>>,
     /// A database whose next open waits until the sender is dropped or sends.
     pub hold: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    /// Every replica path [`Opener::remove`] was asked to delete, in order.
+    pub removed: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl FakeOpener {
+    pub fn removed(&self) -> Vec<std::path::PathBuf> {
+        self.removed.lock().map(|r| r.clone()).unwrap_or_default()
+    }
     pub fn all(&self) -> Vec<Arc<FakeReplica>> {
         self.opened.lock().map(|o| o.clone()).unwrap_or_default()
     }
@@ -414,6 +425,18 @@ impl Opener for FakeOpener {
             .map_err(|_| ReplicaError::Closed)?
             .push(Arc::clone(&replica));
         Ok(replica)
+    }
+
+    /// Records the path, and deletes the file there when a test made one.
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()> {
+        self.removed
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned"))?
+            .push(replica.to_path_buf());
+        match std::fs::remove_file(replica) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 }
 

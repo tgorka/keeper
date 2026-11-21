@@ -27,6 +27,9 @@ hex = { workspace = true }
 # The outcome journal's test writer (`journal`). Only keeper-core's
 # `[dev-dependencies]` enable it; nothing shipped does.
 outcome-journal = []
+# A test seam: `SyncularReplica::write_then_fault` ends the owner after a
+# write, as a fault would. Only keeper-core's `[dev-dependencies]` enable it.
+owner-fault = []
 
 [dev-dependencies]
 keeper-testkit = { path = "../keeper-testkit" }

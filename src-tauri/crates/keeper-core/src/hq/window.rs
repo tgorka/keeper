@@ -501,7 +501,11 @@ impl Hq {
         if inner.authorization.removed {
             return HqError::Sentence(phase_sentence(HqPhase::Removed, Some(server.host()), 0));
         }
-        if inner.discovering || inner.authorization.open.iter().any(|open| open == database) {
+        // Once this configuration's discovery answered, the next one is only
+        // the periodic rediscovery (114.5): a database it did not list waits
+        // for no round.
+        let pending = inner.discovering && !inner.answered;
+        if pending || inner.authorization.open.iter().any(|open| open == database) {
             return HqError::Arriving(format!(
                 "This conversation has not reached this device yet; it opens here when {database} \
                  brings it."

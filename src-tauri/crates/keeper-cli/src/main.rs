@@ -22,6 +22,8 @@
 //! Each module says which of its answers earns which code.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod accounts;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod graph;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod output;
@@ -62,6 +64,9 @@ mod cli {
     pub enum Module {
         /// A person's device's graph against a real keeper-hq.
         Graph(super::graph::Args),
+        /// The person's domains, as a device last showed them.
+        #[command(subcommand)]
+        Accounts(super::accounts::Args),
     }
 }
 
@@ -74,6 +79,7 @@ fn main() -> std::process::ExitCode {
     let printer = output::Printer::new(cli.json);
     let code = match cli.module {
         cli::Module::Graph(args) => graph::main(args, &printer),
+        cli::Module::Accounts(args) => accounts::main(args, &printer),
     };
     std::process::ExitCode::from(code)
 }

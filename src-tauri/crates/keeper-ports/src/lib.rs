@@ -589,13 +589,22 @@ pub trait Replica: Send + Sync {
     fn close(&self);
     /// Wait until the owner has stopped and released the file. A request
     /// already on the wire when [`Replica::close`] ran ends within the
-    /// transport's request timeout.
-    fn join(&self);
+    /// transport's request timeout. `true` when the owner returned from its
+    /// stop, which publishes what it holds last; `false` when it ended any
+    /// other way (a fault), and [`Replica::state`] may then miss a write it
+    /// accepted. A later call answers the same.
+    fn join(&self) -> bool;
 }
 
-/// Opens a replica. Never touches the network.
+/// Opens a replica, and removes a retired one's files. Never touches the
+/// network.
 pub trait Opener: Send + Sync {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError>;
+    /// Delete every file of the replica at `replica` — the replica itself,
+    /// which holds its cached bodies, its SQLite side files and the access
+    /// log beside it — once it is closed and joined (story 114.5: a domain
+    /// the person left). A file already gone is not an error.
+    fn remove(&self, replica: &std::path::Path) -> std::io::Result<()>;
 }
 
 /// One database this device holds, and who this device is in it.

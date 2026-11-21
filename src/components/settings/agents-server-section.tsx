@@ -16,6 +16,7 @@
  * pairs and syncs the same way.
  */
 import { useCallback, useEffect, useId, useState } from "react";
+import { AgentsDomains } from "@/components/settings/agents-domains";
 import { FileControlled } from "@/components/settings/config-source-section";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -224,6 +225,8 @@ export function AgentsServerSection({ open }: { open: boolean }) {
           ))}
         </ul>
       )}
+
+      <AgentsDomains open={open} />
 
       {status.offer !== null && (
         <fieldset aria-label={OFFER_PAIR} className="flex min-w-0 flex-col gap-2">

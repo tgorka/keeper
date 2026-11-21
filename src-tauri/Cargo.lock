@@ -4563,6 +4563,7 @@ dependencies = [
  "dispatch2",
  "fluidaudio-rs",
  "fs4",
+ "keeper-accounts",
  "keeper-agent",
  "keeper-core",
  "keeper-paths",
@@ -4608,6 +4609,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-accounts"
+version = "0.12.0"
+dependencies = [
+ "keeper-accounts-api",
+ "keeper-ports",
+ "keeper-testkit",
+ "serde",
+ "serde_json",
+ "ts-rs",
+]
+
+[[package]]
 name = "keeper-accounts-api"
 version = "0.12.0"
 dependencies = [
@@ -4641,6 +4654,8 @@ name = "keeper-cli"
 version = "0.12.0"
 dependencies = [
  "clap",
+ "keeper-accounts",
+ "keeper-accounts-api",
  "keeper-graph",
  "keeper-ports",
  "keeper-replica",
@@ -4664,6 +4679,8 @@ dependencies = [
  "globset",
  "hex",
  "image",
+ "keeper-accounts",
+ "keeper-accounts-api",
  "keeper-graph",
  "keeper-graph-protocol",
  "keeper-llm",
