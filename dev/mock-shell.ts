@@ -97,6 +97,7 @@ import type {
   DeviceCodeVm,
   DeviceNameVm,
   DocumentVm,
+  DomainsVm,
   DriveFolderVm,
   FailureOperation,
   FailureStateVm,
@@ -9874,6 +9875,58 @@ const instanceHandlers: Record<string, (payload: Record<string, unknown>) => unk
   },
 };
 
+const domainsParam = new URLSearchParams(window.location.search).get("domains") ?? "listed";
+
+/** The person's domains as `?domains=` asks (114.5); see `hq_domains_subscribe`. */
+function hqDomainsFixture(): DomainsVm {
+  const me = { actorId: "tgorka", name: "Tomasz", me: true };
+  const marta = { actorId: "marta", name: "Marta", me: false };
+  const listed: DomainsVm = {
+    state: "current",
+    readAtMs: Date.now() - 90_000,
+    domains: [
+      {
+        name: "tgdrive",
+        displayName: "tgdrive",
+        kind: "personal",
+        replacedRepository: "https://forge.example/git/tgorka/tgdrive.git",
+        filesWrites: "shadow",
+        members: [me],
+      },
+      { name: "neuradrive", displayName: "Neuradrive", kind: "group", members: [me, marta] },
+      { name: "makidrive", displayName: "Makidrive", kind: "general", members: [marta, me] },
+      { name: "scratch-crew", displayName: "Scratch crew", kind: "group", members: null },
+    ],
+    left: [],
+  };
+  switch (domainsParam) {
+    case "reading":
+      return { ...listed, state: "reading", readAtMs: null, domains: [] };
+    case "empty":
+      return { ...listed, domains: [] };
+    case "offline":
+      return { ...listed, state: "offline" };
+    case "removed":
+      return { ...listed, state: "removed" };
+    case "left":
+      return {
+        ...listed,
+        domains: listed.domains.slice(0, 3),
+        left: [
+          {
+            name: "scratch-crew",
+            displayName: "Scratch crew",
+            kind: "group",
+            unsent: 2,
+            leftAtMs: Date.now() - 30_000,
+          },
+        ],
+      };
+    default:
+      return listed;
+  }
+}
+
 const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   hq_status_subscribe: (payload) => {
     const id = `hq-subscription-${hqWatchers.size + 1}`;
@@ -9890,6 +9943,15 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
     hqWatchers.delete(String(payload.subscriptionId));
     return null;
   },
+  // Settings › Agents › Server › Your domains (114.5): `?domains=` walks the view's states —
+  // listed (the default), reading, empty, offline, left, removed. A viewing aid: Rust decides
+  // every state; this draws each once.
+  hq_domains_subscribe: (payload) => {
+    const channel = payload.channel as MockChannel<DomainsVm>;
+    channel.onmessage?.(hqDomainsFixture());
+    return "hq-domains";
+  },
+  hq_domains_unsubscribe: () => null,
   hq_server_set: (payload) => {
     const typed = String(payload.url ?? "").trim();
     if (typed === "") return hqPublish({ ...hqNone, waitingHere: 0 });

@@ -31,6 +31,8 @@ vi.mock("@/lib/ipc/client", () => ({
   hqPairOfferAccept: vi.fn(),
   hqPairOfferDismiss: vi.fn(() => Promise.resolve()),
   hqDeviceRevoke: vi.fn(),
+  hqDomainsSubscribe: vi.fn(() => Promise.resolve("domains")),
+  hqDomainsUnsubscribe: vi.fn(() => Promise.resolve()),
   hqEnrolments: vi.fn(() => Promise.resolve([])),
 }));
 vi.mock("@/components/settings/config-source-section", () => ({

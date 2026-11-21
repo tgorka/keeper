@@ -21,6 +21,7 @@ import type { DefaultAgentVm } from "./gen/DefaultAgentVm";
 import type { DictionaryTermVm } from "./gen/DictionaryTermVm";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
+import type { DomainsVm } from "./gen/DomainsVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { ExportReceiptVm } from "./gen/ExportReceiptVm";
 import type { FailureStateVm } from "./gen/FailureStateVm";
@@ -510,6 +511,10 @@ export type { DistributorOfferVm } from "./gen/DistributorOfferVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
 export type { DocumentVm } from "./gen/DocumentVm";
+export type { DomainMemberVm } from "./gen/DomainMemberVm";
+export type { DomainsState } from "./gen/DomainsState";
+export type { DomainsVm } from "./gen/DomainsVm";
+export type { DomainVm } from "./gen/DomainVm";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 export type { DriveFolderVm } from "./gen/DriveFolderVm";
 export type { DriveOfferVm } from "./gen/DriveOfferVm";
@@ -577,6 +582,7 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { KnowledgeNoteVm } from "./gen/KnowledgeNoteVm";
 export type { LabelVm } from "./gen/LabelVm";
+export type { LeftDomainVm } from "./gen/LeftDomainVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
@@ -4454,6 +4460,20 @@ export async function hqStatusSubscribe(onStatus: (status: HqStatusVm) => void):
 /** End an {@link hqStatusSubscribe} stream. */
 export async function hqStatusUnsubscribe(subscriptionId: string): Promise<void> {
   await invoke<void>("hq_status_unsubscribe", { subscriptionId });
+}
+
+/**
+ * Stream the person's domains (114.5): each domain this device opens with its kind and who is
+ * in it, the ones left, and how current the view is — Rust's view model — at once and at every
+ * change. Resolves with the subscription id for {@link hqDomainsUnsubscribe}.
+ */
+export async function hqDomainsSubscribe(onDomains: (domains: DomainsVm) => void): Promise<string> {
+  return await subscribeWithStringId<DomainsVm>("hq_domains_subscribe", onDomains);
+}
+
+/** End an {@link hqDomainsSubscribe} stream. */
+export async function hqDomainsUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("hq_domains_unsubscribe", { subscriptionId });
 }
 
 /**
