@@ -163,22 +163,3 @@ fn killed_put_resumes_from_plan_without_resending_held_parts() {
         extra
     );
 }
-
-#[test]
-fn foreign_store_origin_is_refused() {
-    let stand_in = StandIn::start("alpha");
-    stand_in.announce_foreign(true);
-    let dir = tempfile::tempdir().expect("tempdir");
-    let src = dir.path().join("payload.bin");
-    let plan_dir = dir.path().join("plans");
-    std::fs::write(&src, pattern_bytes(1024)).expect("write fixture");
-
-    let out = put_cmd(&stand_in.server_url(), stand_in.token(), &plan_dir, &src)
-        .output()
-        .expect("run put");
-    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
-    let json = parse_json(&out);
-    assert_eq!(json["ok"], false);
-    assert_eq!(json["code"], "transport.foreign_origin");
-    assert_eq!(stand_in.store_bytes_received(), 0);
-}

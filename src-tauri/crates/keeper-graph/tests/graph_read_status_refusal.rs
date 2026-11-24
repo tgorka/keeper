@@ -120,6 +120,7 @@ fn read_status(answer: Answer) -> Result<(), QueryError> {
         link: Some(Link {
             base_url: format!("{base}/tgdrive"),
             token: "t".to_owned(),
+            store: Default::default(),
         }),
         units: Vec::new(),
         watch_presence: None,
