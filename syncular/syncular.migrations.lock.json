@@ -45,6 +45,11 @@
       "name": "0009_knowledge_graph_history",
       "sha256": "575ef00b77c5b2990d45a8647ae248093f73cf99daf7967088c038338474424b",
       "schemaVersion": 9
+    },
+    {
+      "name": "0010_files",
+      "sha256": "ba7691fbabccffd83e7c284d62c856c67fa1e6169909056e23d225e4dafd6c7b",
+      "schemaVersion": 10
     }
   ],
   "head": {
@@ -472,6 +477,487 @@
           {
             "name": "dir",
             "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_entries",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "drive_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "parent_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name_fold",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "content_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "size",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "media_type",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "mtime_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "mode",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "lifecycle",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "updated_event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "updated_seq",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_entry_sources",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "sources",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_event_ops",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "ordinal",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "entity_type",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "entity_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "operation",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "before_revision",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "after_revision",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "before_value",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "after_value",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "before_content_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "after_content_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_events",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "seq",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "descriptor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "request_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "request_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "actor_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "client_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "origin_class",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "origin_actor",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "origin_chain",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "context_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "approval_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "approval_basis",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "proposal_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "change_set_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "job_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "job_ordinal",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "job_attempt_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "reverses_event_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "event_time_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "recorded_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "op_count",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "delta_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_head",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "seq",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "drives",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "files_receipts",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "client_scope",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "descriptor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "request_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "request_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "outcome",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "reason",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "event_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "seq",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "detail",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "recorded_at_ms",
+            "type": "integer",
             "nullable": false
           },
           {

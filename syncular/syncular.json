@@ -18,7 +18,8 @@
     { "version": 6, "through": "0006_knowledge_graph" },
     { "version": 7, "through": "0007_knowledge_graph_contents" },
     { "version": 8, "through": "0008_knowledge_graph_review" },
-    { "version": 9, "through": "0009_knowledge_graph_history" }
+    { "version": 9, "through": "0009_knowledge_graph_history" },
+    { "version": 10, "through": "0010_files" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -100,6 +101,30 @@
     {
       "name": "kg_receipts",
       "scopes": [{ "pattern": "kg_client:{kg_client}", "column": "client_scope" }]
+    },
+    {
+      "name": "files_entries",
+      "scopes": [{ "pattern": "files_drive:{files_drive}", "column": "drive_key" }]
+    },
+    {
+      "name": "files_entry_sources",
+      "scopes": [{ "pattern": "files_sources:{files_sources}", "column": "domain" }]
+    },
+    {
+      "name": "files_events",
+      "scopes": [{ "pattern": "files_page:{files_page}", "column": "page_key" }]
+    },
+    {
+      "name": "files_event_ops",
+      "scopes": [{ "pattern": "files_page:{files_page}", "column": "page_key" }]
+    },
+    {
+      "name": "files_head",
+      "scopes": [{ "pattern": "files_domain:{files_domain}", "column": "domain" }]
+    },
+    {
+      "name": "files_receipts",
+      "scopes": [{ "pattern": "files_client:{files_client}", "column": "client_scope" }]
     }
   ],
   "subscriptions": [
@@ -115,6 +140,11 @@
     { "name": "kgGraph", "scopes": { "kg_graph": "{database}" } },
     { "name": "kgHistory", "scopes": { "kg_history": "{database}" } },
     { "name": "kgReceipts", "scopes": { "kg_client": "{clientScope}" } },
-    { "name": "kgProposals", "scopes": { "kg_proposal": "{actorId}" } }
+    { "name": "kgProposals", "scopes": { "kg_proposal": "{actorId}" } },
+    { "name": "filesDrive", "scopes": { "files_drive": "{driveKey}" } },
+    { "name": "filesDomain", "scopes": { "files_domain": "{database}" } },
+    { "name": "filesPage", "scopes": { "files_page": "{pageKey}" } },
+    { "name": "filesReceipts", "scopes": { "files_client": "{clientScope}" } },
+    { "name": "filesSources", "scopes": { "files_sources": "{database}" } }
   ]
 }
