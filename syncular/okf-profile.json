@@ -1,0 +1,246 @@
+{
+  "profile": "okf",
+  "version": 1,
+  "namespace": "okf",
+  "reservedNamespaces": ["okf", "keeper"],
+  "grammar": {
+    "part": "[a-z][a-z0-9_]*",
+    "form": "<namespace>:<name>",
+    "maxBytes": 64,
+    "exempt": ["order_key"]
+  },
+  "kg1": {
+    "kinds": ["Concept", "Collection", "Resource", "Tag", "Guidance", "Vocabulary"],
+    "relations": ["HAS_TAG", "contains", "guidance_scope", "sources"],
+    "edgeProperties": ["order_key"]
+  },
+  "orderKey": {
+    "property": "order_key",
+    "alphabet": "-0123456789abcdefghijklmnopqrstuvwxyz",
+    "minLength": 1,
+    "maxLength": 64,
+    "neverEndsWith": "-",
+    "between": "the shortest length at which a key strictly between the neighbours exists; at that length, the middle of the keys of that length strictly between them, rounded down, the keys read as base-37 numbers over the alphabet; a middle ending in '-' moves one key down (to one ending in 'z'), or one up when it is the first such key",
+    "respace": "when no key fits, re-key the fewest neighbours around the insertion point in the same change set, the window balanced and its left side first, and never the whole collection",
+    "numberWidth": 8,
+    "rankDigits": 3,
+    "unnumberedPrefix": "z",
+    "unnumberedRankDigits": 5,
+    "titlePrefixMaxDigits": 3
+  },
+  "importance": {
+    "property": "okf:importance",
+    "min": 0,
+    "max": 100
+  },
+  "names": [
+    {
+      "name": "okf:about",
+      "of": "relation",
+      "from": ["Resource", "Collection"],
+      "to": ["Concept"],
+      "meaning": "What a document or a collection is about; made by people and later by a domain's steward, never by the import."
+    },
+    {
+      "name": "okf:related_to",
+      "of": "relation",
+      "from": ["Concept"],
+      "to": ["Concept"],
+      "meaning": "Two concepts that belong together; made by people and later by a domain's steward."
+    },
+    {
+      "name": "okf:links_to",
+      "of": "relation",
+      "from": ["Resource"],
+      "to": ["Resource", "Collection", "Concept"],
+      "meaning": "A document's link to another node; a predicated link keeps its predicate's text in okf:predicate."
+    },
+    {
+      "name": "okf:type",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a Concept, its kind of thing in the grammar (person, project, topic, ...); on a Resource, the frontmatter's type as written."
+    },
+    {
+      "name": "okf:importance",
+      "of": "property",
+      "on": "node",
+      "meaning": "An optional integer 0-100 that ranks search results and what an agent loads first; never decides order; never written by the import."
+    },
+    {
+      "name": "okf:directory",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a Collection, the id of the dir entry of its domain it is bound to, mirrored in kg_file_refs."
+    },
+    {
+      "name": "okf:integrity",
+      "of": "property",
+      "on": "node",
+      "meaning": "The file's trust family as the drive states it; untrusted for anything under the drive's untrusted globs."
+    },
+    {
+      "name": "okf:status",
+      "of": "property",
+      "on": "node",
+      "meaning": "The frontmatter's status (draft, stable, deprecated) as written."
+    },
+    {
+      "name": "okf:generated_at",
+      "of": "property",
+      "on": "node",
+      "meaning": "The frontmatter's generated.at text when it does not parse as a time."
+    },
+    {
+      "name": "okf:generated_by",
+      "of": "property",
+      "on": "node",
+      "meaning": "The frontmatter's generated.by as written; the event's actor stays the importing tool."
+    },
+    {
+      "name": "okf:verified",
+      "of": "property",
+      "on": "node",
+      "meaning": "The frontmatter's verified record as text; only a person's verify_assertion verifies a node."
+    },
+    {
+      "name": "okf:extra",
+      "of": "property",
+      "on": "node",
+      "meaning": "One map of every frontmatter key the profile does not name, each key as written to its value."
+    },
+    {
+      "name": "okf:bundle",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a Collection, the OKF bundle's name as the drive's config declares it."
+    },
+    {
+      "name": "okf:entry",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a bundle's Collection, the bundle's entry document as the config names it."
+    },
+    {
+      "name": "okf:index",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a bundle's Collection, the bundle's index file as the config names it."
+    },
+    {
+      "name": "okf:log",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a bundle's Collection, the bundle's log file as the config names it."
+    },
+    {
+      "name": "okf:listed",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a staging zone's Collection, the config's listing note: a snapshot, not an inventory."
+    },
+    {
+      "name": "okf:drive_okf_version",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a drive's Collection, the drive's own OKF version, never read as the profile's."
+    },
+    {
+      "name": "okf:no_index",
+      "of": "property",
+      "on": "node",
+      "meaning": "On a drive's Collection, the drive config's no_index list as written."
+    },
+    {
+      "name": "okf:profile_version",
+      "of": "property",
+      "on": "node",
+      "meaning": "On the domain's one root Collection, the profile version applied; written only by the profile tool."
+    },
+    {
+      "name": "okf:profile_nodes",
+      "of": "property",
+      "on": "node",
+      "meaning": "On the domain's root Collection, each profile name's Vocabulary node id; written only by the profile tool."
+    },
+    {
+      "name": "okf:summary",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved: a text of the node's own, longer than a description, as a typed reference to a content the node owns. Nothing writes it in this program."
+    },
+    {
+      "name": "okf:plan",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved provenance: the plan a generated text was written under. Nothing writes it in this program."
+    },
+    {
+      "name": "okf:model",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved provenance: the model that wrote a generated text. Nothing writes it in this program."
+    },
+    {
+      "name": "okf:prompt",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved provenance: the prompt a generated text was written from. Nothing writes it in this program."
+    },
+    {
+      "name": "okf:generator",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved provenance: the job or tool that wrote a generated text. Nothing writes it in this program."
+    },
+    {
+      "name": "okf:source_content_id",
+      "of": "property",
+      "on": "node",
+      "reservedFor": "model_text",
+      "meaning": "Reserved provenance: the source a generated text was written from; for a file, its (entry_id, revision). Nothing writes it in this program."
+    },
+    {
+      "name": "okf:predicate",
+      "of": "property",
+      "on": "edge",
+      "meaning": "On okf:links_to, a predicated link's predicate text as written."
+    },
+    {
+      "name": "okf:source_id",
+      "of": "property",
+      "on": "edge",
+      "meaning": "On a sources edge, the frontmatter source entry's id as written."
+    },
+    {
+      "name": "okf:source_title",
+      "of": "property",
+      "on": "edge",
+      "meaning": "On a sources edge, the frontmatter source entry's title as written."
+    },
+    {
+      "name": "okf:source_author",
+      "of": "property",
+      "on": "edge",
+      "meaning": "On a sources edge, the frontmatter source entry's author as written."
+    }
+  ],
+  "modelText": {
+    "summary": "okf:summary",
+    "provenance": ["okf:plan", "okf:model", "okf:prompt", "okf:generator", "okf:source_content_id"],
+    "noteProperty": null,
+    "note": "A node's note is a content the node owns that neither a reserved property nor its description_source_id references; the profile reserves no property for it.",
+    "rules": [
+      "A generated text is marked generated and is unverified until a person verifies it.",
+      "It is tied to the exact node revision or manifest content id it was made from, and is stale when that moves.",
+      "One domain's text goes only to that domain's configured provider, a local one for a local_only drive.",
+      "Nothing is taken from outside content (the drive's untrusted globs) or from a labelled file.",
+      "The not-instructions sentence comes before the content, and no tool is offered."
+    ]
+  }
+}

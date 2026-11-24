@@ -1,0 +1,424 @@
+{
+  "profile": "okf",
+  "version": 1,
+  "names": {
+    "accepted": [
+      "okf:x",
+      "a:b",
+      "neuradrive:topic_area",
+      "okf:a0_9",
+      "okf:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "refused": [
+      {
+        "name": "okf:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "why": "65 bytes"
+      },
+      {
+        "name": "okf:",
+        "why": "empty name"
+      },
+      {
+        "name": ":x",
+        "why": "empty namespace"
+      },
+      {
+        "name": "okf",
+        "why": "no namespace"
+      },
+      {
+        "name": "title",
+        "why": "no namespace; a structural field"
+      },
+      {
+        "name": "order_key",
+        "why": "KG1's own key, exempt from the grammar, never a profile name"
+      },
+      {
+        "name": "Okf:x",
+        "why": "upper case"
+      },
+      {
+        "name": "okf:Unknown",
+        "why": "upper case"
+      },
+      {
+        "name": "okf:źródło",
+        "why": "not ASCII"
+      },
+      {
+        "name": "okf:cytuje-to",
+        "why": "a dash"
+      },
+      {
+        "name": "okf:1x",
+        "why": "starts with a digit"
+      },
+      {
+        "name": "okf:_x",
+        "why": "starts with an underscore"
+      },
+      {
+        "name": "okf:x:y",
+        "why": "a second colon"
+      },
+      {
+        "name": "okf:a b",
+        "why": "a space"
+      },
+      {
+        "name": "Topic Thing",
+        "why": "outside the grammar"
+      },
+      {
+        "name": "Concept",
+        "why": "a reserved kind"
+      }
+    ],
+    "shadowsReserved": [
+      "Concept",
+      "Vocabulary",
+      "contains",
+      "HAS_TAG",
+      "id",
+      "title",
+      "description",
+      "description_source_id",
+      "from_id",
+      "type",
+      "text",
+      "status",
+      "generated_at",
+      "$definition",
+      "$assertion",
+      "$locator"
+    ],
+    "modelText": {
+      "summary": "okf:summary",
+      "provenance": [
+        "okf:plan",
+        "okf:model",
+        "okf:prompt",
+        "okf:generator",
+        "okf:source_content_id"
+      ]
+    }
+  },
+  "orderKeys": {
+    "accepted": [
+      "0",
+      "-h",
+      "00000080-001",
+      "z00001",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+    ],
+    "refused": [
+      {
+        "key": "",
+        "why": "empty"
+      },
+      {
+        "key": "a-",
+        "why": "ends in '-'"
+      },
+      {
+        "key": "A",
+        "why": "outside the alphabet"
+      },
+      {
+        "key": "a_b",
+        "why": "outside the alphabet"
+      },
+      {
+        "key": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "why": "65 characters"
+      }
+    ]
+  },
+  "between": [
+    {
+      "lo": "00000000",
+      "hi": "00000010",
+      "key": "0000001"
+    },
+    {
+      "lo": null,
+      "hi": "00000000",
+      "key": "0"
+    },
+    {
+      "lo": "z00003",
+      "hi": null,
+      "key": "zi"
+    },
+    {
+      "lo": null,
+      "hi": null,
+      "key": "h"
+    },
+    {
+      "lo": "a",
+      "hi": "b",
+      "key": "ah"
+    },
+    {
+      "lo": "a",
+      "hi": "a0",
+      "key": "a-h"
+    },
+    {
+      "lo": "a",
+      "hi": "a1",
+      "key": "a0"
+    },
+    {
+      "lo": "a-1",
+      "hi": "a0",
+      "key": "a-i"
+    },
+    {
+      "lo": "00000080",
+      "hi": "00000080-001",
+      "key": "00000080-0"
+    },
+    {
+      "lo": "00000080",
+      "hi": "00000080",
+      "key": null
+    },
+    {
+      "lo": "b",
+      "hi": "a",
+      "key": null
+    },
+    {
+      "lo": "a-",
+      "hi": null,
+      "key": null
+    }
+  ],
+  "insertAt": [
+    {
+      "case": "equal keys left by two writers: the next insert between them re-keys one",
+      "siblings": ["00000080", "00000080"],
+      "at": 1,
+      "key": "0",
+      "rekeyed": [[0, "-h"]]
+    },
+    {
+      "case": "a key fits: nothing re-keyed",
+      "siblings": ["00000000", "00000010"],
+      "at": 1,
+      "key": "0000001",
+      "rekeyed": []
+    }
+  ],
+  "repeatedInsertion": [
+    {
+      "case": "insert again and again right after the first member",
+      "siblings": ["00000000", "00000010"],
+      "place": "afterFirst",
+      "insertsWithoutRekey": 230,
+      "then": {
+        "key": "0",
+        "rekeyed": [[0, "-h"]]
+      }
+    },
+    {
+      "case": "insert again and again right before the last member",
+      "siblings": ["00000000", "00000010"],
+      "place": "beforeLast",
+      "insertsWithoutRekey": 337,
+      "then": {
+        "key": "9",
+        "rekeyed": [[338, "i"]]
+      }
+    }
+  ],
+  "seed": [
+    {
+      "case": "a shared prefix ranks in name order",
+      "names": ["80-b", "80-a"],
+      "keys": ["00000080-002", "00000080-001"]
+    },
+    {
+      "case": "tgdrive's top level",
+      "names": [
+        "00-inbox",
+        "10-notes",
+        "20-records",
+        "30-work",
+        "40-media",
+        "50-library",
+        "60-sessions",
+        "70-comms",
+        "80-agents",
+        "80-tasks",
+        "90-archive",
+        "99-temp"
+      ],
+      "keys": [
+        "00000000",
+        "00000010",
+        "00000020",
+        "00000030",
+        "00000040",
+        "00000050",
+        "00000060",
+        "00000070",
+        "00000080-001",
+        "00000080-002",
+        "00000090",
+        "00000099"
+      ],
+      "titles": [
+        "inbox",
+        "notes",
+        "records",
+        "work",
+        "media",
+        "library",
+        "sessions",
+        "comms",
+        "agents",
+        "tasks",
+        "archive",
+        "temp"
+      ]
+    },
+    {
+      "case": "a year and a date keep their titles",
+      "names": ["2024 trip", "2024-11-03 trip", "10-notes"],
+      "keys": ["00002024", "20241103", "00000010"],
+      "titles": ["2024 trip", "2024-11-03 trip", "notes"]
+    },
+    {
+      "case": "years, three spellings of one date ranked in name order, long runs and names without a number",
+      "names": [
+        "2024 trip",
+        "2024-11-03 trip",
+        "2024_11_03",
+        "2024.11.03.x",
+        "123456789 x",
+        "readme",
+        "alpha"
+      ],
+      "keys": [
+        "00002024",
+        "20241103-001",
+        "20241103-003",
+        "20241103-002",
+        "z00001",
+        "z00003",
+        "z00002"
+      ],
+      "titles": [
+        "2024 trip",
+        "2024-11-03 trip",
+        "2024_11_03",
+        "2024.11.03.x",
+        "123456789 x",
+        "readme",
+        "alpha"
+      ]
+    }
+  ],
+  "later": [
+    {
+      "case": "a later 80-0 beside 80-a and 80-b",
+      "name": "80-0",
+      "siblings": ["00000080-001", "00000080-002"],
+      "key": "00000080-003"
+    },
+    {
+      "case": "a later 80-x beside a lone 80",
+      "name": "80-x",
+      "siblings": ["00000080"],
+      "key": "00000080-001"
+    },
+    {
+      "case": "a later sibling with a longer prefix",
+      "name": "100-x",
+      "siblings": ["00000010", "00000020"],
+      "key": "00000100"
+    },
+    {
+      "case": "a new number",
+      "name": "15-y",
+      "siblings": ["00000010", "00000020"],
+      "key": "00000015"
+    },
+    {
+      "case": "no number, after the last",
+      "name": "new",
+      "siblings": ["00000010", "z00002"],
+      "key": "zi"
+    },
+    {
+      "case": "no number, empty collection",
+      "name": "new",
+      "siblings": [],
+      "key": "z00001"
+    }
+  ],
+  "titles": [
+    {
+      "name": "10-notes",
+      "member": "folder",
+      "config": null,
+      "title": "notes"
+    },
+    {
+      "name": "00-inbox",
+      "member": "folder",
+      "config": null,
+      "title": "inbox"
+    },
+    {
+      "name": "999-x",
+      "member": "folder",
+      "config": null,
+      "title": "x"
+    },
+    {
+      "name": "1000-x",
+      "member": "folder",
+      "config": null,
+      "title": "1000-x"
+    },
+    {
+      "name": "10-",
+      "member": "folder",
+      "config": null,
+      "title": "10-"
+    },
+    {
+      "name": "2024 trip",
+      "member": "folder",
+      "config": null,
+      "title": "2024 trip"
+    },
+    {
+      "name": "2024-11-03 trip",
+      "member": "folder",
+      "config": null,
+      "title": "2024-11-03 trip"
+    },
+    {
+      "name": "10-plan.md",
+      "member": "document",
+      "config": null,
+      "title": "10-plan.md"
+    },
+    {
+      "name": "30-work",
+      "member": "folder",
+      "config": "Work and clients",
+      "title": "Work and clients"
+    }
+  ],
+  "importance": {
+    "accepted": [0, 1, 50, 100],
+    "refused": [-1, 101, 1.5, "50", null, true]
+  }
+}

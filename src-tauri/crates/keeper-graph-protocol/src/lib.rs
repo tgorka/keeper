@@ -10,7 +10,8 @@
 //! ([`delta`]), the scope and key values of the graph tables ([`scope`]),
 //! the reads' shapes ([`wire`]), the closed query profile `KG-Cypher/1`
 //! ([`profile`]) and the frames a native consumer exchanges with its
-//! separate graph worker ([`worker`]), and a tag's canonical text ([`tag`]).
+//! separate graph worker ([`worker`]), a tag's canonical text ([`tag`]),
+//! and the `okf` profile's names, order keys and number rule ([`okf`]).
 //! `syncular/knowledge-graph.vectors.json` pins every rule here; keeper-hq's
 //! TypeScript validator reproduces the same vectors.
 //!
@@ -26,6 +27,7 @@ pub mod delta;
 pub mod file_ref;
 pub mod inverse;
 pub mod locator;
+pub mod okf;
 pub mod profile;
 pub mod proposal;
 pub mod request;
