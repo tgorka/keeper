@@ -2186,4 +2186,66 @@ mod tests {
             std::fs::write(docs_path(), render_docs()).expect("write docs/settings-keys.md");
         }
     }
+
+    /// `syncular/settings.travel.json`: every registry entry's travel class
+    /// and layer rule, the data the agents server refuses a settings record
+    /// by (story 121.1). Generated from [`KEYS`] and
+    /// [`settings_sync::synced_file_of`], pinned here like the docs table.
+    mod travel {
+        use super::*;
+
+        const REGENERATE: &str = "Regenerate it with `cargo test -p keeper-core --lib \
+             config::keys::tests::travel::regenerate -- --ignored`";
+
+        fn travel_path() -> std::path::PathBuf {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../syncular/settings.travel.json")
+        }
+
+        fn render_travel() -> String {
+            let keys: Vec<serde_json::Value> = KEYS
+                .iter()
+                .map(|spec| {
+                    let class = match settings_sync::synced_file_of(spec) {
+                        Some(SyncedFile::Shared) => "every_device",
+                        Some(SyncedFile::Device) => "this_device",
+                        None => "never",
+                    };
+                    let settable = match spec.settable {
+                        Settable::AnyLayer => "any_layer",
+                        Settable::MachineFileOnly(_) => "machine_file",
+                        Settable::Never(_) => "never",
+                    };
+                    serde_json::json!({
+                        "key": spec.key,
+                        "family": spec.family,
+                        "class": class,
+                        "settable": settable,
+                    })
+                })
+                .collect();
+            let mut out = serde_json::to_string_pretty(&serde_json::json!({ "keys": keys }))
+                .expect("travel JSON");
+            out.push('\n');
+            out
+        }
+
+        #[test]
+        fn the_checked_in_travel_file_matches_the_registry() {
+            let checked_in = std::fs::read_to_string(travel_path())
+                .unwrap_or_else(|_| panic!("syncular/settings.travel.json exists. {REGENERATE}"));
+            assert_eq!(
+                checked_in,
+                render_travel(),
+                "syncular/settings.travel.json is stale. {REGENERATE}"
+            );
+        }
+
+        #[test]
+        #[ignore = "generator, not a check: rewrites syncular/settings.travel.json"]
+        fn regenerate() {
+            std::fs::write(travel_path(), render_travel())
+                .expect("write syncular/settings.travel.json");
+        }
+    }
 }

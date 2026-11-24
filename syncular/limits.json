@@ -4,5 +4,6 @@
   "filePartBytes": 67108864,
   "graphMaxEvents": 100000,
   "graphMaxEntities": 1000000,
-  "graphExportMaxBytes": 1073741824
+  "graphExportMaxBytes": 1073741824,
+  "settingValueMaxBytes": 16384
 }

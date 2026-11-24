@@ -1,0 +1,18 @@
+[package]
+name = "keeper-settings-api"
+description = "The settings contract: travel classes, record keys, who may write a person's settings and a domain's shared configuration"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Types and pure rules only: no storage, transport, Syncular, SQLite, Tauri or
+# keeper-core. `bun run check:module-edges` holds it to the contract role.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }

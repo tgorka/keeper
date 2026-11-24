@@ -1,0 +1,2079 @@
+{
+  "$comment": "Shared contract vectors for keeper-settings-api and keeper-hq settings/config decision rules.",
+  "refusals": [
+    "settings.writer_refused",
+    "settings.not_owner",
+    "settings.not_this_device",
+    "settings.binding_changed",
+    "settings.unknown_key",
+    "settings.never_leaves",
+    "settings.wrong_class",
+    "settings.credential_value",
+    "settings.value_too_large",
+    "settings.blob_too_large",
+    "settings.malformed",
+    "settings.scope_refused",
+    "settings.adoption_refused",
+    "config.writer_refused",
+    "config.names_domain",
+    "config.malformed"
+  ],
+  "credentialPatterns": [
+    {
+      "name": "private_key",
+      "regex": "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    },
+    {
+      "name": "matrix_token",
+      "regex": "\\bsyt_[A-Za-z0-9_\\-]{16,}"
+    },
+    {
+      "name": "anthropic_key",
+      "regex": "\\bsk-ant-[A-Za-z0-9_\\-]{20,}"
+    },
+    {
+      "name": "openai_key",
+      "regex": "\\bsk-[A-Za-z0-9_\\-]{20,}"
+    },
+    {
+      "name": "github_token",
+      "regex": "\\b(?:ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})"
+    },
+    {
+      "name": "aws_access_key",
+      "regex": "\\bAKIA[0-9A-Z]{16}\\b"
+    },
+    {
+      "name": "slack_token",
+      "regex": "\\bxox[bp]-[A-Za-z0-9\\-]{10,}"
+    },
+    {
+      "name": "jwt",
+      "regex": "\\beyJ[A-Za-z0-9_\\-]{8,}\\.[A-Za-z0-9_\\-]{8,}\\.[A-Za-z0-9_\\-]{8,}"
+    },
+    {
+      "name": "posthog_key",
+      "regex": "\\bph[xc]_[A-Za-z0-9]{20,}"
+    },
+    {
+      "name": "bearer",
+      "regex": "\\b[Bb]earer [A-Za-z0-9._~+/\\-]{16,}=*"
+    },
+    {
+      "name": "url_password",
+      "regex": "[a-z][a-z0-9+.\\-]*://[^/\\s:@]+:[^/\\s@]+@"
+    }
+  ],
+  "credentialChoices": ["account", "own", "none"],
+  "limits": {
+    "settingValueMaxBytes": 16384,
+    "attachmentMaxBytes": 26214400
+  },
+  "ids": [
+    {
+      "name": "person record id",
+      "id": "*/debug.mode",
+      "device": "*",
+      "key": "debug.mode",
+      "refusal": null
+    },
+    {
+      "name": "device record id",
+      "id": "01JD3Q8Z5X0000000000000001/sdk_encryption",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "sdk_encryption",
+      "refusal": null
+    },
+    {
+      "name": "device record id with slashes in drive reference",
+      "id": "01JD3Q8Z5X0000000000000001/roles:drive:https://git.example.org/ana/notes#main",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "roles:drive:https://git.example.org/ana/notes#main",
+      "refusal": null
+    },
+    {
+      "name": "missing slash",
+      "id": "debug.mode",
+      "device": null,
+      "key": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "empty device",
+      "id": "/debug.mode",
+      "device": null,
+      "key": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "empty key",
+      "id": "*/",
+      "device": null,
+      "key": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "empty id",
+      "id": "",
+      "device": null,
+      "key": null,
+      "refusal": "settings.malformed"
+    }
+  ],
+  "keys": [
+    {
+      "name": "every_device preference under person",
+      "device": "*",
+      "key": "debug.mode",
+      "record": {
+        "kind": "preference",
+        "key": "debug.mode"
+      },
+      "refusal": null
+    },
+    {
+      "name": "every_device preference under device refused",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "debug.mode",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "this_device preference under device",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "sdk_encryption",
+      "record": {
+        "kind": "preference",
+        "key": "sdk_encryption"
+      },
+      "refusal": null
+    },
+    {
+      "name": "this_device preference under person refused",
+      "device": "*",
+      "key": "sdk_encryption",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "this_device family preference under device",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "record": {
+        "kind": "preference",
+        "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes"
+      },
+      "refusal": null
+    },
+    {
+      "name": "never-leaves exact key refused",
+      "device": "*",
+      "key": "device.name",
+      "record": null,
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "never-leaves account family refused",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "account.01ABC.restored",
+      "record": null,
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "never-leaves notes.read family refused",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "notes.read.x",
+      "record": null,
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "bare family prefix is unknown key",
+      "device": "*",
+      "key": "account.",
+      "record": null,
+      "refusal": "settings.unknown_key"
+    },
+    {
+      "name": "unknown preference key",
+      "device": "*",
+      "key": "nope.nothing",
+      "record": null,
+      "refusal": "settings.unknown_key"
+    },
+    {
+      "name": "pin of any_layer key under person",
+      "device": "*",
+      "key": "pin:notify.dnd_global",
+      "record": {
+        "kind": "pin",
+        "key": "notify.dnd_global"
+      },
+      "refusal": null
+    },
+    {
+      "name": "pin of any_layer key under device",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "pin:notify.dnd_global",
+      "record": {
+        "kind": "pin",
+        "key": "notify.dnd_global"
+      },
+      "refusal": null
+    },
+    {
+      "name": "pin of machine_file key under person refused",
+      "device": "*",
+      "key": "pin:sync.drive_folder",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "pin of machine_file key under device",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "pin:sync.drive_folder",
+      "record": {
+        "kind": "pin",
+        "key": "sync.drive_folder"
+      },
+      "refusal": null
+    },
+    {
+      "name": "pin of never-settable key under device refused",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "pin:voice.wake_enabled",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "pin of unknown key refused",
+      "device": "*",
+      "key": "pin:nope.nothing",
+      "record": null,
+      "refusal": "settings.unknown_key"
+    },
+    {
+      "name": "pin with empty target malformed",
+      "device": "*",
+      "key": "pin:",
+      "record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "offer drive under person",
+      "device": "*",
+      "key": "offer:drive:drive:https://git.example.org/ana/notes#main^notes",
+      "record": {
+        "kind": "offer",
+        "offer_kind": "drive",
+        "reference": "drive:https://git.example.org/ana/notes#main^notes"
+      },
+      "refusal": null
+    },
+    {
+      "name": "offer provider under person",
+      "device": "*",
+      "key": "offer:provider:anthropic",
+      "record": {
+        "kind": "offer",
+        "offer_kind": "provider",
+        "reference": "anthropic"
+      },
+      "refusal": null
+    },
+    {
+      "name": "offer matrix under person",
+      "device": "*",
+      "key": "offer:matrix:@ana:example.org",
+      "record": {
+        "kind": "offer",
+        "offer_kind": "matrix",
+        "reference": "@ana:example.org"
+      },
+      "refusal": null
+    },
+    {
+      "name": "offer under device refused",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "offer:provider:x",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "offer with unknown kind malformed",
+      "device": "*",
+      "key": "offer:email:ana@example.org",
+      "record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "offer with empty rest malformed",
+      "device": "*",
+      "key": "offer:drive:",
+      "record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "drive roles under device",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "roles:drive:https://git.example.org/ana/notes#main",
+      "record": {
+        "kind": "drive_roles",
+        "reference": "drive:https://git.example.org/ana/notes#main"
+      },
+      "refusal": null
+    },
+    {
+      "name": "drive roles under person refused",
+      "device": "*",
+      "key": "roles:drive:https://git.example.org/ana/notes#main",
+      "record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "drive roles without drive prefix malformed",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "roles:notdrive:foo",
+      "record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "drive roles with empty drive ref malformed",
+      "device": "01JD3Q8Z5X0000000000000001",
+      "key": "roles:drive:",
+      "record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "empty key malformed",
+      "device": "*",
+      "key": "",
+      "record": null,
+      "refusal": "settings.malformed"
+    }
+  ],
+  "credentials": [
+    {
+      "name": "refuse private_key pattern",
+      "key": "debug.mode",
+      "value": "-----BEGIN RSA PRIVATE KEY-----\nMIIEfakefakefake",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse matrix_token pattern",
+      "key": "debug.mode",
+      "value": "syt_fakeMatrixToken0123456789",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse anthropic_key pattern",
+      "key": "debug.mode",
+      "value": "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse openai_key pattern",
+      "key": "debug.mode",
+      "value": "sk-fakeOpenAiKey0123456789abcd",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse github_token pattern",
+      "key": "debug.mode",
+      "value": "ghp_FakeGitHubToken0123456789abcdefghijk",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse aws_access_key pattern",
+      "key": "debug.mode",
+      "value": "AKIAIOSFODNN7EXAMPLE",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse slack_token pattern",
+      "key": "debug.mode",
+      "value": "xoxb-0000000000-fake-slack-token",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse jwt pattern",
+      "key": "debug.mode",
+      "value": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.fakeSignature012345",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse posthog_key pattern",
+      "key": "debug.mode",
+      "value": "phc_FakePostHogKey0123456789abcdef",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse bearer pattern",
+      "key": "debug.mode",
+      "value": "Bearer fakeBearerToken0123456789==",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse url_password pattern",
+      "key": "push.gateway_url",
+      "value": "https://ana:supersecret@git.example.org/ana/notes",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "accept look-alike sk-short",
+      "key": "debug.mode",
+      "value": "sk-short",
+      "refusal": null
+    },
+    {
+      "name": "accept look-alike task-abcdefghijklmnopqrstuvwxyz",
+      "key": "debug.mode",
+      "value": "task-abcdefghijklmnopqrstuvwxyz",
+      "refusal": null
+    },
+    {
+      "name": "accept look-alike url without password",
+      "key": "push.gateway_url",
+      "value": "https://git.example.org/ana/notes",
+      "refusal": null
+    },
+    {
+      "name": "accept look-alike short bearer",
+      "key": "debug.mode",
+      "value": "Bearer short",
+      "refusal": null
+    },
+    {
+      "name": "accept credential family choice account",
+      "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "value": "account",
+      "refusal": null
+    },
+    {
+      "name": "accept credential family choice own",
+      "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "value": "own",
+      "refusal": null
+    },
+    {
+      "name": "accept credential family choice none",
+      "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "value": "none",
+      "refusal": null
+    },
+    {
+      "name": "refuse credential family non-choice value",
+      "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "value": "forge:src1",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "accept bots provider credential family choice account",
+      "key": "bots.provider_credential_source.anthropic",
+      "value": "account",
+      "refusal": null
+    },
+    {
+      "name": "refuse bots provider credential family non-choice value",
+      "key": "bots.provider_credential_source.anthropic",
+      "value": "custom:tok",
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "refuse pinned credential family non-choice value",
+      "key": "pin:sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+      "value": "forge:src1",
+      "refusal": "settings.credential_value"
+    }
+  ],
+  "valueWrites": [
+    {
+      "name": "client bound to D1 cannot write D2 record",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000002/sdk_encryption",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000002",
+        "key": "sdk_encryption",
+        "value": "on",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_phone"
+      },
+      "refusal": "settings.not_this_device"
+    },
+    {
+      "name": "device-keyed write without device record refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sdk_encryption",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sdk_encryption",
+        "value": "on",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.not_this_device"
+    },
+    {
+      "name": "ana writes person-level debug.mode",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "agent writer refused",
+      "writer": {
+        "kind": "agent",
+        "actor": "@agent-nixie:example.org",
+        "client": "cli_agent_nixie"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.writer_refused"
+    },
+    {
+      "name": "tool writer refused",
+      "writer": {
+        "kind": "tool",
+        "actor": "@ana:example.org",
+        "client": "cli_tool_1"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.writer_refused"
+    },
+    {
+      "name": "service writer refused",
+      "writer": {
+        "kind": "service",
+        "actor": "@ana:example.org",
+        "client": "cli_service_1"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.writer_refused"
+    },
+    {
+      "name": "bo writing ana row refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@bo:example.org",
+        "client": "cli_bo_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.not_owner"
+    },
+    {
+      "name": "ana writing row owned by bo refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@bo:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.not_owner"
+    },
+    {
+      "name": "ana writing in general domain makidrive refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "general",
+        "owner_actor": null
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.not_owner"
+    },
+    {
+      "name": "never-leaves device.name refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/device.name",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "device.name",
+        "value": "ana-mac",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "never-leaves account family refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/account.01ABC.restored",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "account.01ABC.restored",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "never-leaves notes.read family refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/notes.read.x",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "notes.read.x",
+        "value": "rev-1",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.never_leaves"
+    },
+    {
+      "name": "this_device sdk_encryption under person refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/sdk_encryption",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "sdk_encryption",
+        "value": "on",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "this_device sdk_encryption under D1 accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sdk_encryption",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sdk_encryption",
+        "value": "on",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "every_device notes.embedding_model under person accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/notes.embedding_model",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "notes.embedding_model",
+        "value": "{\"provider\":\"local\"}",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "every_device push.gateway_url under person accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/push.gateway_url",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "push.gateway_url",
+        "value": "https://push.example.org/_matrix/push/v1/notify",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "this_device voice.wake_enabled under D1 accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/voice.wake_enabled",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "voice.wake_enabled",
+        "value": "0",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "unknown key nope.nothing refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/nope.nothing",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "nope.nothing",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.unknown_key"
+    },
+    {
+      "name": "credential-shaped anthropic value refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "sync.credential_source account accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "value": "account",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "sync.credential_source own accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "value": "own",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "sync.credential_source forge:src1 refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "value": "forge:src1",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "value of 16385 ASCII bytes refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.value_too_large"
+    },
+    {
+      "name": "value of 16384 ASCII bytes accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "value_blob true with null value accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/notes.embedding_model",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "notes.embedding_model",
+        "value": null,
+        "value_blob": true
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "value null and value_blob false refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": null,
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "value present and value_blob true refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": "1",
+        "value_blob": true
+      },
+      "device_record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "id and key mismatch refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "push.gateway_url",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "delete of person debug.mode with null value accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "delete",
+      "row": {
+        "id": "*/debug.mode",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "debug.mode",
+        "value": null,
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "pin of any_layer notify.dnd_global under person accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/pin:notify.dnd_global",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "pin:notify.dnd_global",
+        "value": "1",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "pin of machine_file sync.drive_folder under person refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/pin:sync.drive_folder",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "pin:sync.drive_folder",
+        "value": "/tmp/drive",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "pin of machine_file sync.drive_folder under D1 accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/pin:sync.drive_folder",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "pin:sync.drive_folder",
+        "value": "/tmp/drive",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "offer drive under person accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/offer:drive:drive:https://git.example.org/ana/notes#main^notes",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "offer:drive:drive:https://git.example.org/ana/notes#main^notes",
+        "value": "{\"offered\":true}",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": null
+    },
+    {
+      "name": "offer provider under D1 refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/offer:provider:x",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "offer:provider:x",
+        "value": "{\"offered\":true}",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.wrong_class"
+    },
+    {
+      "name": "drive roles under D1 accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/roles:drive:https://git.example.org/ana/notes#main",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "roles:drive:https://git.example.org/ana/notes#main",
+        "value": "[\"notes\"]",
+        "value_blob": false
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "drive roles under person refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "*/roles:drive:https://git.example.org/ana/notes#main",
+        "owner_actor": "@ana:example.org",
+        "device": "*",
+        "key": "roles:drive:https://git.example.org/ana/notes#main",
+        "value": "[\"notes\"]",
+        "value_blob": false
+      },
+      "device_record": null,
+      "refusal": "settings.wrong_class"
+    }
+  ],
+  "deviceWrites": [
+    {
+      "name": "create device by own client accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": null,
+      "refusal": null
+    },
+    {
+      "name": "create device naming another client_id refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_phone",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": null,
+      "refusal": "settings.not_this_device"
+    },
+    {
+      "name": "update device by bound client accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "update device by other client refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000002",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_phone",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_phone"
+      },
+      "refusal": "settings.not_this_device"
+    },
+    {
+      "name": "update changing client_id refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac2",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.binding_changed"
+    },
+    {
+      "name": "delete missing device record refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "delete",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": null,
+      "refusal": "settings.not_this_device"
+    },
+    {
+      "name": "delete device by bound client accepted",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "delete",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": null
+    },
+    {
+      "name": "bad machine fingerprint refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "ABC"
+      },
+      "stored": null,
+      "refusal": "settings.malformed"
+    },
+    {
+      "name": "agent device write refused",
+      "writer": {
+        "kind": "agent",
+        "actor": "@agent-nixie:example.org",
+        "client": "cli_agent_nixie"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": null,
+      "refusal": "settings.writer_refused"
+    },
+    {
+      "name": "bo writing ana device refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@bo:example.org",
+        "client": "cli_bo_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "device_id": "01JD3Q8Z5X0000000000000001",
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "stored": null,
+      "refusal": "settings.not_owner"
+    }
+  ],
+  "adoptions": [
+    {
+      "name": "same fingerprint class and platform adopts",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 0
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "refusal": null
+    },
+    {
+      "name": "second mac with different fingerprint refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 60
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "refusal": "settings.adoption_refused"
+    },
+    {
+      "name": "no fingerprint and untouched 30 days adopts",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": null,
+        "untouched_days": 30
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "refusal": null
+    },
+    {
+      "name": "no fingerprint and untouched 29 days refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": null,
+        "untouched_days": 29
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      },
+      "refusal": "settings.adoption_refused"
+    },
+    {
+      "name": "device class mismatch refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 0
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "phone",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "refusal": "settings.adoption_refused"
+    },
+    {
+      "name": "platform mismatch refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 0
+      },
+      "claim": {
+        "actor": "@ana:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "linux",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "refusal": "settings.adoption_refused"
+    },
+    {
+      "name": "bo claiming ana device refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 0
+      },
+      "claim": {
+        "actor": "@bo:example.org",
+        "writer_kind": "person",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "refusal": "settings.not_owner"
+    },
+    {
+      "name": "agent claiming device refused",
+      "record": {
+        "owner_actor": "@ana:example.org",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "untouched_days": 0
+      },
+      "claim": {
+        "actor": "@agent-nixie:example.org",
+        "writer_kind": "agent",
+        "device_class": "desktop",
+        "platform": "macos",
+        "machine": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "refusal": "settings.writer_refused"
+    }
+  ],
+  "scopes": [
+    {
+      "name": "ana in personal domain anadrive gets own actor",
+      "caller": "person",
+      "actor": "@ana:example.org",
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "allowed": ["@ana:example.org"],
+      "refusal": null
+    },
+    {
+      "name": "ana in general domain makidrive gets empty",
+      "caller": "person",
+      "actor": "@ana:example.org",
+      "domain": {
+        "kind": "general",
+        "owner_actor": null
+      },
+      "allowed": [],
+      "refusal": null
+    },
+    {
+      "name": "bo in ana personal domain anadrive gets empty",
+      "caller": "person",
+      "actor": "@bo:example.org",
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "allowed": [],
+      "refusal": null
+    },
+    {
+      "name": "agent in personal domain refused",
+      "caller": "agent",
+      "actor": "@agent-nixie:example.org",
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "allowed": null,
+      "refusal": "settings.scope_refused"
+    },
+    {
+      "name": "tool in personal domain refused",
+      "caller": "tool",
+      "actor": "@ana:example.org",
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "allowed": null,
+      "refusal": "settings.scope_refused"
+    },
+    {
+      "name": "service in personal domain gets empty (G11)",
+      "caller": "service",
+      "actor": "@ana:example.org",
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "allowed": [],
+      "refusal": null
+    }
+  ],
+  "configWrites": [
+    {
+      "name": "makidrive admin writes template/settings.toml",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "[debug]\nmode = false\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": null
+    },
+    {
+      "name": "makidrive person owner refused",
+      "writer": {
+        "kind": "person",
+        "role": "owner"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "[debug]\nmode = false\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "makidrive agent refused",
+      "writer": {
+        "kind": "agent"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "makidrive tool refused",
+      "writer": {
+        "kind": "tool"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "makidrive service refused",
+      "writer": {
+        "kind": "service"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "teamdrive person owner writes test/domain-setting",
+      "writer": {
+        "kind": "person",
+        "role": "owner"
+      },
+      "domain_kind": "group",
+      "key": "test/domain-setting",
+      "value": "enabled = true",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": null
+    },
+    {
+      "name": "teamdrive person reader refused",
+      "writer": {
+        "kind": "person",
+        "role": "reader"
+      },
+      "domain_kind": "group",
+      "key": "test/domain-setting",
+      "value": "enabled = true",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "teamdrive person editor refused",
+      "writer": {
+        "kind": "person",
+        "role": "editor"
+      },
+      "domain_kind": "group",
+      "key": "test/domain-setting",
+      "value": "enabled = true",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "teamdrive agent refused",
+      "writer": {
+        "kind": "agent"
+      },
+      "domain_kind": "group",
+      "key": "test/domain-setting",
+      "value": "enabled = true",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "admin key naming anadrive refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/anadrive.toml",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.names_domain"
+    },
+    {
+      "name": "value naming teamdrive in drive ref refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "drive:https://git.example.org/tg/teamdrive#main",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.names_domain"
+    },
+    {
+      "name": "value naming MAKIDRIVE case-insensitively refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "MAKIDRIVE",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.names_domain"
+    },
+    {
+      "name": "hyphenated token tgdrive-light does not match tgdrive",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "tgdrive-light",
+      "domains": ["anadrive", "makidrive", "teamdrive", "tgdrive"],
+      "refusal": null
+    },
+    {
+      "name": "uppercase key Template/X malformed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "Template/X",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "double slash key a//b malformed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "a//b",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "parent traversal key ../x malformed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "../x",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "config value over 16384 bytes malformed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "template/settings.toml",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    }
+  ],
+  "templateKeys": [
+    {
+      "name": "keeper.toml",
+      "path": "keeper.toml",
+      "key": "template/keeper.toml",
+      "refusal": null
+    },
+    {
+      "name": "settings.toml",
+      "path": "settings.toml",
+      "key": "template/settings.toml",
+      "refusal": null
+    },
+    {
+      "name": "class/desktop.toml",
+      "path": "class/desktop.toml",
+      "key": "template/class/desktop.toml",
+      "refusal": null
+    },
+    {
+      "name": "settings/desktop.toml",
+      "path": "settings/desktop.toml",
+      "key": "template/settings/desktop.toml",
+      "refusal": null
+    },
+    {
+      "name": "parent traversal ../etc refused",
+      "path": "../etc",
+      "key": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "empty relative path refused",
+      "path": "",
+      "key": null,
+      "refusal": "config.malformed"
+    }
+  ],
+  "blobReads": [
+    {
+      "name": "ana reads own blob",
+      "owner_actor": "@ana:example.org",
+      "reader": {
+        "kind": "person",
+        "actor": "@ana:example.org"
+      },
+      "answer": "granted"
+    },
+    {
+      "name": "bo reading ana blob gets absent",
+      "owner_actor": "@ana:example.org",
+      "reader": {
+        "kind": "person",
+        "actor": "@bo:example.org"
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "agent reading ana blob gets absent",
+      "owner_actor": "@ana:example.org",
+      "reader": {
+        "kind": "agent",
+        "actor": "@agent-nixie:example.org"
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "tool reading ana blob gets absent",
+      "owner_actor": "@ana:example.org",
+      "reader": {
+        "kind": "tool",
+        "actor": "@ana:example.org"
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "service reading ana blob gets absent",
+      "owner_actor": "@ana:example.org",
+      "reader": {
+        "kind": "service",
+        "actor": "@ana:example.org"
+      },
+      "answer": "absent"
+    }
+  ],
+  "blobUploads": [
+    {
+      "name": "exact attachmentMaxBytes accepted",
+      "size": 26214400,
+      "refusal": null
+    },
+    {
+      "name": "one byte over attachmentMaxBytes refused",
+      "size": 26214401,
+      "refusal": "settings.blob_too_large"
+    }
+  ]
+}
