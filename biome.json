@@ -27,7 +27,8 @@
       "!src-tauri/crates/keeper-core/tests/fixtures/agents/sessions/**/log/blobs",
       "!tools/matrix-sdk-sqlite",
       "!tools/syncular-client",
-      "!src-tauri/crates/keeper-ported/tests/fixtures/okf"
+      "!src-tauri/crates/keeper-ported/tests/fixtures/okf",
+      "!catalogue/snapshot.json"
     ]
   },
   "formatter": {

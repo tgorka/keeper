@@ -16,10 +16,18 @@ workspace = true
 
 # The one `human-reads` enabler of the workspace (`scripts/check-graph-boundary.py`).
 # keeper-syncd's conventions (`--json`, one stdout writer, exit codes 0-4) are
-# followed here without depending on it.
+# followed here without depending on it. A composition root (story 123.2): it
+# lists the `app` and `graph` modules and reaches every graph verb through
+# keeper-runtime's local dispatcher, by id.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-keeper-graph = { path = "../keeper-graph", features = ["human-reads"] }
+keeper-graph = { path = "../keeper-graph", features = ["human-reads", "module"] }
+keeper-graph-api = { path = "../keeper-graph-api" }
+keeper-runtime = { path = "../keeper-runtime" }
+keeper-runtime-api = { path = "../keeper-runtime-api" }
+keeper-app-api = { path = "../keeper-app-api" }
 keeper-ports = { path = "../keeper-ports" }
+# The digest of the embedded catalogue snapshot (`app.version`, SR-20).
+sha2 = { workspace = true }
 # `accounts domains` (story 114.5): the view model it prints, and the
 # contract's entry types its tests read the vectors with.
 keeper-accounts = { path = "../keeper-accounts" }

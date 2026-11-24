@@ -1,0 +1,129 @@
+# Reviewed classifications of wire-reachable operations (MA-G13, scripts/check-catalogue.py).
+# A line matches only while its sha256 equals the classified part of the operation's current
+# snapshot entry; the check prints the expected digest for every unclassified change.
+
+[[classified]]
+id = "app.capabilities"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "which operations are available here and why not"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "app.domains"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "the caller's visible domains; nothing for a wire caller before 123.4"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "app.health"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "serving state; a wire caller gets no sentence"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "app.modules"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "which modules this build hosts; no person's data"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "app.version"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "keeper's own version and catalogue digest; no person's data"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.apply"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph write as the epic's table gives it (123.2); proposal {\"via\": \"graph.propose\"}, wire_forbid ['/approval_id', '/event_time_ms']"
+sha256 = "13fa4b74d4f8d17e0be2c1c91e43f0a7a4fa91ac8e72e2c546f91dc4cf0980fc"
+
+[[classified]]
+id = "graph.enqueue"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph write as the epic's table gives it (123.2); proposal \"none\", wire_forbid ['/approval_id', '/event_time_ms']"
+sha256 = "b8be4799e793193b69470c23e05237a1b784dbd297f1ca801570087257b68be8"
+
+[[classified]]
+id = "graph.history"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.inspect"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "dd1ee0313dc433c0c04ec8063c4196b5d5c7bc25df8ba8f7e71408ebf4935062"
+
+[[classified]]
+id = "graph.pending"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.preview_reversal"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.proposal"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.propose"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph write as the epic's table gives it (123.2); proposal \"itself\", wire_forbid ['/reviewers', '/base_revision', '/expires_at_ms', '/proposal_id', '/change/approval_id', '/change/event_time_ms']"
+sha256 = "2c886b1d02c2a487f6750707e0893ca501f49c74d9fbbc654194208793943135"
+
+[[classified]]
+id = "graph.query"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.resume"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph write as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "70bbf01ca32d194d9aeb476b14457723b25243b7bd95491c63355d09c614c537"
+
+[[classified]]
+id = "graph.status"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
+
+[[classified]]
+id = "graph.sync"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph write as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "70bbf01ca32d194d9aeb476b14457723b25243b7bd95491c63355d09c614c537"
+
+[[classified]]
+id = "graph.unreviewed"
+change = "added"
+reviewer = "123.2 rung review"
+reason = "graph read as the epic's table gives it (123.2); proposal \"none\", wire_forbid []"
+sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"

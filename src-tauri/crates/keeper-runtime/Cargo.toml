@@ -1,0 +1,24 @@
+[package]
+name = "keeper-runtime"
+description = "keeper's module runtime: the registry, the start check, the dispatcher and the app module's handlers"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Role `runtime` (MA-G2): first-party edges to contracts only. It alone
+# enables keeper-runtime-api's `runtime` feature (MA-G9, MA-G14).
+[dependencies]
+keeper-app-api = { path = "../keeper-app-api" }
+keeper-runtime-api = { path = "../keeper-runtime-api", features = ["runtime"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+schemars = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

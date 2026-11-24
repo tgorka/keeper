@@ -2,9 +2,9 @@
 //! line, `keeper-cli <module> <verb> [args] [--json]`, for a person or an
 //! agent who drives keeper on a server, from a script or from a test. Its
 //! first module is `graph` (`keeper-cli graph <verb>`): a person's device's
-//! graph against a real keeper-hq. Later modules add their verbs here rather
-//! than shipping a binary each; there is no dispatcher or wire envelope for
-//! every module until a consumer needs one (DF/AD-20).
+//! graph against a real keeper-hq. Since story 123.2 the binary composes
+//! keeper's runtime with the `app` and `graph` modules ([`compose`]) and
+//! every graph verb reaches its operation through the runtime's dispatcher.
 //!
 //! # Output
 //!
@@ -23,6 +23,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod accounts;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod compose;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod debug;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

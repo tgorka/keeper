@@ -1,0 +1,23 @@
+[package]
+name = "keeper-graph-api"
+description = "The graph module's catalogue: one operation per verb of keeper-cli graph, with hand-written payload schemas and the wire rules a caller cannot escape"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# A contract (MA-G1, A-4): a crate of its own, so keeper-graph-protocol's
+# features and the worker's digest never move. keeper-hq does not take it.
+[dependencies]
+keeper-graph-protocol = { path = "../keeper-graph-protocol" }
+keeper-runtime-api = { path = "../keeper-runtime-api" }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }

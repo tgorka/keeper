@@ -1,0 +1,6 @@
+# Approved breaking catalogue changes (excused by scripts/check-catalogue.py).
+#
+# [[breaking]]
+# id = "domain.operation"
+# change = "removed" # removed | kind | effect | output | input | enum
+# reason = "why this break was approved"

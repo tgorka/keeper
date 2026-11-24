@@ -1,0 +1,355 @@
+{
+  "about": "CR-5: committed vectors of keeper-graph-api's wire gate for graph.enqueue; the snapshot carries this file's digest, so a changed case fails scripts/check-catalogue.py until its classification line is written.",
+  "cases": [
+    {
+      "id": "create-node-passes",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000005",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {},
+        "edges": {}
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "verify-assertion-refused",
+      "input": {
+        "ops": [
+          {
+            "op": "verify_assertion",
+            "id": "01JF0000000000000000000030",
+            "expected_revision": "1",
+            "sources": [],
+            "contents": []
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "refuse": "verify_assertion"
+      }
+    },
+    {
+      "id": "guidance-create-propose-only",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000006",
+            "kind": "Guidance",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {},
+        "edges": {}
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "vocabulary-create-propose-only",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000007",
+            "kind": "Vocabulary",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {},
+        "edges": {}
+      },
+      "expect": {
+        "propose_only": "gated_kind:Vocabulary"
+      }
+    },
+    {
+      "id": "guidance-scope-update-edge-by-id",
+      "input": {
+        "ops": [
+          {
+            "op": "update_edge",
+            "id": "01JF0000000000000000000020",
+            "expected_revision": "1",
+            "set_properties": {
+              "w": 1
+            },
+            "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_edge:guidance_scope"
+      }
+    },
+    {
+      "id": "guidance-scope-archive-edge-by-id",
+      "input": {
+        "ops": [
+          {
+            "op": "archive_edge",
+            "id": "01JF0000000000000000000020",
+            "expected_revision": "1",
+            "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_edge:guidance_scope"
+      }
+    },
+    {
+      "id": "unknown-node-propose-only",
+      "input": {
+        "ops": [
+          {
+            "op": "archive_node",
+            "id": "01JF0000000000000000000009",
+            "expected_revision": "1"
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_node"
+      }
+    },
+    {
+      "id": "known-guidance-node-update",
+      "input": {
+        "ops": [
+          {
+            "op": "update_node",
+            "id": "01JF0000000000000000000002",
+            "expected_revision": "1",
+            "set": {
+              "title": "X"
+            }
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "known-concept-node-update-passes",
+      "input": {
+        "ops": [
+          {
+            "op": "update_node",
+            "id": "01JF0000000000000000000001",
+            "expected_revision": "1",
+            "set": {
+              "title": "X"
+            }
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "unknown-edge-propose-only",
+      "input": {
+        "ops": [
+          {
+            "op": "archive_edge",
+            "id": "01JF0000000000000000000022",
+            "expected_revision": "1",
+            "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000001": "Concept",
+          "01JF0000000000000000000002": "Guidance"
+        },
+        "edges": {
+          "01JF0000000000000000000020": {
+            "type": "guidance_scope",
+            "from_kind": "Guidance",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000021": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_edge"
+      }
+    }
+  ]
+}
