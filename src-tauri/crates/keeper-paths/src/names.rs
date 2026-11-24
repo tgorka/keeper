@@ -203,6 +203,16 @@ pub fn same_entry_folded(a: &str, b: &str) -> bool {
     caseless(a) == caseless(b)
 }
 
+/// The caseless key [`same_entry_folded`] compares, as text a row can store
+/// (`files_entries.name_fold`, story 116.1): `name_fold(a) == name_fold(b)`
+/// exactly when `same_entry_folded(a, b)`. ASCII folds to its lowercase.
+pub fn name_fold(name: &str) -> String {
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+    caseless(name)
+}
+
 /// `NFD(full_case_fold(NFD(name)))`: the key two names APFS takes for one
 /// entry share. The second decomposition is not redundant — folding can
 /// leave a sequence that is not in NFD (`ΐ` folds to three characters).

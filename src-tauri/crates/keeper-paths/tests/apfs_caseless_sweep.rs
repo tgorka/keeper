@@ -8,7 +8,7 @@
 //! wrong for any of them fails here. Asked both ways round, because the
 //! comparison must not depend on which side the index or the agent spelled.
 
-use keeper_paths::names::same_entry_folded;
+use keeper_paths::names::{name_fold, same_entry_folded};
 
 const MEASURED: &str = include_str!("data/apfs-caseless-sweep.txt");
 
@@ -52,6 +52,10 @@ fn the_comparison_answers_as_apfs_did_on_every_measured_pair() {
                     if same_entry_folded(x, y) != apfs {
                         wrong.push(format!("{x:?} vs {y:?}: APFS said same={apfs}"));
                     }
+                }
+                // The stored fold (`files_entries.name_fold`) answers the same.
+                if (name_fold(&a) == name_fold(&b)) != apfs {
+                    wrong.push(format!("name_fold {a:?} vs {b:?}: APFS said same={apfs}"));
                 }
             }
         }
