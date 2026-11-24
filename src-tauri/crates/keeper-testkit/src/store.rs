@@ -14,6 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_TOKEN: &str = "standin-token";
 const URL_TTL_MS: u64 = 3_600_000;
 const HOLD_TIMEOUT: Duration = Duration::from_secs(30);
+/// The store's receive buffer: loopback otherwise buffers megabytes, so a paced
+/// store would hide a slow upload inside the kernel (and the client's wait for
+/// the answer would grow with it), which a real link does not.
+const STORE_RECV_BUFFER: usize = 64 * 1024;
 
 /// Two loopback HTTP/1.1 listeners: a grant server and a presigned object store.
 pub struct StandIn {
@@ -70,6 +74,7 @@ struct Shared {
     store_port: u16,
     bytes_received: AtomicU64,
     bytes_served: AtomicU64,
+    store_gets: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -83,6 +88,8 @@ struct State {
     grant_requests: Vec<String>,
     parts_accepted: Vec<u32>,
     cut_next: Option<u64>,
+    silence_next: Option<(u64, Duration)>,
+    pace: Option<(usize, Duration)>,
     pending_hold: Option<Arc<(Mutex<HoldState>, Condvar)>>,
 }
 
@@ -124,7 +131,7 @@ impl StandIn {
     /// Bind and start both loopback listeners for `database`.
     pub fn start(database: &str) -> StandIn {
         let server_listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
-        let store_listener = TcpListener::bind("127.0.0.1:0").expect("bind store");
+        let store_listener = bind_store_listener();
         let server_port = server_listener.local_addr().expect("server addr").port();
         let store_port = store_listener.local_addr().expect("store addr").port();
         let token = DEFAULT_TOKEN.to_owned();
@@ -134,6 +141,7 @@ impl StandIn {
             store_port,
             bytes_received: AtomicU64::new(0),
             bytes_served: AtomicU64::new(0),
+            store_gets: AtomicU64::new(0),
             state: Mutex::new(State {
                 objects: BTreeMap::new(),
                 plans: BTreeMap::new(),
@@ -144,6 +152,8 @@ impl StandIn {
                 grant_requests: Vec::new(),
                 parts_accepted: Vec::new(),
                 cut_next: None,
+                silence_next: None,
+                pace: None,
                 pending_hold: None,
             }),
         });
@@ -228,6 +238,11 @@ impl StandIn {
         self.shared.bytes_served.load(Ordering::SeqCst)
     }
 
+    /// How many store `GET`s of an object have started (each request counts once, before its body).
+    pub fn store_gets(&self) -> u64 {
+        self.shared.store_gets.load(Ordering::SeqCst)
+    }
+
     /// Part numbers answered `200`, in order (repeats included).
     pub fn parts_accepted(&self) -> Vec<u32> {
         self.shared
@@ -241,6 +256,19 @@ impl StandIn {
     /// Drop the next store connection after reading/writing at most `after_bytes` body bytes.
     pub fn cut_next(&self, after_bytes: u64) {
         self.shared.state.lock().expect("state lock").cut_next = Some(after_bytes);
+    }
+
+    /// Pace every store body from now on to `chunk` bytes per `every` (PUT reads, GET
+    /// writes), until called again with `None`.
+    pub fn throttle(&self, pace: Option<(usize, Duration)>) {
+        self.shared.state.lock().expect("state lock").pace = pace;
+    }
+
+    /// The next store connection (single PUT, part PUT or GET, whichever comes first) moves at most
+    /// `after_bytes` body bytes (counted in store_bytes_received/served as today), then neither reads,
+    /// writes nor closes for `hold_for`, then shuts the connection down without storing anything.
+    pub fn silence_next(&self, after_bytes: u64, hold_for: Duration) {
+        self.shared.state.lock().expect("state lock").silence_next = Some((after_bytes, hold_for));
     }
 
     /// Pause the next part `PUT` after its body is read until [`Hold::release`] is called.
@@ -298,6 +326,24 @@ struct RequestHead {
     initial_body: Vec<u8>,
 }
 
+/// The store's loopback listener, with [`STORE_RECV_BUFFER`] and an Ethernet-sized
+/// segment set before `listen` so every accepted connection inherits them (loopback's
+/// 64 KiB segments would otherwise grow the client's send buffer to megabytes).
+fn bind_store_listener() -> TcpListener {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let socket =
+        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("store socket");
+    socket
+        .set_recv_buffer_size(STORE_RECV_BUFFER)
+        .expect("store receive buffer");
+    #[cfg(unix)]
+    socket.set_tcp_mss(1400).expect("store segment size");
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+    socket.bind(&SockAddr::from(addr)).expect("bind store");
+    socket.listen(128).expect("listen store");
+    socket.into()
+}
+
 fn read_head(stream: &mut TcpStream) -> Option<RequestHead> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -352,6 +398,7 @@ fn read_exact_body(stream: &mut TcpStream, initial: &[u8], len: usize) -> Option
 enum StoreRead {
     Complete(Vec<u8>),
     Cut,
+    Silenced,
     Eof,
 }
 
@@ -360,9 +407,14 @@ fn read_store_body(
     initial: &[u8],
     expected_len: u64,
     cut_limit: Option<u64>,
+    silence: Option<(u64, Duration)>,
+    pace: Option<(usize, Duration)>,
     counter: &AtomicU64,
 ) -> StoreRead {
-    let max_read = cut_limit.map_or(expected_len, |n| expected_len.min(n));
+    let max_read = silence
+        .map(|(n, _)| n)
+        .or(cut_limit)
+        .map_or(expected_len, |n| expected_len.min(n));
     let mut body = Vec::with_capacity((max_read as usize).min(1024 * 1024));
     let take = initial.len().min(max_read as usize);
     body.extend_from_slice(&initial[..take]);
@@ -370,6 +422,7 @@ fn read_store_body(
         counter.fetch_add(take as u64, Ordering::SeqCst);
     }
     let mut buf = [0u8; 16_384];
+    let started = std::time::Instant::now();
     while (body.len() as u64) < max_read {
         let remaining = (max_read - body.len() as u64) as usize;
         let want = remaining.min(buf.len());
@@ -378,10 +431,14 @@ fn read_store_body(
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
                 counter.fetch_add(n as u64, Ordering::SeqCst);
+                keep_pace(pace, started, body.len() as u64);
             }
         }
     }
-    if cut_limit.is_some() {
+    if let Some((_, hold_for)) = silence {
+        std::thread::sleep(hold_for);
+        StoreRead::Silenced
+    } else if cut_limit.is_some() {
         StoreRead::Cut
     } else {
         StoreRead::Complete(body)
@@ -866,7 +923,7 @@ fn handle_store_put_part(
     plan_id: &str,
     part_num: u32,
 ) {
-    let (expected_size, expected_sha256, cut_limit) = {
+    let (expected_size, expected_sha256, cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
         let Some(plan) = state.plans.get(plan_id) else {
             write_xml_error(stream, 404, "NoSuchUpload", "Unknown plan");
@@ -895,7 +952,9 @@ fn handle_store_put_part(
             return;
         }
         let cut_limit = state.cut_next.take();
-        (expected_size, expected_sha256, cut_limit)
+        let silence = state.silence_next.take();
+        let pace = state.pace;
+        (expected_size, expected_sha256, cut_limit, silence, pace)
     };
 
     let body = match read_store_body(
@@ -903,10 +962,12 @@ fn handle_store_put_part(
         &req.initial_body,
         expected_size,
         cut_limit,
+        silence,
+        pace,
         &shared.bytes_received,
     ) {
         StoreRead::Complete(body) => body,
-        StoreRead::Cut => {
+        StoreRead::Cut | StoreRead::Silenced => {
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -959,16 +1020,21 @@ fn handle_store_put_single(
         );
         return;
     };
-    let cut_limit = shared.state.lock().expect("state lock").cut_next.take();
+    let (cut_limit, silence, pace) = {
+        let mut state = shared.state.lock().expect("state lock");
+        (state.cut_next.take(), state.silence_next.take(), state.pace)
+    };
     let body = match read_store_body(
         stream,
         &req.initial_body,
         content_len,
         cut_limit,
+        silence,
+        pace,
         &shared.bytes_received,
     ) {
         StoreRead::Complete(body) => body,
-        StoreRead::Cut => {
+        StoreRead::Cut | StoreRead::Silenced => {
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -996,17 +1062,30 @@ fn handle_store_put_single(
     write_response(stream, 200, "application/octet-stream", &[], &[]);
 }
 
+/// Sleep until `moved` body bytes are due at `pace` (`chunk` bytes every `every`) since
+/// `started`, so a paced body moves at that rate however the kernel splits it.
+fn keep_pace(pace: Option<(usize, Duration)>, started: std::time::Instant, moved: u64) {
+    let Some((chunk, every)) = pace else { return };
+    let due = every.mul_f64(moved as f64 / chunk.max(1) as f64);
+    if let Some(ahead) = due.checked_sub(started.elapsed()) {
+        std::thread::sleep(ahead);
+    }
+}
+
 fn handle_store_get(stream: &mut TcpStream, shared: &Shared, req: &RequestHead, hex_digest: &str) {
     let content_id = format!("sha256:{hex_digest}");
-    let (object, cut_limit) = {
+    let (object, cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
         let Some(object) = state.objects.get(&content_id).cloned() else {
             write_xml_error(stream, 404, "NoSuchKey", "Object not found");
             return;
         };
         let cut_limit = state.cut_next.take();
-        (object, cut_limit)
+        let silence = state.silence_next.take();
+        let pace = state.pace;
+        (object, cut_limit, silence, pace)
     };
+    shared.store_gets.fetch_add(1, Ordering::SeqCst);
 
     let total = object.len() as u64;
     let (status, slice, content_range) = if let Some(range_hdr) = req.headers.get("range") {
@@ -1032,7 +1111,7 @@ fn handle_store_get(stream: &mut TcpStream, shared: &Shared, req: &RequestHead, 
         (200u16, &object[..], None)
     };
 
-    if cut_limit == Some(0) {
+    if silence.is_none() && cut_limit == Some(0) {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
@@ -1050,20 +1129,27 @@ fn handle_store_get(stream: &mut TcpStream, shared: &Shared, req: &RequestHead, 
         return;
     }
 
-    let to_send = cut_limit.map_or(slice.len(), |n| slice.len().min(n as usize));
+    let limit = silence.map(|(n, _)| n).or(cut_limit);
+    let to_send = limit.map_or(slice.len(), |n| slice.len().min(n as usize));
+    let chunk_cap = pace.map_or(16_384, |(chunk, _)| chunk.max(1));
+    let started = std::time::Instant::now();
     let mut offset = 0usize;
     while offset < to_send {
-        let end = (offset + 16_384).min(to_send);
+        let end = (offset + chunk_cap).min(to_send);
         match stream.write(&slice[offset..end]) {
             Ok(0) | Err(_) => return,
             Ok(n) => {
                 shared.bytes_served.fetch_add(n as u64, Ordering::SeqCst);
                 offset += n;
+                keep_pace(pace, started, offset as u64);
             }
         }
     }
     let _ = stream.flush();
-    if cut_limit.is_some() {
+    if let Some((_, hold_for)) = silence {
+        std::thread::sleep(hold_for);
+        let _ = stream.shutdown(Shutdown::Both);
+    } else if cut_limit.is_some() {
         let _ = stream.shutdown(Shutdown::Both);
     }
 }
@@ -1220,5 +1306,92 @@ mod tests {
         assert!(head.to_ascii_lowercase().contains("content-length: 1024"));
         assert_eq!(body.len(), 128);
         assert_eq!(standin.store_bytes_served(), 128);
+    }
+
+    #[test]
+    fn silence_next_holds_the_connection_open_then_drops_it() {
+        let standin = StandIn::start("notes");
+        let payload = vec![0xCDu8; 1024];
+        let id = standin.seed(&payload);
+        let url = request_download_url(&standin, &id);
+        standin.silence_next(100, Duration::from_millis(600));
+
+        let (host, path) = split_url(&url);
+        let req = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(&host).expect("connect");
+        stream.write_all(req.as_bytes()).expect("write req");
+        stream.flush().expect("flush");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set timeout");
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        let timed_out = loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break false,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break true;
+                }
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        };
+        assert!(
+            timed_out,
+            "expected read timeout while connection is held silent"
+        );
+
+        let head_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http header end")
+            + 4;
+        assert_eq!(buf.len() - head_end, 100);
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set eof timeout");
+        match stream.read(&mut tmp) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected EOF after silence, got {n} extra bytes"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(e) => panic!("expected EOF after silence, got {e}"),
+        }
+        assert_eq!(standin.store_bytes_served(), 100);
+        assert_eq!(standin.store_gets(), 1);
+    }
+
+    #[test]
+    fn throttle_paces_a_get() {
+        let standin = StandIn::start("notes");
+        let payload = vec![0x5Au8; 5000];
+        let id = standin.seed(&payload);
+        let url = request_download_url(&standin, &id);
+        standin.throttle(Some((1000, Duration::from_millis(20))));
+
+        let (host, path) = split_url(&url);
+        let req = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+        let start = std::time::Instant::now();
+        let (status, _, body) = raw_http(&host, &req);
+        let elapsed = start.elapsed();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, payload);
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "expected paced GET >= 80ms, got {elapsed:?}"
+        );
     }
 }

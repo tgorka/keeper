@@ -57,8 +57,10 @@ pub struct TransferConfig {
     pub threshold: u64,
     /// The least part size (every part but the last).
     pub part_bytes: u64,
-    /// One request's deadline: the connection and a silence while sending
-    /// or receiving. Never the whole transfer's.
+    /// One request's deadline: the connection, the wait for an answer's
+    /// head, and each silence while sending or receiving the body (every
+    /// write or read restarts it). Never the whole body's, nor the
+    /// transfer's: a slow but steady link finishes.
     pub request_timeout: Duration,
     /// Where the plans of uploads in parts are kept: device-local, beside
     /// the file cache, never the replica file.
@@ -115,8 +117,8 @@ impl StoreTransfer {
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(config.request_timeout))
             .timeout_recv_response(Some(config.request_timeout))
-            .timeout_recv_body(Some(config.request_timeout))
-            .timeout_send_body(Some(config.request_timeout))
+            .timeout_per_read(Some(config.request_timeout))
+            .timeout_per_write(Some(config.request_timeout))
             .http_status_as_error(false)
             .max_redirects(0)
             .build()

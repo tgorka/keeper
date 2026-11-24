@@ -22,3 +22,5 @@ hex = { workspace = true }
 tempfile = { workspace = true }
 # The stand-in object store (`store`, story 115.3): part checksums, plan ids.
 base64 = { workspace = true }
+# The stand-in store's small receive window, so loopback buffers like a real link's.
+socket2 = { version = "0.6", features = ["all"] }
