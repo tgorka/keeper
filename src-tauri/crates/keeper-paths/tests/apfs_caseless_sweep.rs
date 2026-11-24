@@ -1,7 +1,8 @@
 //! R603-09: `names::same_entry_folded` answers as APFS did on every name pair
 //! measured on hesperia — every code point whose canonical caseless key
 //! differs from itself (14,369 of them), and the pairs picked by hand around
-//! them (`data/apfs-caseless-sweep.txt` says how each was measured).
+//! them (`syncular/apfs-caseless-sweep.txt` says how each was measured; it is
+//! contract data, so the server's name rule is tested against the same table).
 //!
 //! A table of hand-picked pairs missed `ﬃ` and `ﬄ`, whose fold `unicase`
 //! emits out of order; this one holds every code point, so a fold that goes
@@ -10,7 +11,7 @@
 
 use keeper_paths::names::{name_fold, same_entry_folded};
 
-const MEASURED: &str = include_str!("data/apfs-caseless-sweep.txt");
+const MEASURED: &str = include_str!("../../../../syncular/apfs-caseless-sweep.txt");
 
 fn name(hex: &str) -> String {
     hex.split('-')
