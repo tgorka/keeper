@@ -20,7 +20,8 @@
     { "version": 8, "through": "0008_knowledge_graph_review" },
     { "version": 9, "through": "0009_knowledge_graph_history" },
     { "version": 10, "through": "0010_files" },
-    { "version": 11, "through": "0011_settings" }
+    { "version": 11, "through": "0011_settings" },
+    { "version": 12, "through": "0012_jobs" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -135,7 +136,16 @@
       "name": "settings_values",
       "scopes": [{ "pattern": "settings_owner:{settings_owner}", "column": "owner_actor" }]
     },
-    { "name": "config_values", "scopes": ["dir:{dir}"] }
+    { "name": "config_values", "scopes": ["dir:{dir}"] },
+    { "name": "jobs", "scopes": [{ "pattern": "jobs_page:{jobs_page}", "column": "page_key" }] },
+    {
+      "name": "job_claims",
+      "scopes": [{ "pattern": "jobs_page:{jobs_page}", "column": "page_key" }]
+    },
+    {
+      "name": "job_capabilities",
+      "scopes": [{ "pattern": "jobs_nodes:{jobs_nodes}", "column": "domain" }]
+    }
   ],
   "subscriptions": [
     { "name": "directory", "scopes": { "dir": "{database}" } },
@@ -156,6 +166,8 @@
     { "name": "filesPage", "scopes": { "files_page": "{pageKey}" } },
     { "name": "filesReceipts", "scopes": { "files_client": "{clientScope}" } },
     { "name": "filesSources", "scopes": { "files_sources": "{database}" } },
-    { "name": "settingsOwn", "scopes": { "settings_owner": "{actorId}" } }
+    { "name": "settingsOwn", "scopes": { "settings_owner": "{actorId}" } },
+    { "name": "jobsPage", "scopes": { "jobs_page": "{pageKey}" } },
+    { "name": "jobsNodes", "scopes": { "jobs_nodes": "{database}" } }
   ]
 }
