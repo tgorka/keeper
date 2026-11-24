@@ -41,6 +41,8 @@ pub mod admission;
 pub mod ledger;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod lifecycle;
+#[cfg(all(feature = "module", any(target_os = "linux", target_os = "macos")))]
+pub mod module;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod projection;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

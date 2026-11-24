@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = Path(os.environ.get("KEEPER_MODULE_MANIFEST", ROOT / "src-tauri/Cargo.toml"))
 ROLES = Path(os.environ.get("KEEPER_MODULE_ROLES", ROOT / "scripts/module-roles.json"))
 KINDS = {"contract", "composition-root", "legacy", "port", "provider",
-         "implementation", "path-leaf", "folder-leaf"}
+         "implementation", "path-leaf", "folder-leaf", "runtime", "transport", "adapter"}
 
 
 def cargo(*args):
@@ -62,18 +62,29 @@ for name in sorted(members):
             errors.append(f"{name}: first-party dependency {dependency} has no declared role")
         if role != "composition-root" and other == "provider":
             errors.append(f"{name} ({role}) reaches provider {dependency}")
+        if other in {"runtime", "transport"} and role not in {"composition-root", "transport"}:
+            errors.append(f"{name} ({role}) reaches {other} {dependency}")
+        if other == "adapter" and role != "composition-root":
+            errors.append(f"{name} ({role}) reaches adapter {dependency}")
         if role == "contract" and (
             other in {"port", "provider", "implementation", "composition-root", "legacy"}
             or re.fullmatch(r"syncular-.*|rusqlite|libsqlite3-sys|tokio|tauri.*|matrix-sdk.*", dependency)
         ):
             errors.append(f"{name} (contract) reaches forbidden {dependency}")
-    if role in {"implementation", "path-leaf", "folder-leaf"}:
+        if role == "runtime" and re.fullmatch(r"rusqlite|libsqlite3-sys|syncular-.*|tauri.*|matrix-sdk.*", dependency):
+            errors.append(f"{name} (runtime) reaches forbidden {dependency}")
+        if role == "transport" and re.fullmatch(r"rusqlite|libsqlite3-sys", dependency):
+            errors.append(f"{name} (transport) reaches forbidden {dependency}")
+    if role in {"implementation", "path-leaf", "folder-leaf", "runtime", "transport", "adapter"}:
         for dependency in sorted(tree(name, direct=True) - {name}):
             if dependency not in roles:
                 continue  # Third-party dependencies are not governed by these direct-edge rules.
             allowed = (
                 role == "implementation" and roles[dependency] in {"port", "contract", "path-leaf", "folder-leaf"}
                 or role == "folder-leaf" and roles[dependency] == "path-leaf"
+                or role == "runtime" and roles[dependency] == "contract"
+                or role == "transport" and roles[dependency] in {"contract", "runtime", "transport"}
+                or role == "adapter" and roles[dependency] in {"legacy", "contract", "path-leaf", "folder-leaf"}
             )
             if not allowed:
                 errors.append(f"{name} ({role}) has forbidden direct edge to {dependency}")

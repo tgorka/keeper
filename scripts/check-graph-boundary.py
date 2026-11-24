@@ -421,4 +421,67 @@ for crate in ['keeper-graph-protocol', 'keeper-cli']:
     for path in (CRATES / crate / 'src').rglob('*'):
         if path.is_file() and re.search(rb'examples/|rc_corpus|rc_spawner', path.read_bytes()):
             raise SystemExit(f'shipped source refers to measurement tooling: {path}')
+
+# Story 123.2 (module catalogue). Each rule reads cargo's own resolution; a cargo error
+# fails closed (check_output raises).
+def plain_tree(package, *extra):
+    """`cargo tree` with the given features only (never --all-features)."""
+    return subprocess.check_output(['cargo', 'tree', '--manifest-path', str(MANIFEST), '-p', package,
+                                    '-e', 'normal,build', '--prefix', 'none', *extra], text=True)
+
+# AC7: keeper-hq's tree does not move. The protocol and the default-feature graph client
+# resolve no crate this program adds.
+NEW_CRATES = r'(keeper-runtime|keeper-runtime-api|keeper-app-api|keeper-graph-api)'
+reject(plain_tree('keeper-graph-protocol', '--target', 'all'), NEW_CRATES)
+reject(plain_tree('keeper-graph', '--target', 'all'), NEW_CRATES)
+# SR-5: the graph module opens no replica of its own.
+reject(plain_tree('keeper-graph', '--features', 'module', '--target', 'all'),
+       r'(keeper-replica|syncular-client)')
+# AC9 (F14): the runtime crates the phones compose register nothing by linker magic.
+for target in ['aarch64-apple-ios', 'aarch64-linux-android']:
+    for package in ['keeper-runtime-api', 'keeper-app-api', 'keeper-runtime']:
+        reject(plain_tree(package, '--target', target), r'(inventory|linkme)')
+
+# MA-G9, MA-G14: only keeper-runtime mints callers and witnesses. keeper-runtime-api's
+# `runtime` feature is enabled by no other member and by no default, and no first-party
+# source outside the two runtime crates names its minting module.
+RUNTIME_API, RUNTIME = 'keeper-runtime-api', 'keeper-runtime'
+
+
+def runtime_feature_violations(members):
+    found = []
+    api = members.get(RUNTIME_API, {})
+    if 'runtime' in default_closure(api.get('features', {})):
+        found.append('keeper-runtime-api enables `runtime` by default')
+    for name, doc in members.items():
+        enables = any(isinstance(t.get(RUNTIME_API), dict) and 'runtime' in t[RUNTIME_API].get('features', [])
+                      for t in dependency_tables(doc))
+        enables = enables or any(v in (RUNTIME_API + '/runtime', RUNTIME_API + '?/runtime')
+                                 for values in doc.get('features', {}).values() for v in values)
+        if enables and name != RUNTIME:
+            found.append(f'{name} enables keeper-runtime-api/runtime')
+    return found
+
+
+_, MEMBER_DOCS = parsed(ROOT_TEXT, MEMBER_TEXT)
+violations = runtime_feature_violations(MEMBER_DOCS)
+if violations:
+    raise SystemExit('; '.join(violations))
+for label, mutate in [
+    ('a default enabling runtime', lambda d: {**d, RUNTIME_API: {**d[RUNTIME_API], 'features': {
+        **d[RUNTIME_API].get('features', {}), 'default': ['runtime']}}}),
+    ('keeper-cli enabling runtime', lambda d: {**d, 'keeper-cli': {**d['keeper-cli'], 'dependencies': {
+        RUNTIME_API: {'path': '../keeper-runtime-api', 'features': ['runtime']}}}}),
+    ('a feature forwarding runtime', lambda d: {**d, 'keeper-graph': {**d['keeper-graph'], 'features': {
+        'x': [RUNTIME_API + '/runtime']}}}),
+]:
+    if not runtime_feature_violations(mutate(MEMBER_DOCS)):
+        raise SystemExit(f'runtime feature guard self-test not caught: {label}')
+for name, manifest in MEMBER_PATH.items():
+    if name in (RUNTIME_API, RUNTIME):
+        continue
+    for path in manifest.parent.rglob('*.rs'):
+        if 'target' not in path.parts and 'runtime_only' in path.read_text():
+            raise SystemExit(f'runtime_only named outside keeper-runtime: {path}')
+
 print('graph protocol/worker/core/mobile dependency boundaries and exact 11/6 unsafe inventory passed')

@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 bun run check:core-frozen
 bun run check:module-edges
+bun run check:catalogue
 bun run check:core-tauri-free
 bun run check:core-sync-free
 bun run check:syncd-lean

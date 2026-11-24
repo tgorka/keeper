@@ -22,6 +22,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { workspace = true }
 ulid = { workspace = true }
+# The graph module's catalogue and the runtime contract, behind `module`
+# only (MA-G5): the default build, and keeper-hq's, pulls neither.
+keeper-graph-api = { path = "../keeper-graph-api", optional = true }
+keeper-runtime-api = { path = "../keeper-runtime-api", optional = true }
 
 # Graph worker launch checks (110.5, OD-A delta §4.4): P6c's soft stack
 # limit, the spawning thread's `no_new_privs`, the page and signal-frame
@@ -36,8 +40,14 @@ landlock = "=0.4.7"
 # command line (`keeper-cli`) enables it; no other crate and no default
 # does (`scripts/check-graph-boundary.py`), so no agent tool can obtain one.
 human-reads = []
+# The graph as a module of keeper's runtime (story 123.2): handlers bound to
+# `keeper-graph-api`'s operations, each given only the facade its class
+# allows. Off by default; it never implies `human-reads`.
+module = ["dep:keeper-graph-api", "dep:keeper-runtime-api"]
 
 [dev-dependencies]
+# The module's tests reach it through the real dispatcher.
+keeper-runtime = { path = "../keeper-runtime" }
 keeper-replica = { path = "../keeper-replica" }
 keeper-testkit = { path = "../keeper-testkit" }
 # The tests open real replicas and read the adapter's schema.

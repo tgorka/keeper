@@ -66,10 +66,11 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
              "keeper-sync": "legacy", "keeper-port": "port",
              "keeper-provider": "provider", "keeper-testkit": "composition-root",
              "keeper-paths": "path-leaf", "keeper-folders": "folder-leaf",
-             "keeper-scratch-api": "contract", "keeper-app": "composition-root"}
+             "keeper-scratch-api": "contract", "keeper-app": "composition-root",
+             "keeper-rt": "runtime", "keeper-tp": "transport", "keeper-ad": "adapter"}
     (root / "Cargo.toml").write_text(
         '[workspace]\nresolver = "2"\nmembers = ' + json.dumps(list(names)) +
-        '\nexclude = ["bridge", "tokio", "serde"]\n')
+        '\nexclude = ["bridge", "tokio", "serde", "rusqlite", "tonic"]\n')
     roles = root / "roles.json"
     roles.write_text(json.dumps(names))
     env = dict(os.environ, KEEPER_MODULE_MANIFEST=str(root / "Cargo.toml"),
@@ -81,12 +82,17 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         path.mkdir(exist_ok=True)
         (path / "lib.rs").write_text("")
         text = f'[package]\nname = "{name}"\nversion = "0.0.0"\nedition = "2021"\n[lib]\npath = "lib.rs"\n'
-        if dependency:
-            text += f'[{kind}]\n{dependency} = {{ path = "../{dependency}"'
-            text += ', optional = true }\n[features]\nextra = ["dep:' + dependency + '"]\n' if feature else ' }\n'
+        deps = [dependency] if isinstance(dependency, str) else list(dependency or [])
+        if deps:
+            text += f'[{kind}]\n'
+            for dep in deps:
+                text += f'{dep} = {{ path = "../{dep}"'
+                text += ', optional = true }\n' if feature else ' }\n'
+            if feature:
+                text += '[features]\nextra = [' + ', '.join(f'"dep:{dep}"' for dep in deps) + ']\n'
         (path / "Cargo.toml").write_text(text)
 
-    for name in [*names, "bridge", "tokio", "serde"]:
+    for name in [*names, "bridge", "tokio", "serde", "rusqlite", "tonic"]:
         crate(name)
     run("fixture baseline GREEN", "check-module-edges.py", env=env)
     cases = [
@@ -99,6 +105,16 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("legacy build provider", "keeper-core", "keeper-provider", "build-dependencies", False),
         ("optional provider", "keeper-port", "keeper-provider", "dependencies", True),
         ("target provider", "keeper-core", "keeper-provider", 'target.\'cfg(target_os = "windows")\'.dependencies', False),
+        ("runtime implementation", "keeper-rt", "keeper-scratch", "dependencies", False),
+        ("transport rusqlite", "keeper-tp", "rusqlite", "dependencies", False),
+        ("transport port", "keeper-tp", "keeper-port", "dependencies", False),
+        ("implementation runtime", "keeper-scratch", "keeper-rt", "dependencies", False),
+        ("port transport", "keeper-port", "keeper-tp", "dependencies", False),
+        ("provider adapter", "keeper-provider", "keeper-ad", "dependencies", False),
+        ("contract runtime", "keeper-scratch-api", "keeper-rt", "dependencies", False),
+        ("path leaf transport", "keeper-paths", "keeper-tp", "dependencies", False),
+        ("folder leaf adapter", "keeper-folders", "keeper-ad", "dependencies", False),
+        ("legacy runtime", "keeper-core", "keeper-rt", "dependencies", False),
     ]
     for label, name, dependency, kind, feature in cases:
         crate(name, dependency, kind, feature)
@@ -116,6 +132,8 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("keeper-folders", "keeper-paths", "dependencies"),
         ("keeper-app", "keeper-provider", "dependencies"),
         ("keeper-core", "keeper-provider", "dev-dependencies"),
+        ("keeper-rt", "keeper-scratch-api", "dependencies"),
+        ("keeper-tp", ["keeper-scratch-api", "tonic"], "dependencies"),
     ]:
         crate(name, dependency, kind)
         run(f"allowed {name} {kind} {dependency} GREEN", "check-module-edges.py", env=env)

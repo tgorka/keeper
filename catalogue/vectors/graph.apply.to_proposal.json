@@ -1,0 +1,134 @@
+{
+  "about": "CR-5: committed vectors of keeper-graph-api's to_proposal for graph.apply; the snapshot carries this file's digest, so a changed case fails scripts/check-catalogue.py until its classification line is written.",
+  "cases": [
+    {
+      "id": "create-node",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000005",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "expect": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "change": {
+          "ops": [
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000005",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "with-event-time",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000005",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "event_time_ms": 1700000000000,
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "expect": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "change": {
+          "ops": [
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000005",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            }
+          ],
+          "event_time_ms": 1700000000000
+        }
+      }
+    },
+    {
+      "id": "two-ops",
+      "input": {
+        "ops": [
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000005",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          },
+          {
+            "op": "create_node",
+            "id": "01JF0000000000000000000006",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "properties": {}
+          }
+        ],
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        }
+      },
+      "expect": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "change": {
+          "ops": [
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000005",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            },
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000006",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

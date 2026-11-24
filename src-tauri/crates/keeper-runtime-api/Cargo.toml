@@ -1,0 +1,27 @@
+[package]
+name = "keeper-runtime-api"
+description = "keeper's module catalogue contract: operations as data, with their effect class and wire rules, the module and handler types and the class witness"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# A contract (MA-G1, G2): no tokio, storage, transport or keeper crate.
+[dependencies]
+futures-core = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+ts-rs = { workspace = true }
+
+[features]
+# The minting of callers, grants and the `decide` witness (MA-G9, MA-G14).
+# Only `keeper-runtime` enables it; `scripts/check-graph-boundary.py`
+# refuses any other enabler, a default that implies it, and any first-party
+# source outside the two runtime crates that names `runtime_only`.
+runtime = []
