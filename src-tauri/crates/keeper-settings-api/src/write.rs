@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::credential::check_value;
+use crate::credential::{check_value, is_credential_choice};
 use crate::record::{classify, parse_id, Device, RecordKey};
 use crate::refusal::Refusal;
 use crate::travel::Travel;
@@ -150,6 +150,9 @@ pub fn check_value_write(
                 }
                 check_value(&key, value)?;
             }
+            // A blob is unreadable at commit, so a credential choice (which may
+            // only be `account`, `own` or `none`) is never accepted as one.
+            (None, true) if is_credential_choice(&key) => return Err(Refusal::CredentialValue),
             (None, true) => {}
             (Some(_), true) | (None, false) => return Err(Refusal::Malformed),
         }

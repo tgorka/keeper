@@ -1017,6 +1017,58 @@
       "refusal": "settings.credential_value"
     },
     {
+      "name": "sync.credential_source value as a blob refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "sync.credential_source.drive:https://git.example.org/ana/notes#main^notes",
+        "value": null,
+        "value_blob": true
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.credential_value"
+    },
+    {
+      "name": "bots.provider_credential_source value as a blob refused",
+      "writer": {
+        "kind": "person",
+        "actor": "@ana:example.org",
+        "client": "cli_ana_mac"
+      },
+      "domain": {
+        "kind": "personal",
+        "owner_actor": "@ana:example.org"
+      },
+      "op": "upsert",
+      "row": {
+        "id": "01JD3Q8Z5X0000000000000001/bots.provider_credential_source.anthropic",
+        "owner_actor": "@ana:example.org",
+        "device": "01JD3Q8Z5X0000000000000001",
+        "key": "bots.provider_credential_source.anthropic",
+        "value": null,
+        "value_blob": true
+      },
+      "device_record": {
+        "owner_actor": "@ana:example.org",
+        "client_id": "cli_ana_mac"
+      },
+      "refusal": "settings.credential_value"
+    },
+    {
       "name": "value of 16385 ASCII bytes refused",
       "writer": {
         "kind": "person",

@@ -49,15 +49,20 @@ pub fn credential_shaped(value: &str) -> Option<&'static str> {
         .find_map(|(&(name, _), re)| re.is_match(value).then_some(name))
 }
 
+/// Whether `key` (bare or `pin:`) belongs to one of [`CREDENTIAL_FAMILIES`].
+#[must_use]
+pub fn is_credential_choice(key: &str) -> bool {
+    let bare = key.strip_prefix("pin:").unwrap_or(key);
+    CREDENTIAL_FAMILIES
+        .iter()
+        .any(|prefix| bare.starts_with(prefix))
+}
+
 /// Validates `value` for `key`: credential-source family keys (including
 /// `pin:` forms) only allow [`CREDENTIAL_CHOICES`]; all other keys reject
 /// values matched by [`credential_shaped`].
 pub fn check_value(key: &str, value: &str) -> Result<(), Refusal> {
-    let bare = key.strip_prefix("pin:").unwrap_or(key);
-    if CREDENTIAL_FAMILIES
-        .iter()
-        .any(|prefix| bare.starts_with(prefix))
-    {
+    if is_credential_choice(key) {
         if CREDENTIAL_CHOICES.contains(&value) {
             return Ok(());
         }

@@ -164,7 +164,8 @@ travel data, generated from keeper-core's registry and never edited by hand.
   an every-device key travels in `*`, a this-device key in the device's own records.
 - **No secret travels.** A credential-shaped value is refused (`settings.credential_value`), and a
   credential choice (`sync.credential_source.…`, `bots.provider_credential_source.…`) records only
-  `account`, `own` or `none`.
+  `account`, `own` or `none`, inline: such a key's value as a `value_blob` is refused
+  (`settings.credential_value`), since the server cannot read a blob at commit.
 - **Bounds.** A `value` longer than `limits.json`'s `settingValueMaxBytes` is refused
   (`settings.value_too_large`); it is `value_blob` instead, uploaded under the generic upload grant
   within `attachmentMaxBytes` (`settings.blob_too_large` above it) and read through the generic
