@@ -14,6 +14,13 @@ const PART_BYTES: u64 = 2 * 1024 * 1024;
 const MULTI_PART_LEN: usize = 2 * (PART_BYTES as usize) + 1000;
 const DOWNLOAD_SILENCE_LEN: usize = 1024 * 1024;
 const PACE: (usize, Duration) = (64 * 1024, Duration::from_millis(62));
+/// The slow upload's parts: the store paces the first half of each (about 2 s, twice the bound)
+/// and reads the last half at full speed, so whatever the client's kernel still holds after its
+/// last write (OS-sized: a loopback send buffer can outgrow the store's receive window) drains
+/// before the answer wait, instead of at the paced rate inside it.
+const SLOW_PART_BYTES: u64 = 4 * 1024 * 1024;
+const SLOW_UPLOAD_LEN: usize = 2 * (SLOW_PART_BYTES as usize) + 1000;
+const SLOW_UNPACED_TAIL: u64 = SLOW_PART_BYTES / 2;
 const HOLD_FOR: Duration = Duration::from_secs(20);
 
 fn xorshift_bytes(mut state: u64, len: usize) -> Vec<u8> {
@@ -74,13 +81,24 @@ fn a_slow_but_steady_store_takes_an_upload_in_parts() {
     let plan_dir = dir.path().join("plans");
     let src = dir.path().join("slow.bin");
 
-    let bytes = xorshift_bytes(0x1153_1001, MULTI_PART_LEN);
+    let bytes = xorshift_bytes(0x1153_1001, SLOW_UPLOAD_LEN);
     let size = bytes.len() as u64;
     fs::write(&src, &bytes).expect("write source");
 
     s.throttle(Some(PACE));
-    let t = make_transfer(&s, slot_for(&s), plan_dir.clone(), PART_BYTES, TIMEOUT);
+    s.unpaced_upload_tail(SLOW_UNPACED_TAIL);
+    let t = make_transfer(&s, slot_for(&s), plan_dir.clone(), SLOW_PART_BYTES, TIMEOUT);
+    let started = Instant::now();
     let uploaded = t.upload(&src, None, &mut |_| {}).expect("slow upload");
+    let elapsed = started.elapsed();
+
+    // Two full parts, each paced for ~2 s: the upload outlasts the 1 s bound several times over,
+    // so it went through only because no single wait exceeded it.
+    assert!(
+        elapsed > 3 * TIMEOUT,
+        "slow upload took {elapsed:?}, expected over {:?}",
+        3 * TIMEOUT
+    );
 
     assert_eq!(
         s.object(&uploaded.content_id).as_deref(),
