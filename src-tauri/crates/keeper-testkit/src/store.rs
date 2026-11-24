@@ -90,6 +90,7 @@ struct State {
     cut_next: Option<u64>,
     silence_next: Option<(u64, Duration)>,
     pace: Option<(usize, Duration)>,
+    unpaced_upload_tail: u64,
     pending_hold: Option<Arc<(Mutex<HoldState>, Condvar)>>,
 }
 
@@ -154,6 +155,7 @@ impl StandIn {
                 cut_next: None,
                 silence_next: None,
                 pace: None,
+                unpaced_upload_tail: 0,
                 pending_hold: None,
             }),
         });
@@ -264,6 +266,21 @@ impl StandIn {
         self.shared.state.lock().expect("state lock").pace = pace;
     }
 
+    /// Read the last `bytes` of every throttled upload body (single or part PUT) at full speed.
+    ///
+    /// After a client's last write, the bytes its kernel still holds reach the store before the
+    /// answer can, so the client's wait for the answer is that drain. How much the kernel holds
+    /// is the OS's call (macOS grows a loopback send buffer past what the store's receive window
+    /// suggests); a tail at least that large keeps the drain off the paced clock, so a slow
+    /// upload's answer wait measures the store, not the kernel. GET bodies are unaffected.
+    pub fn unpaced_upload_tail(&self, bytes: u64) {
+        self.shared
+            .state
+            .lock()
+            .expect("state lock")
+            .unpaced_upload_tail = bytes;
+    }
+
     /// The next store connection (single PUT, part PUT or GET, whichever comes first) moves at most
     /// `after_bytes` body bytes (counted in store_bytes_received/served as today), then neither reads,
     /// writes nor closes for `hold_for`, then shuts the connection down without storing anything.
@@ -332,9 +349,9 @@ struct RequestHead {
 /// Linux grows a sender's buffer from its congestion window times the segment size, so
 /// loopback's 64 KiB segments would still grow the client's send buffer to megabytes; an
 /// Ethernet-sized segment, set here and inherited by accepted sockets, keeps it small.
-/// macOS refuses `TCP_MAXSEG` on an unconnected socket (EINVAL) and does not need it: it
-/// grows a send buffer only while the peer's advertised window is at least 4/5 of it, and
-/// the 64 KiB receive buffer caps that window below the default 128 KiB send space.
+/// macOS refuses `TCP_MAXSEG` on an unconnected socket (EINVAL), and its loopback send buffer
+/// can still hold a large share of a part (CI run 45444300522); a paced test that needs the
+/// client's answer wait bounded sets [`StandIn::unpaced_upload_tail`] instead of relying on it.
 fn bind_store_listener() -> TcpListener {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let socket =
@@ -408,13 +425,30 @@ enum StoreRead {
     Eof,
 }
 
+/// A throttled upload body's pace: `pace.0` bytes per `pace.1`, except its last `unpaced_tail`
+/// bytes, which are read at full speed ([`StandIn::unpaced_upload_tail`]).
+#[derive(Clone, Copy)]
+struct UploadPace {
+    pace: (usize, Duration),
+    unpaced_tail: u64,
+}
+
+impl UploadPace {
+    fn of(state: &State) -> Option<UploadPace> {
+        state.pace.map(|pace| UploadPace {
+            pace,
+            unpaced_tail: state.unpaced_upload_tail,
+        })
+    }
+}
+
 fn read_store_body(
     stream: &mut TcpStream,
     initial: &[u8],
     expected_len: u64,
     cut_limit: Option<u64>,
     silence: Option<(u64, Duration)>,
-    pace: Option<(usize, Duration)>,
+    pace: Option<UploadPace>,
     counter: &AtomicU64,
 ) -> StoreRead {
     let max_read = silence
@@ -427,6 +461,10 @@ fn read_store_body(
     if take > 0 {
         counter.fetch_add(take as u64, Ordering::SeqCst);
     }
+    let paced_until = pace.map_or(expected_len, |p| {
+        expected_len.saturating_sub(p.unpaced_tail)
+    });
+    let pace = pace.map(|p| p.pace);
     let mut buf = [0u8; 16_384];
     let started = std::time::Instant::now();
     while (body.len() as u64) < max_read {
@@ -437,7 +475,7 @@ fn read_store_body(
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
                 counter.fetch_add(n as u64, Ordering::SeqCst);
-                keep_pace(pace, started, body.len() as u64);
+                keep_pace(pace, started, (body.len() as u64).min(paced_until));
             }
         }
     }
@@ -959,7 +997,7 @@ fn handle_store_put_part(
         }
         let cut_limit = state.cut_next.take();
         let silence = state.silence_next.take();
-        let pace = state.pace;
+        let pace = UploadPace::of(&state);
         (expected_size, expected_sha256, cut_limit, silence, pace)
     };
 
@@ -1028,7 +1066,8 @@ fn handle_store_put_single(
     };
     let (cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
-        (state.cut_next.take(), state.silence_next.take(), state.pace)
+        let pace = UploadPace::of(&state);
+        (state.cut_next.take(), state.silence_next.take(), pace)
     };
     let body = match read_store_body(
         stream,
