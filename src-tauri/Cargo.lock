@@ -4768,6 +4768,8 @@ dependencies = [
  "keeper-accounts",
  "keeper-accounts-api",
  "keeper-app-api",
+ "keeper-files",
+ "keeper-files-api",
  "keeper-graph",
  "keeper-graph-api",
  "keeper-ports",

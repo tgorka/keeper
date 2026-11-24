@@ -30,6 +30,8 @@ mod compose;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod debug;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod files;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod graph;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod output;
@@ -74,6 +76,8 @@ mod cli {
     pub enum Module {
         /// A person's device's graph against a real keeper-hq.
         Graph(super::graph::Args),
+        /// A domain's drives: list, fetch on demand, put.
+        Files(super::files::Args),
         /// The person's domains, as a device last showed them.
         #[command(subcommand)]
         Accounts(super::accounts::Args),
@@ -94,6 +98,7 @@ fn main() -> std::process::ExitCode {
     let printer = output::Printer::new(cli.json);
     let code = match cli.module {
         cli::Module::Graph(args) => graph::main(args, &printer),
+        cli::Module::Files(args) => files::main(args, &printer),
         cli::Module::Accounts(args) => accounts::main(args, &printer),
         cli::Module::Serve(args) => serve::main(args, &printer),
         cli::Module::Debug(args) => debug::main(args, &printer),

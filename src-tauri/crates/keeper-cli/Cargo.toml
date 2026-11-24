@@ -33,6 +33,9 @@ sha2 = { workspace = true }
 keeper-accounts = { path = "../keeper-accounts" }
 keeper-accounts-api = { path = "../keeper-accounts-api" }
 keeper-replica = { path = "../keeper-replica" }
+# `files` (story 116.4): drives, ls, get, put.
+keeper-files = { path = "../keeper-files" }
+keeper-files-api = { path = "../keeper-files-api" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
