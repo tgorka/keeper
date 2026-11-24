@@ -34,7 +34,8 @@ use serde_json::{Map, Value};
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
 use super::admission::{Admission, Principal};
-use super::projection::{Exporter, Generation, Store};
+use super::prefix::PrefixError;
+use super::projection::{Exporter, Generation, Limits, Store};
 use super::protocol::profile::{admit, MAX_ROWS};
 use super::protocol::wire::{
     self, admit_read_params, decode_content, decode_context, decode_edge, decode_node,
@@ -252,6 +253,7 @@ struct Reads {
     admission: Arc<Admission>,
     runtime: Arc<Runtime>,
     exporter: AsyncMutex<Option<Exporter>>,
+    limits: Limits,
     revoked: watch::Sender<bool>,
     inflight: AtomicUsize,
     idle: Notify,
@@ -281,6 +283,17 @@ impl GraphReads {
         admission: Arc<Admission>,
         runtime: Arc<Runtime>,
     ) -> Result<Self, QueryError> {
+        Self::open_within(source, root, admission, runtime, Limits::default())
+    }
+
+    /// [`GraphReads::open`] whose exports hold at most `limits`.
+    pub(crate) fn open_within(
+        source: Arc<dyn GraphSource>,
+        root: &Path,
+        admission: Arc<Admission>,
+        runtime: Arc<Runtime>,
+        limits: Limits,
+    ) -> Result<Self, QueryError> {
         if !super::available() {
             return Err(QueryError::Unavailable("platform.unsupported"));
         }
@@ -291,6 +304,7 @@ impl GraphReads {
             admission,
             runtime,
             exporter: AsyncMutex::new(None),
+            limits,
             revoked: watch::channel(false).0,
             inflight: AtomicUsize::new(0),
             idle: Notify::new(),
@@ -421,14 +435,21 @@ impl GraphReads {
         let checkpoint = self.scope()?;
         let mut held = self.0.exporter.lock().await;
         if held.is_none() {
-            *held = Some(Exporter::genesis(
+            *held = Some(Exporter::genesis_within(
                 self.domain(),
                 &self.0.store.export_path(),
+                self.0.limits,
             )?);
         }
         let exporter = held.as_mut().ok_or(QueryError::Storage("export"))?;
         let extended = match exporter.extend(self.0.source.as_ref()) {
             Ok(extended) => extended,
+            Err(error @ PrefixError::Capacity { .. }) => {
+                // The verified prefix stays: nothing is corrupt, and the
+                // next refresh resumes where this one stopped.
+                tracing::warn!(domain = self.domain(), %error, "graph prefix past capacity");
+                return Err(QueryError::Unavailable("prefix.capacity"));
+            }
             Err(error) => {
                 // A corrupt prefix is never served shortened; the next
                 // refresh replays from genesis.

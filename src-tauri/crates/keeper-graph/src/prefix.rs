@@ -55,6 +55,11 @@ pub enum PrefixError {
     /// The event at `at` is present and does not verify.
     #[error("graph event {at} is corrupt: {reason}")]
     Corrupt { at: u64, reason: &'static str },
+    /// The event at `at` would take the prefix past what one generation
+    /// holds (`measure`: `"events"`, `"entities"` or `"export_bytes"`).
+    /// The prefix before it verified; nothing is corrupt.
+    #[error("graph event {at} is past what one generation holds: {measure}")]
+    Capacity { at: u64, measure: &'static str },
 }
 
 pub(crate) fn corrupt(at: u64, reason: &'static str) -> PrefixError {

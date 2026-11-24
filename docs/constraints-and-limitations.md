@@ -372,8 +372,9 @@ keeps at most two published generations alive (`MAX_RETAINED_GENERATIONS`); a bu
 refused while two are referenced. A selected generation a worker refuses as unreadable is
 unselected and rebuilt from the accepted history on the next refresh. Query and inspection
 deadlines (3 s) and the build deadline (180 s) run from before spawn through exit and reap. A
-prefix longer than 100,000 events or an export over 1 GiB is an R1 limit:
-`projection_unavailable`.
+prefix longer than 100,000 events, more than 1,000,000 live entities or an export over 1 GiB is
+an R1 limit: `projection_unavailable: prefix.capacity` (typed `PrefixError::Capacity`, never
+`prefix.corrupt`); the verified prefix is kept, so the next refresh resumes rather than replaying.
 
 **Worker value admission (R6).** The builder admits every after-image with the reviewed 110.1
 rule, unchanged: nesting at most 16, finite numbers within ±2^53−1, strings at most 65,536
