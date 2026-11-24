@@ -180,4 +180,43 @@ table. Each figure below names its run date beside this commit's.
 
 ### Figures
 
-None yet.
+**hesperia** (macOS 27.0, arm64, `rustc` 1.99.1, `tonic` 0.14.9, `prost`
+0.14.4, `rmcp` 3.10.0; spike `6e1b4f76` from base `df74c488`; run
+2026-11-24 17:51–17:58 UTC, after the thresholds commit `c4dda2bf` of
+17:18 UTC). The owner's own account, while he worked: load average 6 to 15
+during the run, so the tails are pessimistic.
+
+W1: the schema-checked echo, 10 000 warm calls, p50 / p99 in µs, one connection:
+
+| Payload | gRPC, socket | NDJSON, socket | `tonic` over `duplex` | direct call |
+| --- | --- | --- | --- | --- |
+| 64 B | 32.9 / 64.1 | 8.0 / 16.1 | 14.8 / 28.6 | 0.1 / 0.2 |
+| 4 KiB | 42.4 / 86.0 | 14.2 / 33.8 | 27.7 / 37.2 | 0.2 / 0.2 |
+| 64 KiB | 302.0 / 537.0 | 196.8 / 340.9 | 135.8 / 258.6 | 0.9 / 1.2 |
+| 1 MiB | 3 903 / 6 329 | 2 942 / 4 177 | 1 498 / 1 945 | 19.7 / 54.1 |
+
+At 8 and 64 concurrent calls, gRPC shares one connection and NDJSON opens
+one connection per caller. 4 KiB at 64 concurrent calls: gRPC 1 575 / 3 488,
+NDJSON 233 / 974. One run of gRPC at 64 B and 64 concurrent calls broke with
+`BrokenPipe` ("stream closed because of a broken pipe") and was recorded as
+a failure, not a figure. 123.3 should look at this before it relies on one
+shared connection. The full table is the run's `w1.json`.
+
+W4: `keeper-cli`, stripped release binary: 10 055 296 B without the wire;
+14 575 408 B with `tonic`/`prost`/`tower` and the input schema check
+(`jsonschema`); 16 957 760 B with `rmcp` as well (+6.58 MiB). The app's
+binary was not built on hesperia; it is owed.
+
+W8: the three fixed tools' `tools` array is 590 B and 124 tokens
+(`tiktoken-rs` 0.9.1, `o200k_base`). Each pinned candidate adds 222–243 B
+(46–52 tokens). Two runs give identical bytes and SHA-256.
+
+| # | hesperia | delectra |
+| --- | --- | --- |
+| T1 | **met**: +42.2 µs p50, +85.7 µs p99 | pending |
+| T2 | **not met**: gRPC's added p50 is 3.01 × NDJSON's | pending |
+| T3 | **met**: +6.58 MiB | pending |
+| T4 | not measured (app build owed) | — |
+
+The delectra figures and the rest of W7, W11 and W12 follow in 123.1's
+report.
