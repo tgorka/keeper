@@ -96,11 +96,12 @@ pub struct Submit {
     pub not_before_ms: Option<u64>,
 }
 
-/// `jobs.cancel`: the submitter ends a job that has not ended.
+/// `jobs.cancel`: the submitter ends a queued job or requests cancellation of a claimed one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cancel {
     pub job_id: String,
+    pub expected_revision: u64,
 }
 
 /// `jobs.claim`: a worker acquires a job for `lease_ms`.
@@ -108,6 +109,7 @@ pub struct Cancel {
 #[serde(deny_unknown_fields)]
 pub struct Claim {
     pub job_id: String,
+    pub expected_claim_revision: u64,
     pub lease_ms: u64,
 }
 

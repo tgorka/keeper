@@ -18,6 +18,13 @@
 //! claim, a takeover, a re-claim after release, a restart with the same
 //! client, and A→B→A. The session claim's rule (rise only on a new holder
 //! client) is not this one.
+//!
+//! **Cancel and the attempt bound.** Cancelling a `queued` job ends it at once. Cancelling a
+//! `claimed` one records `cancel_requested_at_ms` and lets the running attempt finish: its next
+//! `jobs.renew` is refused `cancel_requested`, its `jobs.complete` is still recorded, and its
+//! `jobs.release` or re-queueing `jobs.fail` ends the job `cancelled` (as does a takeover claim).
+//! A job never outlives its attempt bound: releasing the last attempt ends it `dead`, and a claim
+//! over a lapsed last attempt ends it `dead` while answering `attempts_exhausted`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +69,16 @@ pub struct Rows {
     pub claim: Option<JobClaim>,
 }
 
+/// What a judged command writes. `code` is `None` when the command is accepted; `Some` when it is
+/// refused yet its commit is applied, because the judgement ends the job (a claim beyond the
+/// attempt bound or after a cancel request): the receipt is `rejected` with that code and the
+/// commit's sequence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Judged {
+    pub rows: Rows,
+    pub code: Option<Refusal>,
+}
+
 /// Whether `claim` no longer holds its job at the server's `now_ms`: given
 /// back, or not renewed within its lease by the server's own record.
 #[must_use]
@@ -93,25 +110,41 @@ pub fn input_digest(payload: &crate::command::Submit) -> Result<String, Refusal>
 
 /// Judges a checked job command against `before`. `jobs.declare_capability`
 /// is [`declare`]'s.
-pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows, Refusal> {
+pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Judged, Refusal> {
     match payload {
-        Payload::Submit(p) => submit(p, before, ctx),
+        Payload::Submit(p) => submit(p, before, ctx).map(|rows| Judged { rows, code: None }),
         Payload::DeclareCapability(_) => Err(Refusal::InvalidRequest),
-        Payload::Cancel(_) => {
+        Payload::Cancel(p) => {
             let job = open_job(before)?;
-            let mut after = before.clone();
-            let mut job = job.clone();
-            end(&mut job, JobState::Cancelled, ctx);
-            if let Some(claim) = after.claim.as_mut() {
-                release(claim, &job, ctx);
+            if p.expected_revision != job.revision {
+                return Err(Refusal::Conflict);
             }
-            after.job = Some(job);
-            Ok(after)
+            if job.state == JobState::Claimed {
+                let mut job = job.clone();
+                if job.cancel_requested_at_ms.is_none() {
+                    job.cancel_requested_at_ms = Some(ctx.now_ms);
+                }
+                touch(&mut job, ctx);
+                return Ok(Judged {
+                    rows: Rows {
+                        job: Some(job),
+                        claim: before.claim.clone(),
+                    },
+                    code: None,
+                });
+            }
+            Ok(Judged {
+                rows: ended(before, job, JobState::Cancelled, ctx),
+                code: None,
+            })
         }
         Payload::Claim(p) => {
             let job = open_job(before)?;
             if ctx.now_ms < job.not_before_ms {
                 return Err(Refusal::NotDue);
+            }
+            if p.expected_claim_revision != before.claim.as_ref().map_or(0, |c| c.revision) {
+                return Err(Refusal::Conflict);
             }
             if let Some(claim) = &before.claim {
                 let same_client = claim.holder_actor == ctx.caller.actor
@@ -120,8 +153,17 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
                     return Err(Refusal::Conflict);
                 }
             }
+            if job.cancel_requested_at_ms.is_some() {
+                return Ok(Judged {
+                    rows: ended(before, job, JobState::Cancelled, ctx),
+                    code: Some(Refusal::CancelRequested),
+                });
+            }
             if job.attempt >= job.max_attempts {
-                return Err(Refusal::AttemptsExhausted);
+                return Ok(Judged {
+                    rows: ended(before, job, JobState::Dead, ctx),
+                    code: Some(Refusal::AttemptsExhausted),
+                });
             }
             let attempt_id = ctx
                 .minted_attempt_id
@@ -151,32 +193,50 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
                 author_actor: ctx.caller.actor.clone(),
                 author_client: ctx.caller.client.clone(),
             };
-            Ok(Rows {
-                job: Some(job),
-                claim: Some(claim),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job),
+                    claim: Some(claim),
+                },
+                code: None,
             })
         }
         Payload::Renew(p) => {
             let (job, claim) = current(before, p, ctx)?;
+            if job.cancel_requested_at_ms.is_some() {
+                return Err(Refusal::CancelRequested);
+            }
             let mut claim = claim.clone();
             claim.renewed_at_ms = ctx.now_ms;
             claim.revision += 1;
             author(&mut claim, ctx);
-            Ok(Rows {
-                job: Some(job.clone()),
-                claim: Some(claim),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job.clone()),
+                    claim: Some(claim),
+                },
+                code: None,
             })
         }
         Payload::Release(p) => {
             let (job, claim) = current(before, p, ctx)?;
             let mut job = job.clone();
-            job.state = JobState::Queued;
-            touch(&mut job, ctx);
+            if job.cancel_requested_at_ms.is_some() {
+                end(&mut job, JobState::Cancelled, ctx);
+            } else if job.attempt >= job.max_attempts {
+                end(&mut job, JobState::Dead, ctx);
+            } else {
+                job.state = JobState::Queued;
+                touch(&mut job, ctx);
+            }
             let mut claim = claim.clone();
             release(&mut claim, &job, ctx);
-            Ok(Rows {
-                job: Some(job),
-                claim: Some(claim),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job),
+                    claim: Some(claim),
+                },
+                code: None,
             })
         }
         Payload::Progress(p) => {
@@ -196,9 +256,12 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
                 job.note.clone_from(&p.note);
             }
             touch(&mut job, ctx);
-            Ok(Rows {
-                job: Some(job),
-                claim: Some(claim.clone()),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job),
+                    claim: Some(claim.clone()),
+                },
+                code: None,
             })
         }
         Payload::Complete(p) => {
@@ -210,9 +273,12 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
             end(&mut job, JobState::Succeeded, ctx);
             let mut claim = claim.clone();
             release(&mut claim, &job, ctx);
-            Ok(Rows {
-                job: Some(job),
-                claim: Some(claim),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job),
+                    claim: Some(claim),
+                },
+                code: None,
             })
         }
         Payload::Fail(p) => {
@@ -222,8 +288,12 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
             job.error_sentence = Some(p.sentence.clone());
             job.effects = Some(p.effects.clone());
             if p.retryable && job.attempt < job.max_attempts {
-                job.state = JobState::Queued;
-                touch(&mut job, ctx);
+                if job.cancel_requested_at_ms.is_some() {
+                    end(&mut job, JobState::Cancelled, ctx);
+                } else {
+                    job.state = JobState::Queued;
+                    touch(&mut job, ctx);
+                }
             } else {
                 let state = if p.retryable {
                     JobState::Dead
@@ -234,9 +304,12 @@ pub fn judge(payload: &Payload, before: &Rows, ctx: &Context<'_>) -> Result<Rows
             }
             let mut claim = claim.clone();
             release(&mut claim, &job, ctx);
-            Ok(Rows {
-                job: Some(job),
-                claim: Some(claim),
+            Ok(Judged {
+                rows: Rows {
+                    job: Some(job),
+                    claim: Some(claim),
+                },
+                code: None,
             })
         }
     }
@@ -306,6 +379,7 @@ fn submit(p: &crate::command::Submit, before: &Rows, ctx: &Context<'_>) -> Resul
         submitted_at_ms: ctx.now_ms,
         updated_at_ms: ctx.now_ms,
         ended_at_ms: None,
+        cancel_requested_at_ms: None,
         revision: 1,
         author_actor: ctx.caller.actor.clone(),
         author_client: ctx.caller.client.clone(),
@@ -369,6 +443,20 @@ fn end(job: &mut Job, state: JobState, ctx: &Context<'_>) {
     job.ended_at_ms = Some(ctx.now_ms);
     job.page_key = page::month(&job.domain, ctx.now_ms);
     touch(job, ctx);
+}
+
+/// `before` with `job` ended in `state` and its claim, if any, given back and moved with it.
+fn ended(before: &Rows, job: &Job, state: JobState, ctx: &Context<'_>) -> Rows {
+    let mut job = job.clone();
+    end(&mut job, state, ctx);
+    let mut claim = before.claim.clone();
+    if let Some(claim) = claim.as_mut() {
+        release(claim, &job, ctx);
+    }
+    Rows {
+        job: Some(job),
+        claim,
+    }
 }
 
 /// Gives the claim back and keeps it under its job's page.

@@ -1590,7 +1590,7 @@ which move together):
   `cancelled`, `dead`), `attempt`, `max_attempts`, `not_before_ms`, `plan_blob`, `plan_attempt_id`,
   `note`, `result`, `result_blob`, `effects`, `error_code`, `error_sentence`, `submitter_actor`,
   `submitter_client`, `submitter_context`, `submitted_at_ms`, `updated_at_ms`, `ended_at_ms`,
-  `revision`, `author_actor`, `author_client`.
+  `cancel_requested_at_ms`, `revision`, `author_actor`, `author_client`.
 - `job_claims`: `job_id` (key), `domain`, `page_key`, `holder_actor`, `holder_client`, `attempt_id`,
   `epoch`, `lease_ms`, `acquired_at_ms`, `renewed_at_ms`, `released`, `revision`, authorship.
 - `job_capabilities`: `id` (the client scope, *Ids*), `domain`, `actor_id`, `client_id`,
@@ -1598,8 +1598,9 @@ which move together):
 
 **Scope and isolation.** While a job has not ended, its `jobs` and `job_claims` rows live under
 `jobs_page` = `<domain>/open`. The command that ends it (`jobs.complete`, a `jobs.fail` leaving it
-`failed` or `dead`, or `jobs.cancel`) moves both rows to `<domain>/<yyyy-mm>`, the UTC month it
-ended in, in the same commit, by Syncular's explicit scope move: an upsert and a `rescope` of the
+`failed`, `dead` or `cancelled`, `jobs.cancel`, `jobs.release`, or a `jobs.claim` ending it `dead`
+or `cancelled`) moves both rows to `<domain>/<yyyy-mm>`, the UTC month it ended in, in the same
+commit, by Syncular's explicit scope move: an upsert and a `rescope` of the
 same row (0.97 `dist/push.js:215-275`, §2.2: only scope columns may differ; the delete under the
 old scopes and the upsert under the new are emitted at the next version). A client subscribing the
 current month and `<domain>/open` therefore holds every running job however old, and every job
@@ -1615,18 +1616,20 @@ context_id: <ULID> | null, payload: {…}}` (*The knowledge graph*, Requests); i
 SHA-256 of the JCS bytes of `{version, descriptor, context_id, payload}`. The receipt is
 `{descriptor, request_id, request_digest, outcome: accepted | conflict | rejected, code?,
 commit_seq?, attempt_id?, epoch?}`; the same request id with the same digest is answered from the
-record, with another digest `idempotency_mismatch`.
+record, with another digest `idempotency_mismatch`. A judgement that ends a job while refusing the
+command (a claim beyond the attempt bound or after a cancel request) is answered `rejected` with
+its `code` and the `commit_seq` of the commit that ended the job.
 
 | descriptor | payload | caller | effect |
 | --- | --- | --- | --- |
 | `jobs.submit` | `{job_id, kind, input?: {refs, params}, input_blob?, runs_on, max_attempts, not_before_ms?}` | person, agent or tool | a `queued` job under `<domain>/open`, with `input_digest`; `input` and `input_blob` exclusive |
-| `jobs.cancel` | `{job_id}` | the submitter | ends an open job `cancelled`, releases its claim, moves both rows |
-| `jobs.claim` | `{job_id, lease_ms}` | a worker | acquires a due job; the receipt carries the new `attempt_id`, `epoch` and `commit_seq` |
-| `jobs.renew` | `{job_id, attempt_id}` | the holder | `renewed_at_ms` = the server's clock |
-| `jobs.release` | `{job_id, attempt_id}` | the holder | the claim `released`, the job `queued` |
+| `jobs.cancel` | `{job_id, expected_revision}` | the submitter | a `queued` job ends `cancelled` at once (claim released, both rows moved); a `claimed` job records `cancel_requested_at_ms`, which its current attempt meets at its next `jobs.renew` (refused `cancel_requested`); its `jobs.complete` or `jobs.fail` is still recorded; a stale `expected_revision` is `conflict` |
+| `jobs.claim` | `{job_id, expected_claim_revision, lease_ms}` (`0` when no claim row) | a worker | acquires a due job; the receipt carries the new `attempt_id`, `epoch` and `commit_seq`; stale revision `conflict`; a job with a cancel request ends `cancelled` (receipt `cancel_requested`) and one with no attempt left ends `dead` (receipt `attempts_exhausted`), both moving the rows |
+| `jobs.renew` | `{job_id, attempt_id}` | the holder | `renewed_at_ms` = the server's clock; refused `cancel_requested` once a cancel is requested |
+| `jobs.release` | `{job_id, attempt_id}` | the holder | the claim `released`; the job `queued`, or `dead` at its last attempt, or `cancelled` when a cancel was requested |
 | `jobs.progress` | `{job_id, attempt_id, note?, plan_blob?, input_digest}` | the holder | a note and, once, the plan bound to `input_digest`: a second plan `plan_exists`, another digest `input_moved` |
 | `jobs.complete` | `{job_id, attempt_id, result? \| result_blob?, effects}` | the holder | ends the job `succeeded`, releases the claim, moves both rows |
-| `jobs.fail` | `{job_id, attempt_id, error_code, sentence, retryable, effects?}` | the holder | retryable with attempts left: `queued`; otherwise ends `failed` (not retryable) or `dead`, and moves both rows |
+| `jobs.fail` | `{job_id, attempt_id, error_code, sentence, retryable, effects?}` | the holder | retryable with attempts left: `queued` (a cancel request turns a re-queue into `cancelled`); otherwise ends `failed` (not retryable) or `dead`, and moves both rows |
 | `jobs.declare_capability` | `{capabilities}` | any client | replaces the caller's own `job_capabilities` row (122.5 builds on it) |
 
 **References** (never inline bytes): `{type: row, table, id}`, `{type: job_blob, job_id, column:
@@ -1658,4 +1661,5 @@ bound of `limits.json`. The stable codes: `invalid_request`, `unsupported_versio
 `idempotency_mismatch`, `row_too_large`, `inline_too_large`, `note_too_large`, `too_many_refs`,
 `too_many_effects`, `plan_too_large`, `lease_out_of_range`, `attempts_out_of_range`,
 `too_many_open`, `job_exists`, `unknown_job`, `terminal`, `conflict`, `not_due`,
-`attempts_exhausted`, `stale_attempt`, `plan_exists`, `input_moved`, `invalid_effect`.
+`attempts_exhausted`, `stale_attempt`, `plan_exists`, `input_moved`, `invalid_effect`,
+`cancel_requested`.

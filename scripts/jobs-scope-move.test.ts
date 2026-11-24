@@ -99,6 +99,7 @@ function makeJobRow(overrides: Partial<Record<string, RowValue>> = {}): Record<s
     submitted_at_ms: SUBMITTED_AT_MS,
     updated_at_ms: SUBMITTED_AT_MS,
     ended_at_ms: null,
+    cancel_requested_at_ms: null,
     revision: 2,
     author_actor: SERVICE,
     author_client: SERVICE,

@@ -52,6 +52,8 @@ pub enum Refusal {
     InputMoved,
     /// An effect names another job, or repeats an ordinal.
     InvalidEffect,
+    /// Cancellation was requested; the attempt cannot renew or be re-claimed.
+    CancelRequested,
 }
 
 impl Refusal {
@@ -81,11 +83,12 @@ impl Refusal {
             Self::PlanExists => "plan_exists",
             Self::InputMoved => "input_moved",
             Self::InvalidEffect => "invalid_effect",
+            Self::CancelRequested => "cancel_requested",
         }
     }
 
     /// Every code, in declaration order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::InvalidRequest,
         Self::UnsupportedVersion,
         Self::IdempotencyMismatch,
@@ -108,6 +111,7 @@ impl Refusal {
         Self::PlanExists,
         Self::InputMoved,
         Self::InvalidEffect,
+        Self::CancelRequested,
     ];
 }
 

@@ -35,7 +35,8 @@
     "stale_attempt",
     "plan_exists",
     "input_moved",
-    "invalid_effect"
+    "invalid_effect",
+    "cancel_requested"
   ],
   "limits": {
     "jobRowMaxBytes": 65536,
@@ -176,11 +177,25 @@
         "request_id": "01JD000000000000000000R005",
         "context_id": null,
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         }
       },
       "outcome": "accepted",
-      "digest": "sha256:9d9a6e3663e8885b190056ba1363334f59d9d6799564614fa831bc87805add5a"
+      "digest": "sha256:bbc57cf2cc9141a42db0a330f08fab583a67b722728467dadde15a2978e2e878"
+    },
+    {
+      "name": "cancel-missing-expected-revision",
+      "descriptor": "jobs.cancel",
+      "envelope": {
+        "version": 1,
+        "request_id": "01JD000000000000000000R005",
+        "context_id": null,
+        "payload": {
+          "job_id": "01JD0000000000000000000001"
+        }
+      },
+      "outcome": "invalid_request"
     },
     {
       "name": "claim-minimal",
@@ -191,11 +206,26 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_claim_revision": 0,
           "lease_ms": 30000
         }
       },
       "outcome": "accepted",
-      "digest": "sha256:fc311ec997a1a41764086cfc89d9cce48e06b595f50e0b2e2724245f9c4a9770"
+      "digest": "sha256:1e84bb8b4cde7d5e14e53ca7555d89be0adf55af069b8f3a955d8c3a1aa96207"
+    },
+    {
+      "name": "claim-missing-expected-claim-revision",
+      "descriptor": "jobs.claim",
+      "envelope": {
+        "version": 1,
+        "request_id": "01JD000000000000000000R006",
+        "context_id": null,
+        "payload": {
+          "job_id": "01JD0000000000000000000001",
+          "lease_ms": 30000
+        }
+      },
+      "outcome": "invalid_request"
     },
     {
       "name": "renew-minimal",
@@ -351,7 +381,8 @@
         "request_id": "01JD000000000000000000R014",
         "context_id": null,
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         }
       },
       "outcome": "unsupported_version"
@@ -364,7 +395,8 @@
         "request_id": "not-a-ulid",
         "context_id": "bad-ctx",
         "payload": {
-          "job_id": "bad-job"
+          "job_id": "bad-job",
+          "expected_revision": 1
         },
         "extra": true
       },
@@ -377,7 +409,8 @@
         "request_id": "01JD000000000000000000R015",
         "context_id": null,
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         }
       },
       "outcome": "invalid_request"
@@ -390,7 +423,8 @@
         "request_id": "01JD000000000000000000R016",
         "context_id": null,
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         },
         "extra": 1
       },
@@ -404,7 +438,8 @@
         "request_id": "not-a-ulid",
         "context_id": null,
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         }
       },
       "outcome": "invalid_request"
@@ -417,7 +452,8 @@
         "request_id": "01JD000000000000000000R017",
         "context_id": "not-a-ulid",
         "payload": {
-          "job_id": "01JD0000000000000000000001"
+          "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1
         }
       },
       "outcome": "invalid_request"
@@ -442,6 +478,7 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_revision": 1,
           "extra": true
         }
       },
@@ -461,7 +498,8 @@
         "request_id": "01JD000000000000000000R020",
         "context_id": null,
         "payload": {
-          "job_id": "bad-ulid"
+          "job_id": "bad-ulid",
+          "expected_revision": 1
         }
       },
       "outcome": "invalid_request"
@@ -5444,11 +5482,12 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_claim_revision": 0,
           "lease_ms": 10000
         }
       },
       "outcome": "accepted",
-      "digest": "sha256:2b88626e86e96edb3988764c4593b99c608b5578247fdd17275833c797ebf4d0"
+      "digest": "sha256:ab097ceeab8769230a0dd8c7d0e027751d1acf69c24d6ea2393f2a0ecf46ac29"
     },
     {
       "name": "claim-lease-below-min",
@@ -5459,6 +5498,7 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_claim_revision": 0,
           "lease_ms": 9999
         }
       },
@@ -5473,11 +5513,12 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_claim_revision": 0,
           "lease_ms": 600000
         }
       },
       "outcome": "accepted",
-      "digest": "sha256:2ea0aa4bba53a3f862fa03762afbbcda36ae03ad46a410b12f4dd7862e5bdbf4"
+      "digest": "sha256:4c0f4cbcf897a4f51287971a3f0c1328ef27d7fbe014c399ed430517b7c4dba9"
     },
     {
       "name": "claim-lease-above-max",
@@ -5488,6 +5529,7 @@
         "context_id": null,
         "payload": {
           "job_id": "01JD0000000000000000000001",
+          "expected_claim_revision": 0,
           "lease_ms": 600001
         }
       },
@@ -11066,6 +11108,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000001",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11201,7 +11244,8 @@
           "now_ms": 1795996806000,
           "descriptor": "jobs.cancel",
           "payload": {
-            "job_id": "01JD0000000000000000000001"
+            "job_id": "01JD0000000000000000000001",
+            "expected_revision": 4
           },
           "outcome": "terminal"
         },
@@ -11272,6 +11316,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000002",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11382,6 +11427,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000002",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A2",
@@ -11426,6 +11472,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000003",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11452,6 +11499,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000003",
+            "expected_claim_revision": 1,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A2",
@@ -11535,6 +11583,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000004",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11562,6 +11611,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000004",
+            "expected_claim_revision": 1,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000B1",
@@ -11576,6 +11626,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000004",
+            "expected_claim_revision": 1,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000B1",
@@ -11632,6 +11683,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000004",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A3",
@@ -11730,6 +11782,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000005",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11778,6 +11831,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000005",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000B1",
@@ -11792,6 +11846,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000005",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000B1",
@@ -11847,6 +11902,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000006",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -11929,6 +11985,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000007",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12000,6 +12057,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000007",
+            "expected_claim_revision": 1,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000B1",
@@ -12076,7 +12134,7 @@
     },
     {
       "name": "release-then-reclaim",
-      "about": "Releasing a claim returns the job to queued and marks the claim released; reclaiming increments epoch and attempt until attempts_exhausted.",
+      "about": "Releasing a claim with attempts left returns the job to queued and marks the claim released; reclaiming raises epoch and attempt; releasing the last attempt ends the job dead and moves it to its month.",
       "steps": [
         {
           "caller": {
@@ -12111,6 +12169,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000008",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12161,6 +12220,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000008",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A2",
@@ -12193,13 +12253,21 @@
           "outcome": "accepted",
           "expect": {
             "job": {
-              "state": "queued",
+              "state": "dead",
+              "attempt": 2,
+              "ended_at_ms": 1795996803000,
+              "page_key": "d/2026-11",
               "revision": 5
             },
             "claim": {
               "released": true,
+              "page_key": "d/2026-11",
               "revision": 4
             }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
           }
         },
         {
@@ -12211,10 +12279,11 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000008",
+            "expected_claim_revision": 4,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A3",
-          "outcome": "attempts_exhausted"
+          "outcome": "terminal"
         }
       ]
     },
@@ -12255,6 +12324,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000009",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12312,6 +12382,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000009",
+            "expected_claim_revision": 2,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A2",
@@ -12400,6 +12471,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000010",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12463,6 +12535,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000011",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12537,6 +12610,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000011",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12551,6 +12625,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000011",
+            "expected_claim_revision": 0,
             "lease_ms": 30000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12612,6 +12687,7 @@
           "descriptor": "jobs.claim",
           "payload": {
             "job_id": "01JD0000000000000000000012",
+            "expected_claim_revision": 0,
             "lease_ms": 600000
           },
           "minted_attempt_id": "01JD00000000000000000000A1",
@@ -12729,101 +12805,6 @@
       ]
     },
     {
-      "name": "cancel-moves-and-releases",
-      "about": "Cancelling a claimed job moves both job and claim to the end month, releases the claim, and refuses further worker renewal as terminal.",
-      "steps": [
-        {
-          "caller": {
-            "actor": "alice",
-            "client": "alice-phone",
-            "context": null
-          },
-          "now_ms": 1795996800000,
-          "descriptor": "jobs.submit",
-          "payload": {
-            "job_id": "01JD0000000000000000000013",
-            "kind": "test.alpha",
-            "runs_on": "server",
-            "max_attempts": 3
-          },
-          "outcome": "accepted",
-          "expect": {
-            "job": {
-              "state": "queued",
-              "page_key": "d/open",
-              "revision": 1
-            },
-            "claim": null
-          }
-        },
-        {
-          "caller": {
-            "actor": "worker",
-            "client": "w-a"
-          },
-          "now_ms": 1795996801000,
-          "descriptor": "jobs.claim",
-          "payload": {
-            "job_id": "01JD0000000000000000000013",
-            "lease_ms": 30000
-          },
-          "minted_attempt_id": "01JD00000000000000000000A1",
-          "outcome": "accepted",
-          "expect": {
-            "job": {
-              "state": "claimed",
-              "attempt": 1,
-              "revision": 2
-            },
-            "claim": {
-              "epoch": 1,
-              "released": false,
-              "revision": 1
-            }
-          }
-        },
-        {
-          "caller": {
-            "actor": "alice",
-            "client": "alice-phone",
-            "context": null
-          },
-          "now_ms": 1795996802000,
-          "descriptor": "jobs.cancel",
-          "payload": {
-            "job_id": "01JD0000000000000000000013"
-          },
-          "outcome": "accepted",
-          "expect": {
-            "job": {
-              "state": "cancelled",
-              "ended_at_ms": 1795996802000,
-              "page_key": "d/2026-11",
-              "revision": 3
-            },
-            "claim": {
-              "released": true,
-              "page_key": "d/2026-11",
-              "revision": 2
-            }
-          }
-        },
-        {
-          "caller": {
-            "actor": "worker",
-            "client": "w-a"
-          },
-          "now_ms": 1795996803000,
-          "descriptor": "jobs.renew",
-          "payload": {
-            "job_id": "01JD0000000000000000000013",
-            "attempt_id": "01JD00000000000000000000A1"
-          },
-          "outcome": "terminal"
-        }
-      ]
-    },
-    {
       "name": "declare-capability",
       "about": "Declaring capabilities sorts and deduplicates them under the client scope id and increments revision on replacement.",
       "steps": [
@@ -12869,6 +12850,1011 @@
               "revision": 2
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "claim-with-a-stale-claim-revision-conflicts",
+      "about": "Claiming with an outdated expected_claim_revision conflicts without mutating state; retrying with the current claim revision succeeds.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J1",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "attempt": 0,
+              "cancel_requested_at_ms": null,
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J1",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.release",
+          "payload": {
+            "job_id": "01JD00000000000000000000J1",
+            "attempt_id": "01JD00000000000000000000A1"
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 3
+            },
+            "claim": {
+              "released": true,
+              "page_key": "d/open",
+              "revision": 2
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-b"
+          },
+          "now_ms": 1795996803000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J1",
+            "expected_claim_revision": 1,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A2",
+          "outcome": "conflict"
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-b"
+          },
+          "now_ms": 1795996804000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J1",
+            "expected_claim_revision": 2,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A2",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 2,
+              "revision": 4
+            },
+            "claim": {
+              "epoch": 2,
+              "attempt_id": "01JD00000000000000000000A2",
+              "holder_client": "w-b",
+              "released": false,
+              "page_key": "d/open",
+              "revision": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "first-claim-with-a-nonzero-revision-conflicts",
+      "about": "Claiming a never-claimed job requires expected_claim_revision 0; a nonzero value conflicts.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J2",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "attempt": 0,
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J2",
+            "expected_claim_revision": 1,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "conflict"
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J2",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel-with-a-stale-revision-conflicts",
+      "about": "Cancelling with an outdated expected_revision conflicts; retrying with the current job revision records the cancel request.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J3",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J3",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "released": false,
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J3",
+            "expected_revision": 1
+          },
+          "outcome": "conflict"
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996803000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J3",
+            "expected_revision": 2
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "cancel_requested_at_ms": 1795996803000,
+              "ended_at_ms": null,
+              "page_key": "d/open",
+              "revision": 3
+            },
+            "claim": {
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          },
+          "held_by": {
+            "d/open": true,
+            "d/2026-11": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel-of-a-queued-job-ends-it-at-once",
+      "about": "Cancelling a queued job immediately moves it to cancelled on the month page and refuses subsequent claims as terminal.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J4",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J4",
+            "expected_revision": 1
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "cancelled",
+              "ended_at_ms": 1795996801000,
+              "cancel_requested_at_ms": null,
+              "page_key": "d/2026-11",
+              "revision": 2
+            },
+            "claim": null
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J4",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "terminal"
+        }
+      ]
+    },
+    {
+      "name": "cancel-of-a-claimed-job-is-honoured-at-the-next-renewal",
+      "about": "Cancelling a claimed job records cancel_requested_at_ms without releasing the claim; renew returns cancel_requested, and the worker can still complete with effects.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J5",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J5",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J5",
+            "expected_revision": 2
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "cancel_requested_at_ms": 1795996802000,
+              "ended_at_ms": null,
+              "page_key": "d/open",
+              "revision": 3
+            },
+            "claim": {
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          },
+          "held_by": {
+            "d/open": true,
+            "d/2026-11": false
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996803000,
+          "descriptor": "jobs.renew",
+          "payload": {
+            "job_id": "01JD00000000000000000000J5",
+            "attempt_id": "01JD00000000000000000000A1"
+          },
+          "outcome": "cancel_requested"
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996804000,
+          "descriptor": "jobs.complete",
+          "payload": {
+            "job_id": "01JD00000000000000000000J5",
+            "attempt_id": "01JD00000000000000000000A1",
+            "result": {
+              "ok": true
+            },
+            "effects": [
+              {
+                "id": {
+                  "job_id": "01JD00000000000000000000J5",
+                  "ordinal": 0
+                },
+                "produced": {
+                  "type": "proposal",
+                  "proposal_id": "p1"
+                }
+              }
+            ]
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "succeeded",
+              "ended_at_ms": 1795996804000,
+              "cancel_requested_at_ms": 1795996802000,
+              "page_key": "d/2026-11",
+              "effects": [
+                {
+                  "id": {
+                    "job_id": "01JD00000000000000000000J5",
+                    "ordinal": 0
+                  },
+                  "produced": {
+                    "type": "proposal",
+                    "proposal_id": "p1"
+                  }
+                }
+              ],
+              "revision": 4
+            },
+            "claim": {
+              "released": true,
+              "page_key": "d/2026-11",
+              "revision": 2
+            }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel-request-then-fail-ends-cancelled",
+      "about": "When cancel is requested on a claimed job, a retryable failure with remaining attempts ends cancelled rather than requeuing.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J6",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J6",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "released": false,
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J6",
+            "expected_revision": 2
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "cancel_requested_at_ms": 1795996802000,
+              "page_key": "d/open",
+              "revision": 3
+            },
+            "claim": {
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          },
+          "held_by": {
+            "d/open": true,
+            "d/2026-11": false
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996803000,
+          "descriptor": "jobs.renew",
+          "payload": {
+            "job_id": "01JD00000000000000000000J6",
+            "attempt_id": "01JD00000000000000000000A1"
+          },
+          "outcome": "cancel_requested"
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996804000,
+          "descriptor": "jobs.fail",
+          "payload": {
+            "job_id": "01JD00000000000000000000J6",
+            "attempt_id": "01JD00000000000000000000A1",
+            "error_code": "test.alpha.stopped",
+            "sentence": "stopped on request",
+            "retryable": true,
+            "effects": []
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "cancelled",
+              "ended_at_ms": 1795996804000,
+              "cancel_requested_at_ms": 1795996802000,
+              "error_code": "test.alpha.stopped",
+              "error_sentence": "stopped on request",
+              "page_key": "d/2026-11",
+              "revision": 4
+            },
+            "claim": {
+              "released": true,
+              "page_key": "d/2026-11",
+              "revision": 2
+            }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel-request-on-a-lapsed-attempt-ends-at-takeover",
+      "about": "A takeover claim over a lapsed attempt with a pending cancel request ends the job cancelled with outcome cancel_requested without minting a new attempt.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J7",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 3
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J7",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": false,
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.cancel",
+          "payload": {
+            "job_id": "01JD00000000000000000000J7",
+            "expected_revision": 2
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "cancel_requested_at_ms": 1795996802000,
+              "page_key": "d/open",
+              "revision": 3
+            },
+            "claim": {
+              "released": false,
+              "page_key": "d/open",
+              "revision": 1
+            }
+          },
+          "held_by": {
+            "d/open": true,
+            "d/2026-11": false
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-b"
+          },
+          "now_ms": 1795996831000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J7",
+            "expected_claim_revision": 1,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A2",
+          "outcome": "cancel_requested",
+          "expect": {
+            "job": {
+              "state": "cancelled",
+              "attempt": 1,
+              "ended_at_ms": 1795996831000,
+              "cancel_requested_at_ms": 1795996802000,
+              "page_key": "d/2026-11",
+              "revision": 4
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": true,
+              "page_key": "d/2026-11",
+              "revision": 2
+            }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "release-of-the-last-attempt-ends-dead",
+      "about": "Releasing the final allowed attempt ends the job dead and moves both job and claim to the end month page.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J8",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 1
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "max_attempts": 1,
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J8",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "released": false,
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996802000,
+          "descriptor": "jobs.release",
+          "payload": {
+            "job_id": "01JD00000000000000000000J8",
+            "attempt_id": "01JD00000000000000000000A1"
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "dead",
+              "attempt": 1,
+              "ended_at_ms": 1795996802000,
+              "page_key": "d/2026-11",
+              "revision": 3
+            },
+            "claim": {
+              "released": true,
+              "page_key": "d/2026-11",
+              "revision": 2
+            }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "lapsed-last-attempt-ends-dead-at-the-next-claim",
+      "about": "Claiming over a lapsed final attempt ends the job dead with outcome attempts_exhausted without minting a new attempt, and a subsequent claim is refused as terminal.",
+      "steps": [
+        {
+          "caller": {
+            "actor": "alice",
+            "client": "alice-phone",
+            "context": null
+          },
+          "now_ms": 1795996800000,
+          "descriptor": "jobs.submit",
+          "payload": {
+            "job_id": "01JD00000000000000000000J9",
+            "kind": "test.alpha",
+            "runs_on": "server",
+            "max_attempts": 1
+          },
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "queued",
+              "max_attempts": 1,
+              "page_key": "d/open",
+              "revision": 1
+            },
+            "claim": null
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-a"
+          },
+          "now_ms": 1795996801000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J9",
+            "expected_claim_revision": 0,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A1",
+          "outcome": "accepted",
+          "expect": {
+            "job": {
+              "state": "claimed",
+              "attempt": 1,
+              "revision": 2
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": false,
+              "revision": 1
+            }
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-b"
+          },
+          "now_ms": 1795996831000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J9",
+            "expected_claim_revision": 1,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A2",
+          "outcome": "attempts_exhausted",
+          "expect": {
+            "job": {
+              "state": "dead",
+              "attempt": 1,
+              "ended_at_ms": 1795996831000,
+              "page_key": "d/2026-11",
+              "revision": 3
+            },
+            "claim": {
+              "epoch": 1,
+              "attempt_id": "01JD00000000000000000000A1",
+              "released": true,
+              "page_key": "d/2026-11",
+              "revision": 2
+            }
+          },
+          "held_by": {
+            "d/open": false,
+            "d/2026-11": true
+          }
+        },
+        {
+          "caller": {
+            "actor": "worker",
+            "client": "w-b"
+          },
+          "now_ms": 1795996832000,
+          "descriptor": "jobs.claim",
+          "payload": {
+            "job_id": "01JD00000000000000000000J9",
+            "expected_claim_revision": 2,
+            "lease_ms": 30000
+          },
+          "minted_attempt_id": "01JD00000000000000000000A3",
+          "outcome": "terminal"
         }
       ]
     }

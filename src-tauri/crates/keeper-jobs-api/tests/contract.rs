@@ -163,6 +163,7 @@ fn the_job_columns_hold_any_kind() {
         "submitted_at_ms": 1_700_000_000_000_u64,
         "updated_at_ms": 1_700_000_000_000_u64,
         "ended_at_ms": null,
+        "cancel_requested_at_ms": null,
         "revision": 1,
         "author_actor": "actor_1",
         "author_client": "client_1"
@@ -200,6 +201,7 @@ fn the_job_columns_hold_any_kind() {
         "submitted_at_ms": 1_700_000_000_000_u64,
         "updated_at_ms": 1_700_000_005_000_u64,
         "ended_at_ms": 1_700_000_005_000_u64,
+        "cancel_requested_at_ms": null,
         "revision": 4,
         "author_actor": "actor_2",
         "author_client": "client_2"

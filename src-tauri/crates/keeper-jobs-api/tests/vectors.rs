@@ -4,7 +4,7 @@
 
 use keeper_jobs_api::command::{check, Descriptor, Payload};
 use keeper_jobs_api::model::{AttemptId, JobCapabilities, JobState};
-use keeper_jobs_api::transition::{declare, judge, moves, Caller, Context, Rows};
+use keeper_jobs_api::transition::{declare, judge, moves, Caller, Context, Judged, Rows};
 use keeper_jobs_api::{Refusal, CONTRACT_VERSION, LIMITS};
 use serde_json::{json, Map, Value};
 
@@ -149,8 +149,9 @@ fn every_sequence_judges_as_the_vectors_say() {
             }
             let before = rows.clone();
             match judge(&command.payload, &rows, &ctx) {
-                Ok(after) => {
-                    assert_eq!(step["outcome"], "accepted", "{at}");
+                Ok(Judged { rows: after, code }) => {
+                    let expected = code.map_or("accepted", Refusal::code);
+                    assert_eq!(step["outcome"], expected, "{at}");
                     if let Some(expect) = step.get("expect") {
                         expect_rows(&after, expect, &at);
                     }
@@ -165,6 +166,10 @@ fn every_sequence_judges_as_the_vectors_say() {
                 }
                 Err(refusal) => {
                     assert_eq!(refusal.code(), step["outcome"], "{at}");
+                    assert!(
+                        step.get("expect").is_none(),
+                        "{at}: a refusal writes nothing"
+                    );
                     // A refusal writes nothing: `rows` stays as it was.
                 }
             }
