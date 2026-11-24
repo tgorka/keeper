@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 10,
+  "schemaVersion": 11,
   "schemaVersions": [
     {
       "version": 1,
@@ -60,6 +60,12 @@
       "version": 10,
       "migrations": [
         "0010_files"
+      ]
+    },
+    {
+      "version": 11,
+      "migrations": [
+        "0011_settings"
       ]
     }
   ],
@@ -3392,6 +3398,233 @@
         }
       ],
       "extensions": {}
+    },
+    {
+      "name": "settings_devices",
+      "generation": "733a1742f8b43ad8dc1a288dacaa0a58",
+      "primaryKey": "device_id",
+      "columns": [
+        {
+          "name": "device_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "owner_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "device_class",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "platform",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "version",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "machine",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "settings_owner:{settings_owner}",
+          "variable": "settings_owner",
+          "column": "owner_actor"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "settings_devices_owner",
+          "columns": [
+            "owner_actor"
+          ],
+          "unique": false
+        },
+        {
+          "name": "settings_devices_client",
+          "columns": [
+            "client_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "settings_values",
+      "generation": "842d545724d1a0d7a8f0a62002d94359",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "owner_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "device",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "value_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_by_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "settings_owner:{settings_owner}",
+          "variable": "settings_owner",
+          "column": "owner_actor"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "settings_values_owner_device",
+          "columns": [
+            "owner_actor",
+            "device",
+            "key"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "config_values",
+      "generation": "91ff019d6bdd4986139f71bee7795f21",
+      "primaryKey": "key",
+      "columns": [
+        {
+          "name": "key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "dir",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "value",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "value_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "issuer",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "dir:{dir}",
+          "variable": "dir",
+          "column": "dir"
+        }
+      ],
+      "extensions": {}
     }
   ],
   "subscriptions": [
@@ -3607,6 +3840,18 @@
           "value": {
             "kind": "parameter",
             "name": "database"
+          }
+        }
+      ]
+    },
+    {
+      "name": "settingsOwn",
+      "scopes": [
+        {
+          "variable": "settings_owner",
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
           }
         }
       ]

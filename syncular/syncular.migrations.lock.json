@@ -50,6 +50,11 @@
       "name": "0010_files",
       "sha256": "ba7691fbabccffd83e7c284d62c856c67fa1e6169909056e23d225e4dafd6c7b",
       "schemaVersion": 10
+    },
+    {
+      "name": "0011_settings",
+      "sha256": "af8f2c82c9938684ff89c78c19625bcdd58d0b6a18cad76cd3f7cf0e54b4bdec",
+      "schemaVersion": 11
     }
   ],
   "head": {
@@ -477,6 +482,57 @@
           {
             "name": "dir",
             "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "config_values",
+        "primaryKey": "key",
+        "columns": [
+          {
+            "name": "key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "dir",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "value",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "value_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "revision",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "issuer",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
             "nullable": false
           },
           {
@@ -2123,6 +2179,128 @@
             "name": "trust",
             "type": "string",
             "nullable": true
+          }
+        ]
+      },
+      {
+        "name": "settings_devices",
+        "primaryKey": "device_id",
+        "columns": [
+          {
+            "name": "device_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "owner_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "client_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "device_class",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "platform",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "version",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "machine",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "settings_values",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "owner_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "device",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "value",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "value_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "revision",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "updated_by_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
           }
         ]
       },
