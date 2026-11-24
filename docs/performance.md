@@ -149,3 +149,35 @@ CI never measures the **full** cold-start-to-interactive figure or idle memory â
 both need the webview and, for cold start, a live per-account SDK activation
 (Keychain + network). Those stay on the release checklist. CI also carries no
 telemetry, analytics, or crash-reporting; the gates are pure offline tests.
+
+## The local socket, measured (123.1)
+
+Story 123.1 measures keeper's local socket before 123.3 builds it: gRPC
+(`tonic` 0.14) over a Unix socket against newline-delimited JSON over the
+same socket and against the same call in-process, real MCP clients through
+a stdio program on `rmcp`, and what another program of the same person can
+already read of keeper. The spike's code lives on the throwaway branch
+`spike/123-1`, never on `main`, and is kept as a git bundle with the story.
+
+- **Base:** keeper `main` at `df74c488` (2026-11-24).
+- **Hosts:** delectra (Linux amd64) and hesperia (macOS). The Linux dev
+  container is used for no figure.
+
+### Thresholds (committed before any figure)
+
+For one connection, warm, and a 4 KiB call whose input is checked against
+its JSON Schema before it is answered:
+
+| # | Threshold | Hosts |
+| --- | --- | --- |
+| T1 | The wire adds at most **0.5 ms at p50** and **2 ms at p99** to the in-process call (gRPC over the socket minus the direct function call). | delectra, hesperia |
+| T2 | gRPC's added p50 is at most **1.5 Ã—** NDJSON's added p50 over the same socket. | delectra, hesperia |
+| T3 | The wire and `rmcp` add at most **12 MiB** to `keeper-cli`'s stripped release binary. | delectra, hesperia |
+| T4 | The wire and `rmcp` add at most **8 MiB** to the app's stripped release binary. | hesperia |
+
+A threshold is met only by a figure taken after the commit that wrote this
+table. Each figure below names its run date beside this commit's.
+
+### Figures
+
+None yet.
