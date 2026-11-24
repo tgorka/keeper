@@ -93,6 +93,41 @@ fn an_extra_or_missing_top_level_key_is_refused_by_both() {
     assert!(!apply.is_valid(&good));
 }
 
+/// AC5: a node created in the change is tagged with `expected_revision:
+/// null` (the parser requires it), so the schema of every op that carries a
+/// change accepts that payload; a tag of a known node keeps its string
+/// revision, and a non-string non-null one is refused by both.
+#[test]
+fn a_tag_on_a_node_created_in_the_same_change_validates() {
+    let node = "01JF0000000000000000000005";
+    let create = json!({"op": "create_node", "id": node, "kind": "Concept", "title": "T",
+        "description": null, "properties": {}});
+    let tag = |op: &str, revision: Value| json!({"op": op, "node_id": node, "tag": "t", "expected_revision": revision});
+    let propose = validator("graph.propose");
+    let proposed = |change: &Value| {
+        json!({"target": target(), "proposal_id": "01JF0000000000000000000099",
+            "base_revision": null, "change": change, "reviewers": ["ana"],
+            "expires_at_ms": null})
+    };
+    for op in ["add_tag", "remove_tag"] {
+        let fresh = json!({"ops": [create.clone(), tag(op, Value::Null)]});
+        let known = json!({"ops": [tag(op, json!("1"))]});
+        let wrong = json!({"ops": [tag(op, json!(1))]});
+        assert!(change_accepted(&fresh), "{op}: parse fresh");
+        assert!(change_accepted(&known), "{op}: parse known");
+        assert!(!change_accepted(&wrong), "{op}: parse wrong");
+        for id in ["graph.apply", "graph.enqueue"] {
+            let schema = validator(id);
+            assert!(schema.is_valid(&targeted(&fresh)), "{id} {op}: fresh");
+            assert!(schema.is_valid(&targeted(&known)), "{id} {op}: known");
+            assert!(!schema.is_valid(&targeted(&wrong)), "{id} {op}: wrong");
+        }
+        assert!(propose.is_valid(&proposed(&fresh)), "propose {op}: fresh");
+        assert!(propose.is_valid(&proposed(&known)), "propose {op}: known");
+        assert!(!propose.is_valid(&proposed(&wrong)), "propose {op}: wrong");
+    }
+}
+
 /// AC5: on the propose vectors, `graph.propose`'s schema accepts what
 /// `proposal::parse` accepts.
 #[test]
@@ -229,6 +264,26 @@ fn the_gates_over_their_vectors() {
         "guidance-scope-update-edge-by-id",
         "guidance-scope-archive-edge-by-id",
         "unknown-node-propose-only",
+        "verify-assertion-after-another-op-refused",
+        "create-edge-guidance-scope-propose-only",
+        "create-edge-to-guidance-node-propose-only",
+        "create-edge-between-concepts-passes",
+        "update-edge-ending-at-guidance-propose-only",
+        "archive-edge-from-vocabulary-propose-only",
+        "unarchive-edge-with-unknown-end-propose-only",
+        "update-plain-edge-passes",
+        "merge-into-guidance-propose-only",
+        "merge-absorbing-vocabulary-propose-only",
+        "merge-absorbing-unknown-node-propose-only",
+        "merge-rewriting-guidance-scope-edge-propose-only",
+        "merge-concepts-passes",
+        "add-tag-on-guidance-propose-only",
+        "remove-tag-on-unknown-node-propose-only",
+        "create-node-then-tag-passes",
+        "remove-tag-on-concept-passes",
+        "create-content-on-vocabulary-propose-only",
+        "update-content-on-unknown-node-propose-only",
+        "create-content-on-concept-passes",
     ];
     for (id, gate) in [
         ("graph.apply", wire_gate as fn(&Value, &dyn Facts) -> Gate),

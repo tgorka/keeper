@@ -213,6 +213,143 @@ def main():
             "no base snapshot XR-6 GREEN",
         )
 
+        # 11. oneOf branches are paired by their `op` const and checked inside.
+        def change_op(op_id):
+            op = make_op(op_id, effect="write")
+            op["input"] = {
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {"op": {"const": "create_node"}, "title": {"type": "string"}},
+                                    "required": ["op", "title"],
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": {"const": "add_tag"},
+                                        "expected_revision": {"type": ["null", "string"]},
+                                    },
+                                    "required": ["op"],
+                                },
+                            ]
+                        },
+                    }
+                },
+                "required": ["ops"],
+            }
+            return op
+
+        one_base = Path(temporary) / "oneof-base.json"
+        one_base.write_text(json.dumps({"operations": [change_op("graph.enqueue")]}), encoding="utf-8")
+
+        def one_of(mutate):
+            op = change_op("graph.enqueue")
+            mutate(op["input"]["properties"]["ops"]["items"]["oneOf"])
+            write_state([op])
+
+        one_of(lambda branches: None)
+        run_check(root, one_base, True, "passed (1 operations)", "oneOf unmutated GREEN")
+        one_of(lambda branches: branches.reverse())
+        run_check(root, one_base, True, "passed (1 operations)", "oneOf reordered GREEN")
+        one_of(lambda branches: branches[0]["properties"]["title"].update(type="integer"))
+        run_check(root, one_base, False, 'oneOf[op="create_node"]/title type changed', "oneOf retyped field RED")
+        one_of(lambda branches: branches[1]["required"].append("expected_revision"))
+        run_check(root, one_base, False, 'oneOf[op="add_tag"]/expected_revision', "oneOf newly required RED")
+        one_of(lambda branches: branches[1]["properties"]["expected_revision"].update(type="string"))
+        run_check(root, one_base, False, "type changed", "oneOf narrowed nullable RED")
+        one_of(lambda branches: branches.pop(1))
+        run_check(root, one_base, False, 'input variant removed: /ops/-/oneOf[op="add_tag"]', "oneOf variant removed RED")
+
+        # 12. The real catalogue: its own snapshot as base passes; retyping a
+        # change op's field or removing a graph op's output member fails.
+        real = json.loads((ROOT / "catalogue/snapshot.json").read_text(encoding="utf-8"))
+        real_root = Path(temporary) / "real"
+        (real_root / "catalogue").mkdir(parents=True)
+        for rel in {rel for op in real["operations"] for rel in (op.get("vectors") or {})}:
+            (real_root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (real_root / rel).write_bytes((ROOT / rel).read_bytes())
+        real_base = Path(temporary) / "real-base.json"
+        real_base.write_text(json.dumps(real), encoding="utf-8")
+
+        def real_state(mutate):
+            doc = copy.deepcopy(real)
+            ops = {op["id"]: op for op in doc["operations"]}
+            mutate(ops)
+            (real_root / "catalogue/snapshot.json").write_text(json.dumps(doc), encoding="utf-8")
+
+        def change_branch(op, name):
+            props = op["input"]["properties"]
+            items = props.get("change", {}).get("properties", props)["ops"]["items"]
+            return next(b for b in items["oneOf"] if b["properties"]["op"].get("const") == name)
+
+        real_state(lambda ops: None)
+        run_check(real_root, real_base, True, "catalogue compatibility and classification passed", "real unmutated GREEN")
+        real_state(lambda ops: change_branch(ops["graph.apply"], "create_node")["properties"]["title"].update(type="integer"))
+        run_check(real_root, real_base, False, 'graph.apply: input property /ops/-/oneOf[op="create_node"]/title type changed', "real retyped op field RED")
+        real_state(lambda ops: change_branch(ops["graph.propose"], "add_tag")["required"].append("surprise"))
+        run_check(real_root, real_base, False, 'graph.propose: input property newly required: /change/ops/-/oneOf[op="add_tag"]/surprise', "real newly required op field RED")
+        real_state(lambda ops: ops["graph.history"]["output"]["properties"].pop("page"))
+        run_check(real_root, real_base, False, "graph.history: output property removed: /page", "real removed output member RED")
+        real_state(lambda ops: ops["graph.apply"]["output"]["properties"].pop("outcome"))
+        run_check(real_root, real_base, False, "graph.apply: output property removed: /outcome", "real removed apply outcome RED")
+
+        # 13. The base from git: no tag, a tag before the catalogue, a tag with
+        # it, a missing object and a run outside a repository.
+        repo = Path(temporary) / "git-repo"
+        repo.mkdir()
+        git_env = dict(os.environ, GIT_CEILING_DIRECTORIES=temporary)
+
+        def git(*args):
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                 "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                check=True, capture_output=True, env=git_env,
+            )
+
+        def run_git_check(expected_ok, expected_text, label):
+            env = dict(git_env, KEEPER_CATALOGUE_ROOT=str(repo))
+            env.pop("KEEPER_CATALOGUE_BASE", None)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT)], env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            assert (result.returncode == 0) == expected_ok, f"{label}: rc {result.returncode}\n{result.stdout}"
+            assert expected_text in result.stdout, f"{label} missing {expected_text!r} in:\n{result.stdout}"
+
+        (repo / "catalogue").mkdir()
+        (repo / "vectors").mkdir()
+        (repo / vec_rel).write_bytes(vec_bytes)
+        (repo / "catalogue/classification.toml").write_text("\n".join(all_cls), encoding="utf-8")
+        (repo / "README").write_text("x\n", encoding="utf-8")
+        # Outside a repository: git itself fails, so the check fails.
+        (repo / "catalogue/snapshot.json").write_text(json.dumps(base_doc), encoding="utf-8")
+        run_git_check(False, "git tag --list v* --sort=-v:refname failed", "outside a repository RED")
+        git("init", "-q")
+        git("add", "README")
+        git("commit", "-q", "-m", "before the catalogue")
+        run_git_check(True, "no catalogue snapshot at (no v* tag)", "no tag GREEN")
+        git("tag", "v0.1.0")
+        run_git_check(True, "no catalogue snapshot at v0.1.0", "tag before the catalogue GREEN")
+        git("add", "catalogue", "vectors")
+        git("commit", "-q", "-m", "catalogue")
+        git("tag", "v0.2.0")
+        run_git_check(True, "catalogue compatibility and classification passed", "tag with the catalogue GREEN")
+        mutated = copy.deepcopy(base_doc)
+        del mutated["operations"][0]["output"]["properties"]["status"]
+        (repo / "catalogue/snapshot.json").write_text(json.dumps(mutated), encoding="utf-8")
+        run_git_check(False, "app.alpha: output property removed: /status", "base read through git RED")
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "v0.2.0:catalogue/snapshot.json"],
+            check=True, capture_output=True, text=True, env=git_env,
+        ).stdout.strip()
+        (repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+        run_git_check(False, "git show v0.2.0:catalogue/snapshot.json failed", "missing object RED")
+
     print("catalogue self-tests passed")
 
 

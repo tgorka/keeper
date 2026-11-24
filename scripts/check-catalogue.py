@@ -108,6 +108,39 @@ def collect_enums(root, node, at="", depth=0, out=None):
     return out
 
 
+def branch_key(root, branch, index):
+    """A `oneOf`/`anyOf` branch's identity: its `op` const when it has one
+    (the graph's change operations), otherwise its position."""
+    node = resolve_ref(root, branch)
+    props = node.get("properties") if isinstance(node, dict) else None
+    op = props.get("op") if isinstance(props, dict) else None
+    if isinstance(op, dict) and "const" in op:
+        return f"op={canonical(op['const'])}"
+    return str(index)
+
+
+def walk_branches(op_id, side, base_root, base_node, cur_root, cur_node, path, issues, check, depth):
+    """Pair each base branch of `oneOf`/`anyOf` with the current one of the
+    same key and check the pair; an input variant that is gone is breaking
+    (a payload it accepted is now refused)."""
+    for key in ("oneOf", "anyOf"):
+        base_branches = base_node.get(key)
+        if not isinstance(base_branches, list):
+            continue
+        cur_branches = cur_node.get(key) if isinstance(cur_node, dict) else None
+        if not isinstance(cur_branches, list):
+            cur_branches = []
+        current = {branch_key(cur_root, b, i): b for i, b in enumerate(cur_branches)}
+        for i, branch in enumerate(base_branches):
+            name = branch_key(base_root, branch, i)
+            label = f"{path}/{key}[{name}]"
+            if name not in current:
+                if side == "input":
+                    issues.append(f"{op_id}: input variant removed: {label}")
+                continue
+            check(op_id, base_root, branch, cur_root, current[name], label, issues, depth + 1)
+
+
 def check_output_schema(op_id, base_root, base_node, cur_root, cur_node, path, issues, depth=0):
     if depth > 64:
         return
@@ -134,6 +167,7 @@ def check_output_schema(op_id, base_root, base_node, cur_root, cur_node, path, i
             check_output_schema(op_id, base_root, base_prop, cur_root, cur_prop, prop_path, issues, depth + 1)
     if isinstance(base_node.get("items"), dict) and isinstance(cur_node, dict) and isinstance(cur_node.get("items"), dict):
         check_output_schema(op_id, base_root, base_node["items"], cur_root, cur_node["items"], f"{path}/-", issues, depth + 1)
+    walk_branches(op_id, "output", base_root, base_node, cur_root, cur_node, path, issues, check_output_schema, depth)
 
 
 def check_input_schema(op_id, base_root, base_node, cur_root, cur_node, path, issues, depth=0):
@@ -163,6 +197,7 @@ def check_input_schema(op_id, base_root, base_node, cur_root, cur_node, path, is
             check_input_schema(op_id, base_root, base_prop, cur_root, cur_prop, prop_path, issues, depth + 1)
     if isinstance(base_node.get("items"), dict) and isinstance(cur_node.get("items"), dict):
         check_input_schema(op_id, base_root, base_node["items"], cur_root, cur_node["items"], f"{path}/-", issues, depth + 1)
+    walk_branches(op_id, "input", base_root, base_node, cur_root, cur_node, path, issues, check_input_schema, depth)
 
 
 def load_base_snapshot():
@@ -172,24 +207,27 @@ def load_base_snapshot():
             print("no catalogue snapshot at none: compatibility check passes (XR-6)")
             return None
         return json.loads(Path(override).read_text(encoding="utf-8"))
-    tags = subprocess.run(
-        ["git", "-C", str(ROOT), "tag", "--list", "v*", "--sort=-v:refname"],
-        text=True,
-        capture_output=True,
-    )
-    tag = next((line.strip() for line in tags.stdout.splitlines() if line.strip()), None) if tags.returncode == 0 else None
+    tags = git("tag", "--list", "v*", "--sort=-v:refname")
+    tag = next((line.strip() for line in tags.splitlines() if line.strip()), None)
     if not tag:
         print("no catalogue snapshot at (no v* tag): compatibility check passes (XR-6)")
         return None
-    show = subprocess.run(
-        ["git", "-C", str(ROOT), "show", f"{tag}:catalogue/snapshot.json"],
-        text=True,
-        capture_output=True,
-    )
-    if show.returncode != 0:
+    # Absent at the tag (a release before the catalogue) passes; any other
+    # git failure is an error, never "no snapshot".
+    listed = git("ls-tree", "--name-only", tag, "--", "catalogue/snapshot.json")
+    if not listed.strip():
         print(f"no catalogue snapshot at {tag}: compatibility check passes (XR-6)")
         return None
-    return json.loads(show.stdout)
+    return json.loads(git("show", f"{tag}:catalogue/snapshot.json"))
+
+
+def git(*args):
+    run = subprocess.run(["git", "-C", str(ROOT), *args], text=True, capture_output=True)
+    if run.returncode != 0:
+        raise SystemExit(
+            f"catalogue compatibility check: git {' '.join(args)} failed ({run.returncode}): {run.stderr.strip()}"
+        )
+    return run.stdout
 
 
 def load_breaking():

@@ -313,9 +313,17 @@ impl Command {
 }
 
 /// Each `--database` with its actor and client: one value applies to every
-/// database, otherwise one per database, in order.
+/// database, otherwise one per database, in order. A database named twice
+/// is refused: one replica per database.
 fn domains(args: &Args) -> Result<Vec<(String, String, String)>, Value> {
     let n = args.database.len();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(repeated) = args.database.iter().find(|d| !seen.insert(d.as_str())) {
+        return Err(fail(
+            "invalid_arguments",
+            &format!("--database {repeated} is given more than once"),
+        ));
+    }
     let pick = |values: &[String], i: usize| match values.len() {
         1 => values.first().cloned(),
         len if len == n => values.get(i).cloned(),

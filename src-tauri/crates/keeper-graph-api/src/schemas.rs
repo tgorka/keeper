@@ -133,7 +133,7 @@ fn ops() -> Vec<Value> {
             &[
                 ("node_id", text()),
                 ("tag", text()),
-                ("expected_revision", text()),
+                ("expected_revision", nullable_text()),
             ],
             &[],
         ),
@@ -142,7 +142,7 @@ fn ops() -> Vec<Value> {
             &[
                 ("node_id", text()),
                 ("tag", text()),
-                ("expected_revision", text()),
+                ("expected_revision", nullable_text()),
             ],
             &[],
         ),
@@ -323,13 +323,129 @@ pub fn decide_input() -> Value {
     )
 }
 
-/// Every graph operation's output: a document whose `ok` says how it went.
-#[must_use]
-pub fn answer() -> Value {
+/// A graph operation's output: a document whose `ok` says how it went, and
+/// the members its success carries (AC6: removing one is a breaking change).
+/// A member whose JSON type depends on the build or the server is left
+/// untyped (`{}`); its presence is still the contract.
+fn answer(members: &[(&str, Value)]) -> Value {
+    let mut properties = Map::new();
+    properties.insert("ok".to_owned(), json!({"type": "boolean"}));
+    for (name, schema) in members {
+        properties.insert((*name).to_owned(), schema.clone());
+    }
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
-        "properties": {"ok": {"type": "boolean"}},
+        "properties": properties,
         "required": ["ok"],
     })
+}
+
+fn any() -> Value {
+    json!({})
+}
+
+/// `graph.enqueue`'s and `graph.discard`'s output: the entry and its state.
+#[must_use]
+pub fn queued_answer() -> Value {
+    answer(&[("request_id", text()), ("state", text())])
+}
+
+/// `graph.pending`'s and `graph.resume`'s output: the queue's entries.
+#[must_use]
+pub fn entries_answer() -> Value {
+    answer(&[("entries", list(object(), 0))])
+}
+
+fn sent_members() -> Members {
+    vec![
+        ("request_id", text()),
+        ("descriptor", text()),
+        ("outcome", object()),
+        ("fenced", json!({"type": ["boolean", "null"]})),
+    ]
+}
+
+/// A sent command's output (`graph.apply`, `graph.propose`, `graph.decide`,
+/// `graph.acknowledge`): its request id, descriptor, outcome and fence.
+#[must_use]
+pub fn sent_answer() -> Value {
+    answer(&sent_members())
+}
+
+/// `graph.reverse`'s output: a sent command's, or (not sent) the preview
+/// and why.
+#[must_use]
+pub fn reverse_answer() -> Value {
+    let mut members = sent_members();
+    members.extend([("error", text()), ("preview", any())]);
+    answer(&members)
+}
+
+/// `graph.sync`'s output.
+#[must_use]
+pub fn sync_answer() -> Value {
+    answer(&[
+        ("graph_seq", any()),
+        ("built", any()),
+        ("completeness", text()),
+    ])
+}
+
+fn read_members() -> Members {
+    vec![
+        ("rows", any()),
+        ("domain", text()),
+        ("graph_seq", any()),
+        ("checkpoint", any()),
+        ("contract_schema", any()),
+        ("projection_version", any()),
+        ("engine", any()),
+        ("completeness", text()),
+    ]
+}
+
+/// `graph.query`'s output: the rows and the projection they were read from.
+#[must_use]
+pub fn query_answer() -> Value {
+    answer(&read_members())
+}
+
+/// `graph.inspect`'s output: the projection's rows, or the typed reads'
+/// (which say so in `source`).
+#[must_use]
+pub fn inspect_answer() -> Value {
+    let mut members = read_members();
+    members.push(("source", text()));
+    answer(&members)
+}
+
+/// `graph.history`'s and `graph.unreviewed`'s output: one page.
+#[must_use]
+pub fn page_answer() -> Value {
+    answer(&[("page", any())])
+}
+
+/// `graph.proposal`'s output.
+#[must_use]
+pub fn revisions_answer() -> Value {
+    answer(&[("revisions", any())])
+}
+
+/// `graph.preview_reversal`'s output.
+#[must_use]
+pub fn preview_answer() -> Value {
+    answer(&[("preview", any())])
+}
+
+/// `graph.status`'s output.
+#[must_use]
+pub fn status_answer() -> Value {
+    answer(&[
+        ("head", any()),
+        ("checkpoint", any()),
+        ("runtime", text()),
+        ("fence", any()),
+        ("queue", any()),
+    ])
 }

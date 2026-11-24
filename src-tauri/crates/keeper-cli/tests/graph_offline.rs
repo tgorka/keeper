@@ -294,5 +294,31 @@ fn the_database_flag_repeats() {
     let answer: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(answer["error"], "invalid_arguments", "{answer}");
     assert_eq!(out.status.code(), Some(2));
+    // A database named twice would open two replica owners on one file:
+    // refused before anything is opened.
+    let dup_state = dir.join("dup");
+    let out = Command::new(env!("CARGO_BIN_EXE_keeper-cli"))
+        .args(["--json", "graph", "--state"])
+        .arg(&dup_state)
+        .args([
+            "--url",
+            URL,
+            "--database",
+            "work",
+            "--database",
+            "work",
+            "--actor",
+            "ana",
+            "--client",
+            "dev1",
+            "status",
+        ])
+        .env("KEEPER_GRAPH_TOKEN", "t")
+        .output()
+        .expect("runs");
+    let answer: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(answer["error"], "invalid_arguments", "{answer}");
+    assert_eq!(out.status.code(), Some(2), "{answer}");
+    assert!(!dup_state.join("work.sqlite").exists());
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use keeper_graph_api as api;
 use keeper_ports::server::ServerUrl;
-use keeper_ports::{LinkState, Source};
+use keeper_ports::{LinkState, ReplicaError, Source};
 use keeper_runtime_api::{
     Bindings, Decide, ErrorCode, Manifest, Module, OpError, Read, Reply, Write,
 };
@@ -865,6 +865,27 @@ pub async fn inspect_typed(
             "offline",
             GraphClientError::Offline.to_string(),
         )),
+        // A replica still connecting (`online` admits `Connecting`) or not
+        // syncing, or a query nothing came back for: the server was not
+        // reached, so the read is unavailable, not refused. `Unheard`'s
+        // `retryable` is the client's word on asking again now.
+        Err(GraphClientError::Replica(
+            error @ (ReplicaError::NotSyncing | ReplicaError::Closed),
+        )) => Err(OpError::new(
+            ErrorCode::Unavailable,
+            "offline",
+            error.to_string(),
+        )),
+        Err(GraphClientError::Replica(ReplicaError::Unheard {
+            code,
+            message,
+            retryable,
+        })) => Err(OpError::new(
+            ErrorCode::Unavailable,
+            "offline",
+            format!("{code}: {message}"),
+        )
+        .retryable(retryable)),
         Err(error) => Err(OpError::new(
             ErrorCode::Refused,
             "refused",
@@ -1455,6 +1476,8 @@ mod tests {
     struct Reads {
         link: LinkState,
         rows: Vec<(&'static str, Value, bool)>,
+        /// What every query fails with, when set.
+        fail: Option<fn() -> ReplicaError>,
     }
 
     impl GraphWrite for Reads {
@@ -1469,6 +1492,9 @@ mod tests {
             descriptor: &str,
             params: Value,
         ) -> Result<Vec<serde_json::Map<String, Value>>, ReplicaError> {
+            if let Some(fail) = self.fail {
+                return Err(fail());
+            }
             let archived = params["include_archived"] == json!(true);
             Ok(self
                 .rows
@@ -1498,9 +1524,14 @@ mod tests {
     }
 
     fn reads_client(link: LinkState) -> GraphClient {
+        reads_client_failing(link, None)
+    }
+
+    fn reads_client_failing(link: LinkState, fail: Option<fn() -> ReplicaError>) -> GraphClient {
         use crate::protocol::wire::{GET_CONTENT, GET_EDGE, GET_NODE};
         let port = Arc::new(Reads {
             link,
+            fail,
             rows: vec![
                 (GET_NODE, node(NODE, "active"), false),
                 (GET_NODE, node(ARCHIVED, "archived"), true),
@@ -1598,6 +1629,50 @@ mod tests {
             .expect_err("stale");
         assert_eq!(stale.code, ErrorCode::InvalidArgument);
         assert_eq!(stale.reason, "allow_stale");
+    }
+
+    /// AC10/A-20: a freshly opened replica is `Connecting`, which `online`
+    /// admits; when its query is unheard (the server was not reached), or the
+    /// replica does not sync or is closed, the typed read is `UNAVAILABLE`
+    /// `offline`, never `REFUSED`; retryable unless the client says otherwise.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspect_without_the_worker_is_unavailable_while_the_server_is_unreachable() {
+        fn unheard() -> ReplicaError {
+            ReplicaError::Unheard {
+                code: "transport.failed".into(),
+                message: "connection refused".into(),
+                retryable: true,
+            }
+        }
+        fn unreadable() -> ReplicaError {
+            ReplicaError::Unheard {
+                code: "transport.failed".into(),
+                message: "unreadable".into(),
+                retryable: false,
+            }
+        }
+        let cases: [(fn() -> ReplicaError, bool); 4] = [
+            (unheard, true),
+            (|| ReplicaError::NotSyncing, true),
+            (|| ReplicaError::Closed, true),
+            (unreadable, false),
+        ];
+        for (fail, retryable) in cases {
+            let client = reads_client_failing(LinkState::Connecting, Some(fail));
+            let error = inspect_typed(
+                client,
+                InspectEntity::Node,
+                NODE.into(),
+                false,
+                false,
+                "work".into(),
+            )
+            .await
+            .expect_err("unreachable");
+            assert_eq!(error.code, ErrorCode::Unavailable, "{}", fail());
+            assert_eq!(error.reason, "offline", "{}", fail());
+            assert_eq!(error.retryable, retryable, "{}", fail());
+        }
     }
 
     fn module_over(state: &std::path::Path, source: Result<Source, OpError>) -> GraphModule {

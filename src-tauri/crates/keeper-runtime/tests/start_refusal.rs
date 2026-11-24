@@ -4,8 +4,8 @@ use std::sync::Arc;
 use keeper_app_api::{ModuleState, ModulesVm};
 use keeper_runtime::{app_module, AppInfo, Runtime};
 use keeper_runtime_api::{
-    Bindings, CallContext, CliHint, Effect, Kind, Manifest, Module, OperationSpec, ProposalForm,
-    Read, Requirement, Scope, Write,
+    Bindings, CallContext, CliHint, Effect, Fixed, Kind, Manifest, Module, OpError, OperationSpec,
+    ProposalForm, Read, Requirement, Scope, Write,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,37 @@ static BAD_WIRE_OPS: &[OperationSpec] = &[OperationSpec {
     to_proposal: None,
     wire_gate: None,
     vectors: &[],
+}];
+
+fn identity(input: &serde_json::Value) -> Result<serde_json::Value, OpError> {
+    Ok(input.clone())
+}
+
+/// Declared `read`, bound by `BindMode::WriteAll`: the start check must refuse,
+/// or the dispatcher would hand a read op a `&Write` witness.
+static MISMATCH_OPS: &[OperationSpec] = &[read_op("mismatch.ping")];
+static BAD_ID_OPS: &[OperationSpec] = &[read_op("badid")];
+static FOREIGN_OPS: &[OperationSpec] = &[read_op("alpha.ping")];
+static VIA_MISSING_OPS: &[OperationSpec] = &[OperationSpec {
+    kind: Kind::Command,
+    effect: Effect::Write,
+    proposal: ProposalForm::Via("viamiss.ghost"),
+    to_proposal: Some(identity),
+    ..read_op("viamiss.apply")
+}];
+static VIA_READ_OPS: &[OperationSpec] = &[
+    OperationSpec {
+        kind: Kind::Command,
+        effect: Effect::Write,
+        proposal: ProposalForm::Via("viaread.peek"),
+        to_proposal: Some(identity),
+        ..read_op("viaread.apply")
+    },
+    read_op("viaread.peek"),
+];
+static BAD_FIX_OPS: &[OperationSpec] = &[OperationSpec {
+    wire_fix: &[("/nonexistent/fixed", Fixed::Null)],
+    ..read_op("badfix.ping")
 }];
 
 static REQ_MISSING: &[Requirement] = &[Requirement {
@@ -282,6 +313,75 @@ fn scenario_modules(name: &str) -> Vec<Arc<dyn Module>> {
                 bind_mode: BindMode::Normal,
             }),
         ],
+        "class_mismatch" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "mismatch",
+                requires: &[],
+                operations: MISMATCH_OPS,
+                bind_mode: BindMode::WriteAll,
+            }),
+        ],
+        "bad_op_id" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "badid",
+                requires: &[],
+                operations: BAD_ID_OPS,
+                bind_mode: BindMode::Normal,
+            }),
+        ],
+        "foreign_op" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "foreign",
+                requires: &[],
+                operations: FOREIGN_OPS,
+                bind_mode: BindMode::Normal,
+            }),
+        ],
+        "via_missing_target" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "viamiss",
+                requires: &[],
+                operations: VIA_MISSING_OPS,
+                bind_mode: BindMode::WriteAll,
+            }),
+        ],
+        "via_read_target" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "viaread",
+                requires: &[],
+                operations: VIA_READ_OPS,
+                bind_mode: BindMode::Normal,
+            }),
+        ],
+        "bad_wire_fix" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "badfix",
+                requires: &[],
+                operations: BAD_FIX_OPS,
+                bind_mode: BindMode::Normal,
+            }),
+        ],
+        "duplicate_module" => vec![
+            app_module(),
+            Arc::new(Fixture {
+                id: "alpha",
+                requires: &[],
+                operations: ALPHA_OPS,
+                bind_mode: BindMode::Normal,
+            }),
+            Arc::new(Fixture {
+                id: "alpha",
+                requires: &[],
+                operations: &[],
+                bind_mode: BindMode::Normal,
+            }),
+        ],
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -361,12 +461,43 @@ fn missing_optional_module_exits_0_and_reports_absent() {
 #[test]
 fn start_check_refusals_exit_3_naming_module_and_problem() {
     let cases = [
-        ("duplicate_op", &["dup", "dup.ping"][..]),
+        (
+            "duplicate_op",
+            &["dup", "declares duplicate operation 'dup.ping'"][..],
+        ),
         ("unbound_op", &["unbound", "unbound.ping"][..]),
         ("unknown_binding", &["extra", "extra.ghost"][..]),
         ("bad_via", &["badvia", "badvia.apply"][..]),
         ("bad_wire", &["badwire", "/nonexistent/field"][..]),
         ("cycle", &["cycle_a", "cycle_b"][..]),
+        (
+            "class_mismatch",
+            &["'mismatch.ping' declares effect 'read' but bound handler is 'write'"][..],
+        ),
+        (
+            "bad_op_id",
+            &["module 'badid' declares invalid operation id 'badid'"][..],
+        ),
+        (
+            "foreign_op",
+            &["module 'foreign' declares foreign operation 'alpha.ping'"][..],
+        ),
+        (
+            "via_missing_target",
+            &[
+                "'viamiss.apply'",
+                "target is not an operation of module 'viamiss'",
+            ][..],
+        ),
+        (
+            "via_read_target",
+            &["'viaread.apply'", "target must be a write command"][..],
+        ),
+        (
+            "bad_wire_fix",
+            &["'badfix.ping' has wire rule pointer '/nonexistent/fixed'"][..],
+        ),
+        ("duplicate_module", &["duplicate module 'alpha'"][..]),
     ];
 
     for (scenario, expected_tokens) in cases {

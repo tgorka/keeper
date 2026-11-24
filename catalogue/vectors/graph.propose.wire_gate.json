@@ -410,6 +410,1298 @@
       "expect": {
         "propose_only": "unknown_edge"
       }
+    },
+    {
+      "id": "verify-assertion-after-another-op-refused",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000060",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            },
+            {
+              "op": "verify_assertion",
+              "id": "01JF0000000000000000000030",
+              "expected_revision": "1",
+              "sources": [],
+              "contents": []
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "refuse": "verify_assertion"
+      }
+    },
+    {
+      "id": "create-edge-guidance-scope-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_edge",
+              "id": "01JF0000000000000000000061",
+              "from_id": "01JF0000000000000000000051",
+              "to_id": "01JF0000000000000000000052",
+              "type": "guidance_scope",
+              "properties": {},
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_edge:guidance_scope"
+      }
+    },
+    {
+      "id": "create-edge-to-guidance-node-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_edge",
+              "id": "01JF0000000000000000000061",
+              "from_id": "01JF0000000000000000000051",
+              "to_id": "01JF0000000000000000000053",
+              "type": "related_to",
+              "properties": {},
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "create-edge-between-concepts-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_edge",
+              "id": "01JF0000000000000000000061",
+              "from_id": "01JF0000000000000000000051",
+              "to_id": "01JF0000000000000000000052",
+              "type": "related_to",
+              "properties": {},
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "update-edge-ending-at-guidance-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "update_edge",
+              "id": "01JF0000000000000000000072",
+              "expected_revision": "1",
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "archive-edge-from-vocabulary-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "archive_edge",
+              "id": "01JF0000000000000000000073",
+              "expected_revision": "1",
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Vocabulary"
+      }
+    },
+    {
+      "id": "unarchive-edge-with-unknown-end-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "unarchive_edge",
+              "id": "01JF0000000000000000000074",
+              "expected_revision": "1",
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_node"
+      }
+    },
+    {
+      "id": "update-plain-edge-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "update_edge",
+              "id": "01JF0000000000000000000070",
+              "expected_revision": "1",
+              "from_lifecycle_revision": "1",
+              "to_lifecycle_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "merge-into-guidance-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "merge_nodes",
+              "target_id": "01JF0000000000000000000053",
+              "target_revision": "1",
+              "absorbed": [
+                {
+                  "id": "01JF0000000000000000000051",
+                  "expected_revision": "1"
+                }
+              ],
+              "edges": []
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "merge-absorbing-vocabulary-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "merge_nodes",
+              "target_id": "01JF0000000000000000000051",
+              "target_revision": "1",
+              "absorbed": [
+                {
+                  "id": "01JF0000000000000000000054",
+                  "expected_revision": "1"
+                }
+              ],
+              "edges": []
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Vocabulary"
+      }
+    },
+    {
+      "id": "merge-absorbing-unknown-node-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "merge_nodes",
+              "target_id": "01JF0000000000000000000051",
+              "target_revision": "1",
+              "absorbed": [
+                {
+                  "id": "01JF0000000000000000000099",
+                  "expected_revision": "1"
+                }
+              ],
+              "edges": []
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_node"
+      }
+    },
+    {
+      "id": "merge-rewriting-guidance-scope-edge-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "merge_nodes",
+              "target_id": "01JF0000000000000000000051",
+              "target_revision": "1",
+              "absorbed": [
+                {
+                  "id": "01JF0000000000000000000052",
+                  "expected_revision": "1"
+                }
+              ],
+              "edges": [
+                {
+                  "id": "01JF0000000000000000000071",
+                  "expected_revision": "1",
+                  "from_lifecycle_revision": "1",
+                  "to_lifecycle_revision": "1"
+                }
+              ]
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_edge:guidance_scope"
+      }
+    },
+    {
+      "id": "merge-concepts-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "merge_nodes",
+              "target_id": "01JF0000000000000000000051",
+              "target_revision": "1",
+              "absorbed": [
+                {
+                  "id": "01JF0000000000000000000052",
+                  "expected_revision": "1"
+                }
+              ],
+              "edges": [
+                {
+                  "id": "01JF0000000000000000000070",
+                  "expected_revision": "1",
+                  "from_lifecycle_revision": "1",
+                  "to_lifecycle_revision": "1"
+                }
+              ]
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "add-tag-on-guidance-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "add_tag",
+              "node_id": "01JF0000000000000000000053",
+              "tag": "t",
+              "expected_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Guidance"
+      }
+    },
+    {
+      "id": "remove-tag-on-unknown-node-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "remove_tag",
+              "node_id": "01JF0000000000000000000099",
+              "tag": "t",
+              "expected_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_node"
+      }
+    },
+    {
+      "id": "create-node-then-tag-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_node",
+              "id": "01JF0000000000000000000060",
+              "kind": "Concept",
+              "title": "T",
+              "description": null,
+              "properties": {}
+            },
+            {
+              "op": "add_tag",
+              "node_id": "01JF0000000000000000000060",
+              "tag": "t",
+              "expected_revision": null
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "remove-tag-on-concept-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "remove_tag",
+              "node_id": "01JF0000000000000000000051",
+              "tag": "t",
+              "expected_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
+    },
+    {
+      "id": "create-content-on-vocabulary-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_content",
+              "id": "01JF0000000000000000000080",
+              "owner_node_id": "01JF0000000000000000000054",
+              "body": {
+                "text": "x"
+              }
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "gated_kind:Vocabulary"
+      }
+    },
+    {
+      "id": "update-content-on-unknown-node-propose-only",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "update_content",
+              "id": "01JF0000000000000000000080",
+              "owner_node_id": "01JF0000000000000000000099",
+              "body": {
+                "text": "x"
+              },
+              "expected_revision": "1"
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": {
+        "propose_only": "unknown_node"
+      }
+    },
+    {
+      "id": "create-content-on-concept-passes",
+      "input": {
+        "target": {
+          "server": "https://hq.example",
+          "domain": "work"
+        },
+        "proposal_id": "01JF0000000000000000000040",
+        "base_revision": null,
+        "change": {
+          "ops": [
+            {
+              "op": "create_content",
+              "id": "01JF0000000000000000000080",
+              "owner_node_id": "01JF0000000000000000000051",
+              "body": {
+                "text": "x"
+              }
+            }
+          ]
+        },
+        "reviewers": ["ana"],
+        "expires_at_ms": null
+      },
+      "facts": {
+        "nodes": {
+          "01JF0000000000000000000051": "Concept",
+          "01JF0000000000000000000052": "Concept",
+          "01JF0000000000000000000053": "Guidance",
+          "01JF0000000000000000000054": "Vocabulary"
+        },
+        "edges": {
+          "01JF0000000000000000000070": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000071": {
+            "type": "guidance_scope",
+            "from_kind": "Concept",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000072": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": "Guidance"
+          },
+          "01JF0000000000000000000073": {
+            "type": "related_to",
+            "from_kind": "Vocabulary",
+            "to_kind": "Concept"
+          },
+          "01JF0000000000000000000074": {
+            "type": "related_to",
+            "from_kind": "Concept",
+            "to_kind": null
+          }
+        }
+      },
+      "expect": "pass"
     }
   ]
 }
