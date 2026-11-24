@@ -4,6 +4,7 @@
 mod app;
 mod check;
 mod error;
+mod wire;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 pub use app::app_module;
 pub use error::StartError;
+pub use wire::WireDispatcher;
 
 /// Static information about the running binary, answered by `app.version`
 /// and `app.domains`.
@@ -34,6 +36,8 @@ pub(crate) struct RuntimeInner {
     pub module_states: BTreeMap<String, ModuleState>,
     pub operations: BTreeMap<&'static str, check::CheckedEntry>,
     pub dispatches: AtomicU64,
+    /// Handlers a wire caller reached (123.3-AC6's count).
+    pub handler_calls: AtomicU64,
     _modules: Vec<Arc<dyn Module>>,
 }
 
@@ -87,6 +91,7 @@ impl Runtime {
             module_states,
             operations: checked.operations,
             dispatches: AtomicU64::new(0),
+            handler_calls: AtomicU64::new(0),
             _modules: kept_modules,
         });
 
@@ -116,6 +121,19 @@ impl Runtime {
     #[must_use]
     pub fn modules(&self) -> Vec<(String, ModuleState)> {
         self.inner.modules()
+    }
+
+    /// The dispatcher a wire transport is handed: `Caller::Wire`, and only
+    /// what a wire caller may reach (story 123.3).
+    #[must_use]
+    pub fn wire_dispatcher(&self) -> WireDispatcher {
+        WireDispatcher::new(self.clone())
+    }
+
+    /// How many handlers a wire caller has reached so far.
+    #[must_use]
+    pub fn wire_handler_calls(&self) -> u64 {
+        self.inner.handler_calls.load(Ordering::Relaxed)
     }
 }
 

@@ -74,7 +74,7 @@ mod human;
 use crate::output::Printer;
 use crate::{EXIT_CONFIG, EXIT_DEFERRED, EXIT_FAILURE, EXIT_OK, EXIT_PREREQUISITE};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Subcommand;
@@ -315,10 +315,14 @@ impl Command {
 /// Each `--database` with its actor and client: one value applies to every
 /// database, otherwise one per database, in order. A database named twice
 /// is refused: one replica per database.
-fn domains(args: &Args) -> Result<Vec<(String, String, String)>, Value> {
-    let n = args.database.len();
+fn domains(
+    database: &[String],
+    actor: &[String],
+    client: &[String],
+) -> Result<Vec<(String, String, String)>, Value> {
+    let n = database.len();
     let mut seen = std::collections::BTreeSet::new();
-    if let Some(repeated) = args.database.iter().find(|d| !seen.insert(d.as_str())) {
+    if let Some(repeated) = database.iter().find(|d| !seen.insert(d.as_str())) {
         return Err(fail(
             "invalid_arguments",
             &format!("--database {repeated} is given more than once"),
@@ -330,8 +334,8 @@ fn domains(args: &Args) -> Result<Vec<(String, String, String)>, Value> {
         _ => None,
     };
     (0..n)
-        .map(|i| match (pick(&args.actor, i), pick(&args.client, i)) {
-            (Some(actor), Some(client)) => Ok((args.database[i].clone(), actor, client)),
+        .map(|i| match (pick(actor, i), pick(client, i)) {
+            (Some(actor), Some(client)) => Ok((database[i].clone(), actor, client)),
             _ => Err(fail(
                 "invalid_arguments",
                 "--actor and --client are given once, or once per --database",
@@ -342,7 +346,8 @@ fn domains(args: &Args) -> Result<Vec<(String, String, String)>, Value> {
 
 /// Open one database's replica (the composition root's part, SR-5).
 fn open(
-    args: &Args,
+    state: &Path,
+    url: &str,
     database: &str,
     actor: &str,
     client: &str,
@@ -358,13 +363,13 @@ fn open(
     let unavailable = |e: &dyn std::fmt::Display| {
         OpError::new(ErrorCode::Unavailable, "storage_unavailable", e.to_string())
     };
-    std::fs::create_dir_all(&args.state).map_err(|e| unavailable(&e))?;
+    std::fs::create_dir_all(state).map_err(|e| unavailable(&e))?;
     let replica = SyncularReplica::open(ReplicaSpec {
         database: database.to_owned(),
-        path: args.state.join(format!("{database}.sqlite")),
+        path: state.join(format!("{database}.sqlite")),
         client_id: Some(client.to_owned()),
         link: Some(Link {
-            base_url: format!("{}/{database}", args.url.trim_end_matches('/')),
+            base_url: format!("{}/{database}", url.trim_end_matches('/')),
             token: token.to_owned(),
             store: Default::default(),
         }),
@@ -380,23 +385,59 @@ fn open(
     })
 }
 
-/// The run: open, compose, dispatch once. The answer and the dispatch count.
-async fn run(args: Args) -> (Value, u64) {
-    let triples = match domains(&args) {
-        Ok(triples) => triples,
-        Err(error) => return (error, 0),
-    };
+/// The graph module's configuration for `serve`: no worker (A-5).
+pub(crate) fn serve_config(state: &Path) -> GraphConfig {
+    GraphConfig {
+        state: state.to_path_buf(),
+        worker: None,
+        macos_evidence: false,
+        worker_sha256: option_env!("KEEPER_GRAPH_WORKER_SHA256"),
+        ledger: embedded::LEDGER,
+    }
+}
+
+/// Each database with its actor and client, and its binding.
+pub(crate) type Opened = (Vec<(String, String, String)>, Vec<DomainBinding>);
+
+/// One replica per `--database`, kept linked (the composition root's part,
+/// SR-5): the verbs and `serve` open them alike.
+pub(crate) fn open_domains(
+    state: &Path,
+    url: &str,
+    database: &[String],
+    actor: &[String],
+    client: &[String],
+) -> Result<Opened, Value> {
+    let triples = domains(database, actor, client)?;
     let token = std::env::var("KEEPER_GRAPH_TOKEN").ok();
-    let bindings: Vec<DomainBinding> = triples
+    let bindings = triples
         .iter()
         .map(|(database, actor, client)| DomainBinding {
-            server: args.url.clone(),
+            server: url.to_owned(),
             database: database.clone(),
             actor: actor.clone(),
             client: client.clone(),
-            source: open(&args, database, actor, client, token.as_deref()),
+            source: open(state, url, database, actor, client, token.as_deref()),
         })
         .collect();
+    Ok((triples, bindings))
+}
+
+/// The run: open, compose, dispatch once. The answer and the dispatch count.
+async fn run(args: Args) -> (Value, u64) {
+    if let Err(error) = crate::state::claim(&args.state) {
+        return (fail("state_not_ours", &error), 0);
+    }
+    let (triples, bindings) = match open_domains(
+        &args.state,
+        &args.url,
+        &args.database,
+        &args.actor,
+        &args.client,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => return (error, 0),
+    };
     let opened = bindings.first().is_some_and(|b| b.source.is_ok());
     let target = json!({"server": args.url, "domain": triples[0].0});
     let (id, input) = match args.command.request(target, opened) {
@@ -452,6 +493,8 @@ fn exit_code(answer: &Value, address_valid: bool) -> u8 {
     }
     let detail = answer["detail"].as_str().unwrap_or_default();
     match answer["error"].as_str().unwrap_or_default() {
+        // Not a state directory of keeper-cli's own (XR-11).
+        "state_not_ours" => EXIT_PREREQUISITE,
         "approval_required" => EXIT_DEFERRED,
         // Made here only, before anything is opened: no token, no address.
         "unauthorised" | "invalid_server" | "invalid_arguments" => EXIT_CONFIG,

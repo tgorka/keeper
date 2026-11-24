@@ -35,7 +35,10 @@ keeper-accounts-api = { path = "../keeper-accounts-api" }
 keeper-replica = { path = "../keeper-replica" }
 clap = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+# `serve` (story 123.3): the local socket and the state's lock.
+keeper-wire = { path = "../keeper-wire" }
+keeper-wire-api = { path = "../keeper-wire-api" }
 
 # Only the P1 measurement example `rc_spawner` (never shipped) uses these.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]

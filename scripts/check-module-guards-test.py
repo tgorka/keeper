@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
              "keeper-rt": "runtime", "keeper-tp": "transport", "keeper-ad": "adapter"}
     (root / "Cargo.toml").write_text(
         '[workspace]\nresolver = "2"\nmembers = ' + json.dumps(list(names)) +
-        '\nexclude = ["bridge", "tokio", "serde", "rusqlite", "tonic"]\n')
+        '\nexclude = ["bridge", "tokio", "serde", "serde_json", "rusqlite", "tonic", "prost", "hyper", "tower"]\n')
     roles = root / "roles.json"
     roles.write_text(json.dumps(names))
     env = dict(os.environ, KEEPER_MODULE_MANIFEST=str(root / "Cargo.toml"),
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
                 text += '[features]\nextra = [' + ', '.join(f'"dep:{dep}"' for dep in deps) + ']\n'
         (path / "Cargo.toml").write_text(text)
 
-    for name in [*names, "bridge", "tokio", "serde", "rusqlite", "tonic"]:
+    for name in [*names, "bridge", "tokio", "serde", "serde_json", "rusqlite", "tonic", "prost", "hyper", "tower"]:
         crate(name)
     run("fixture baseline GREEN", "check-module-edges.py", env=env)
     cases = [
@@ -107,6 +107,10 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("target provider", "keeper-core", "keeper-provider", 'target.\'cfg(target_os = "windows")\'.dependencies', False),
         ("runtime implementation", "keeper-rt", "keeper-scratch", "dependencies", False),
         ("transport rusqlite", "keeper-tp", "rusqlite", "dependencies", False),
+        ("transport tonic", "keeper-tp", "tonic", "dependencies", False),
+        ("transport prost", "keeper-tp", "prost", "dependencies", False),
+        ("transport hyper", "keeper-tp", "hyper", "dependencies", False),
+        ("transport tower", "keeper-tp", "tower", "dependencies", False),
         ("transport port", "keeper-tp", "keeper-port", "dependencies", False),
         ("implementation runtime", "keeper-scratch", "keeper-rt", "dependencies", False),
         ("port transport", "keeper-port", "keeper-tp", "dependencies", False),
@@ -133,7 +137,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("keeper-app", "keeper-provider", "dependencies"),
         ("keeper-core", "keeper-provider", "dev-dependencies"),
         ("keeper-rt", "keeper-scratch-api", "dependencies"),
-        ("keeper-tp", ["keeper-scratch-api", "tonic"], "dependencies"),
+        ("keeper-tp", ["keeper-scratch-api", "tokio", "serde_json"], "dependencies"),
     ]:
         crate(name, dependency, kind)
         run(f"allowed {name} {kind} {dependency} GREEN", "check-module-edges.py", env=env)

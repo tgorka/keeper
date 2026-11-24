@@ -85,6 +85,22 @@ jobs:
       - run: cargo nextest run --no-tests=pass
         working-directory: src-tauri
 
+  rust-linux:
+    name: "Rust (Linux: runtime, wire, graph, cli)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: rust-linux
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --manifest-path src-tauri/Cargo.toml -p keeper-runtime -p keeper-runtime-api -p keeper-app-api -p keeper-wire -p keeper-wire-api -p keeper-graph-api -p keeper-cli
+      - run: cargo nextest run --manifest-path src-tauri/Cargo.toml -p keeper-graph --features module
+
   recording:
     name: Recording sidecar (unit tests + gapless-concat gate)
     runs-on: macos-latest

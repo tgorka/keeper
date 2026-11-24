@@ -1,0 +1,25 @@
+[package]
+name = "keeper-wire-api"
+description = "keeper's local socket envelope keeper.wire.v1: newline-delimited JSON frames, their committed JSON Schema, the socket's place, the data directory's lock and the client"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Role `transport` (MA-G3, as narrowed by O-123-WIRE-1): no first-party edge;
+# tokio, serde, serde_json and schemars, and never tonic, prost, hyper or tower.
+[dependencies]
+rustix = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

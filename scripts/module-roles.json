@@ -21,5 +21,7 @@
   "keeper-runtime-api": "contract",
   "keeper-testkit": "provider",
   "keeper-sync": "legacy",
-  "keeper-syncd": "legacy"
+  "keeper-syncd": "legacy",
+  "keeper-wire": "transport",
+  "keeper-wire-api": "transport"
 }
