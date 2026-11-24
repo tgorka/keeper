@@ -1084,6 +1084,20 @@ to `sync.credential_refused`; `5xx` is retryable):
   `409` `files.hash_mismatch`)
 - `POST /files/download-grant` `{contentId}` → `{url, expiresAtMs}`
 
+Two rules of this wire the client enforces:
+
+- **`planId` grammar.** A `planId` matches `[A-Za-z0-9._-]{1,128}` and is neither `.` nor `..`
+  (it names the staging key and goes into the paths above). The client refuses any other
+  `planId` and fails the upload; a server must therefore mint its own id, never pass a store's
+  multipart `UploadId` through.
+- **A forgotten plan.** For a plan the server no longer holds (unknown, aborted by the staging
+  sweep, or already completed), `GET …/parts`, `POST …/part-urls` and `POST …/complete` answer
+  `404` `{"code":"files.plan_unknown"}`. On that answer to `GET …/parts` (which the client asks
+  first when it resumes from a plan file) the client deletes its plan file and asks
+  `upload-grant` again; from `part-urls` or `complete` it fails the attempt, and the next
+  attempt does the same. Any other answer keeps the plan file, so every later upload of that file
+  on that device fails until the plan file is removed by hand.
+
 **Store wire and origin check.** The client sends no credential to the object store:
 
 - single `PUT <url>` with `Content-Length: <size>` and `x-amz-checksum-sha256: <whole-file b64>` → `200`
