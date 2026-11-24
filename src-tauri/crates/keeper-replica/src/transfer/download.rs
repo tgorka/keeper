@@ -33,6 +33,8 @@ pub(super) fn run(
 
     let mut file = OpenOptions::new()
         .create(true)
+        // The bytes already here are the resume point.
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&temp_path)
