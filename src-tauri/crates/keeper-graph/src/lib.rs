@@ -57,6 +57,8 @@ pub fn available() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod capacity_tests;
 #[cfg(test)]
 mod client_tests;
 #[cfg(test)]

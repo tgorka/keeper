@@ -451,6 +451,13 @@ impl Exporter {
         &self.path
     }
 
+    /// How many live images the verified prefix holds (the consumer's
+    /// entity count, reviews included).
+    #[cfg(test)]
+    pub(crate) fn images(&self) -> usize {
+        self.images.len()
+    }
+
     /// Verify and export the events `source` holds after the prefix.
     pub(crate) fn extend(&mut self, source: &dyn GraphSource) -> Result<Extended, PrefixError> {
         let first = source.prefix_batch(self.n, BATCH_EVENTS)?;

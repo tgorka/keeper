@@ -1,5 +1,8 @@
 {
   "attachmentMaxBytes": 26214400,
   "filePartThresholdBytes": 67108864,
-  "filePartBytes": 67108864
+  "filePartBytes": 67108864,
+  "graphMaxEvents": 100000,
+  "graphMaxEntities": 1000000,
+  "graphExportMaxBytes": 1073741824
 }

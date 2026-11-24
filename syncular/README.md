@@ -18,11 +18,12 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
-| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; and `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); hand-written, never generated |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; and `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
 | `object-layout.vectors.json` | the file object-store contract's shared vectors (*Objects in parts*): file and staging prefixes, content and staging keys, refused content ids, encoded user metadata, and part-size limits; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-ports`) |
+| `graph-capacity.vectors.json` | the knowledge graph's domain-capacity vectors (*Domain capacity*): event frames with their line lengths and SHA-256 digests, and histories with each step's cumulative creates, review creates, removals and export bytes and the worker's and the consumer's entity counts; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and `keeper-graph` tests, the latter through the real exporter and worker) |
 
 Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -1049,6 +1050,27 @@ domain-visible reference written after the target) is a `conflict` whose precond
 `inverse_caps[]` (the 128-operation cap as generators: `creates` node creates, reversed, fit
 with their review at 127 and refuse `change_limit` at 128), `reversals[]`, `reviews[]`,
 `previews[]` (preview rows decoded or refused), `proposals[]` and `outcomes[]` pin these.
+
+### Domain capacity
+
+One generation of a domain's graph holds at most the three graph limits of `limits.json`, which
+equal the worker's `MAX_EVENTS`, `MAX_ENTITIES` and `MAX_EXPORT_BYTES`: `graphMaxEvents`
+(100,000 events), `graphMaxEntities` (1,000,000 entities) and `graphExportMaxBytes`
+(1,073,741,824 bytes). The server keeps a threshold below each limit and refuses an event that
+would carry a domain past one with a terminal `rejected` receipt, code `change_limit`, and
+`detail` `{"limit":"domain","measure":"events"|"entities"|"export_bytes"}`, before any approval
+is consumed. The domain stays readable; nothing it holds shrinks, so acknowledgements and
+reversals are refused too.
+
+The server counts each measure over the accepted prefix. Events are the head's `graph_seq`.
+Entities are every `create` operation, reviews included: at least the worker's count (every
+non-review entity ever created, a removed membership kept) and the consumer's (live images,
+reviews included). Export bytes are the sum of every event's frame line, its JCS text and
+newline, the manifest line excluded; a line is
+`157 + digits(graph_seq) + digits(op_count) + (op_count − 1) + Σ op + 1`, an operation
+`118 + digits(ordinal) + len(entity_type) + len(operation) + R + V`, where `R` is 4 for a null
+`after_revision` or its length plus 2, and `V` is 4 for a null `after_value` or the length of its
+canonical text. `graph-capacity.vectors.json` pins the frame lines and each history's counts.
 
 ## Objects in parts
 

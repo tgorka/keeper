@@ -1,0 +1,2200 @@
+{
+  "frames": [
+    {
+      "id": "single-node-seq-9",
+      "graph_seq": 9,
+      "event_id": "01JG0000000000000000000001",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000001",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000000101",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "id": "01JG0000000000000000000101",
+            "kind": "Concept",
+            "title": "Alpha"
+          }
+        }
+      ],
+      "line_bytes": 360,
+      "line_sha256": "43680c77de4c53b69cc2def7d45d78ce49d9a577bdd7ef86ab3b359f96ff67ed"
+    },
+    {
+      "id": "single-edge-seq-10",
+      "graph_seq": 10,
+      "event_id": "01JG0000000000000000000002",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000002",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "edge",
+          "entity_id": "01JG0000000000000000000102",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "id": "01JG0000000000000000000102",
+            "type": "contains"
+          }
+        }
+      ],
+      "line_bytes": 346,
+      "line_sha256": "0fad31d75332af0e6780172919721eca08c2b5e798fd71f8530671433d6beb57"
+    },
+    {
+      "id": "seq-99999-boundary",
+      "graph_seq": 99999,
+      "event_id": "01JG0000000000000000000003",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000003",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "tag",
+          "entity_id": "01JG0000000000000000000103",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "id": "01JG0000000000000000000103",
+            "text": "alpha"
+          }
+        }
+      ],
+      "line_bytes": 345,
+      "line_sha256": "6f8c3d6409efbc74b8e6c6e7260140ee3ddb6414c71e6db76193c3214c5faee0"
+    },
+    {
+      "id": "seq-100000-boundary",
+      "graph_seq": 100000,
+      "event_id": "01JG0000000000000000000004",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000004",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "content",
+          "entity_id": "01JG0000000000000000000104",
+          "operation": "update",
+          "after_revision": "2",
+          "after_value": {
+            "id": "01JG0000000000000000000104",
+            "body": "v2"
+          }
+        }
+      ],
+      "line_bytes": 347,
+      "line_sha256": "158c418becfcdb2a71f40cb8c137357daba1587fff719b3fefc474d4ce5d14fd"
+    },
+    {
+      "id": "membership-remove-nulls",
+      "graph_seq": 11,
+      "event_id": "01JG0000000000000000000005",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000005",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node_tag",
+          "entity_id": "01JG0000000000000000000105",
+          "operation": "remove",
+          "after_revision": null,
+          "after_value": null
+        }
+      ],
+      "line_bytes": 302,
+      "line_sha256": "10aaaceeb587303980238af037c8bae8e17e8339d8e7e07e75f2a8572ec6c6d7"
+    },
+    {
+      "id": "non-ascii-text",
+      "graph_seq": 12,
+      "event_id": "01JG0000000000000000000006",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000006",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000000106",
+          "operation": "update",
+          "after_revision": "2",
+          "after_value": {
+            "id": "01JG0000000000000000000106",
+            "title": "Zürich — 東京 🚀"
+          }
+        }
+      ],
+      "line_bytes": 362,
+      "line_sha256": "a2c3be7146637601d59085ac5fb4fe7627a759c0349f85082288a395ae657f1c"
+    },
+    {
+      "id": "jcs-key-order-10-and-2",
+      "graph_seq": 13,
+      "event_id": "01JG0000000000000000000007",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000007",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000000107",
+          "operation": "update",
+          "after_revision": "3",
+          "after_value": {
+            "2": "two",
+            "10": "ten"
+          }
+        }
+      ],
+      "line_bytes": 315,
+      "line_sha256": "fbbf7e5714309e033096c616a5f525d759c9307bf3d7b59e7fa80b1afed2261e"
+    },
+    {
+      "id": "jcs-numbers",
+      "graph_seq": 14,
+      "event_id": "01JG0000000000000000000008",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000008",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000000108",
+          "operation": "update",
+          "after_revision": "4",
+          "after_value": {
+            "large": 1e21,
+            "small": 1e-7,
+            "tenth": 0.1
+          }
+        }
+      ],
+      "line_bytes": 333,
+      "line_sha256": "4299e1b113038b5d5b5637b2f31b1d8069b3f2875e6a563ebddbef377f0c9f15"
+    },
+    {
+      "id": "max-128-ops",
+      "graph_seq": 15,
+      "event_id": "01JG0000000000000000000009",
+      "delta_digest": "0000000000000000000000000000000000000000000000000000000000000009",
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001000",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 0
+          }
+        },
+        {
+          "ordinal": 1,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001001",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 1
+          }
+        },
+        {
+          "ordinal": 2,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001002",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 2
+          }
+        },
+        {
+          "ordinal": 3,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001003",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 3
+          }
+        },
+        {
+          "ordinal": 4,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001004",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 4
+          }
+        },
+        {
+          "ordinal": 5,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001005",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 5
+          }
+        },
+        {
+          "ordinal": 6,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001006",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 6
+          }
+        },
+        {
+          "ordinal": 7,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001007",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 7
+          }
+        },
+        {
+          "ordinal": 8,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001008",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 8
+          }
+        },
+        {
+          "ordinal": 9,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001009",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 9
+          }
+        },
+        {
+          "ordinal": 10,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001010",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 10
+          }
+        },
+        {
+          "ordinal": 11,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001011",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 11
+          }
+        },
+        {
+          "ordinal": 12,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001012",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 12
+          }
+        },
+        {
+          "ordinal": 13,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001013",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 13
+          }
+        },
+        {
+          "ordinal": 14,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001014",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 14
+          }
+        },
+        {
+          "ordinal": 15,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001015",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 15
+          }
+        },
+        {
+          "ordinal": 16,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001016",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 16
+          }
+        },
+        {
+          "ordinal": 17,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001017",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 17
+          }
+        },
+        {
+          "ordinal": 18,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001018",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 18
+          }
+        },
+        {
+          "ordinal": 19,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001019",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 19
+          }
+        },
+        {
+          "ordinal": 20,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001020",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 20
+          }
+        },
+        {
+          "ordinal": 21,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001021",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 21
+          }
+        },
+        {
+          "ordinal": 22,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001022",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 22
+          }
+        },
+        {
+          "ordinal": 23,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001023",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 23
+          }
+        },
+        {
+          "ordinal": 24,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001024",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 24
+          }
+        },
+        {
+          "ordinal": 25,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001025",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 25
+          }
+        },
+        {
+          "ordinal": 26,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001026",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 26
+          }
+        },
+        {
+          "ordinal": 27,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001027",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 27
+          }
+        },
+        {
+          "ordinal": 28,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001028",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 28
+          }
+        },
+        {
+          "ordinal": 29,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001029",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 29
+          }
+        },
+        {
+          "ordinal": 30,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001030",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 30
+          }
+        },
+        {
+          "ordinal": 31,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001031",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 31
+          }
+        },
+        {
+          "ordinal": 32,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001032",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 32
+          }
+        },
+        {
+          "ordinal": 33,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001033",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 33
+          }
+        },
+        {
+          "ordinal": 34,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001034",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 34
+          }
+        },
+        {
+          "ordinal": 35,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001035",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 35
+          }
+        },
+        {
+          "ordinal": 36,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001036",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 36
+          }
+        },
+        {
+          "ordinal": 37,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001037",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 37
+          }
+        },
+        {
+          "ordinal": 38,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001038",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 38
+          }
+        },
+        {
+          "ordinal": 39,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001039",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 39
+          }
+        },
+        {
+          "ordinal": 40,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001040",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 40
+          }
+        },
+        {
+          "ordinal": 41,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001041",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 41
+          }
+        },
+        {
+          "ordinal": 42,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001042",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 42
+          }
+        },
+        {
+          "ordinal": 43,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001043",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 43
+          }
+        },
+        {
+          "ordinal": 44,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001044",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 44
+          }
+        },
+        {
+          "ordinal": 45,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001045",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 45
+          }
+        },
+        {
+          "ordinal": 46,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001046",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 46
+          }
+        },
+        {
+          "ordinal": 47,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001047",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 47
+          }
+        },
+        {
+          "ordinal": 48,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001048",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 48
+          }
+        },
+        {
+          "ordinal": 49,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001049",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 49
+          }
+        },
+        {
+          "ordinal": 50,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001050",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 50
+          }
+        },
+        {
+          "ordinal": 51,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001051",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 51
+          }
+        },
+        {
+          "ordinal": 52,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001052",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 52
+          }
+        },
+        {
+          "ordinal": 53,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001053",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 53
+          }
+        },
+        {
+          "ordinal": 54,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001054",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 54
+          }
+        },
+        {
+          "ordinal": 55,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001055",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 55
+          }
+        },
+        {
+          "ordinal": 56,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001056",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 56
+          }
+        },
+        {
+          "ordinal": 57,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001057",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 57
+          }
+        },
+        {
+          "ordinal": 58,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001058",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 58
+          }
+        },
+        {
+          "ordinal": 59,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001059",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 59
+          }
+        },
+        {
+          "ordinal": 60,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001060",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 60
+          }
+        },
+        {
+          "ordinal": 61,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001061",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 61
+          }
+        },
+        {
+          "ordinal": 62,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001062",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 62
+          }
+        },
+        {
+          "ordinal": 63,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001063",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 63
+          }
+        },
+        {
+          "ordinal": 64,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001064",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 64
+          }
+        },
+        {
+          "ordinal": 65,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001065",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 65
+          }
+        },
+        {
+          "ordinal": 66,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001066",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 66
+          }
+        },
+        {
+          "ordinal": 67,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001067",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 67
+          }
+        },
+        {
+          "ordinal": 68,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001068",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 68
+          }
+        },
+        {
+          "ordinal": 69,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001069",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 69
+          }
+        },
+        {
+          "ordinal": 70,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001070",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 70
+          }
+        },
+        {
+          "ordinal": 71,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001071",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 71
+          }
+        },
+        {
+          "ordinal": 72,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001072",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 72
+          }
+        },
+        {
+          "ordinal": 73,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001073",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 73
+          }
+        },
+        {
+          "ordinal": 74,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001074",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 74
+          }
+        },
+        {
+          "ordinal": 75,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001075",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 75
+          }
+        },
+        {
+          "ordinal": 76,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001076",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 76
+          }
+        },
+        {
+          "ordinal": 77,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001077",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 77
+          }
+        },
+        {
+          "ordinal": 78,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001078",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 78
+          }
+        },
+        {
+          "ordinal": 79,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001079",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 79
+          }
+        },
+        {
+          "ordinal": 80,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001080",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 80
+          }
+        },
+        {
+          "ordinal": 81,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001081",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 81
+          }
+        },
+        {
+          "ordinal": 82,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001082",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 82
+          }
+        },
+        {
+          "ordinal": 83,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001083",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 83
+          }
+        },
+        {
+          "ordinal": 84,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001084",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 84
+          }
+        },
+        {
+          "ordinal": 85,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001085",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 85
+          }
+        },
+        {
+          "ordinal": 86,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001086",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 86
+          }
+        },
+        {
+          "ordinal": 87,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001087",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 87
+          }
+        },
+        {
+          "ordinal": 88,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001088",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 88
+          }
+        },
+        {
+          "ordinal": 89,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001089",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 89
+          }
+        },
+        {
+          "ordinal": 90,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001090",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 90
+          }
+        },
+        {
+          "ordinal": 91,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001091",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 91
+          }
+        },
+        {
+          "ordinal": 92,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001092",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 92
+          }
+        },
+        {
+          "ordinal": 93,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001093",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 93
+          }
+        },
+        {
+          "ordinal": 94,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001094",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 94
+          }
+        },
+        {
+          "ordinal": 95,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001095",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 95
+          }
+        },
+        {
+          "ordinal": 96,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001096",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 96
+          }
+        },
+        {
+          "ordinal": 97,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001097",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 97
+          }
+        },
+        {
+          "ordinal": 98,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001098",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 98
+          }
+        },
+        {
+          "ordinal": 99,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001099",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 99
+          }
+        },
+        {
+          "ordinal": 100,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001100",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 100
+          }
+        },
+        {
+          "ordinal": 101,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001101",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 101
+          }
+        },
+        {
+          "ordinal": 102,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001102",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 102
+          }
+        },
+        {
+          "ordinal": 103,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001103",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 103
+          }
+        },
+        {
+          "ordinal": 104,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001104",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 104
+          }
+        },
+        {
+          "ordinal": 105,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001105",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 105
+          }
+        },
+        {
+          "ordinal": 106,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001106",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 106
+          }
+        },
+        {
+          "ordinal": 107,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001107",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 107
+          }
+        },
+        {
+          "ordinal": 108,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001108",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 108
+          }
+        },
+        {
+          "ordinal": 109,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001109",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 109
+          }
+        },
+        {
+          "ordinal": 110,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001110",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 110
+          }
+        },
+        {
+          "ordinal": 111,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001111",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 111
+          }
+        },
+        {
+          "ordinal": 112,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001112",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 112
+          }
+        },
+        {
+          "ordinal": 113,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001113",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 113
+          }
+        },
+        {
+          "ordinal": 114,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001114",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 114
+          }
+        },
+        {
+          "ordinal": 115,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001115",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 115
+          }
+        },
+        {
+          "ordinal": 116,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001116",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 116
+          }
+        },
+        {
+          "ordinal": 117,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001117",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 117
+          }
+        },
+        {
+          "ordinal": 118,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001118",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 118
+          }
+        },
+        {
+          "ordinal": 119,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001119",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 119
+          }
+        },
+        {
+          "ordinal": 120,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001120",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 120
+          }
+        },
+        {
+          "ordinal": 121,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001121",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 121
+          }
+        },
+        {
+          "ordinal": 122,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001122",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 122
+          }
+        },
+        {
+          "ordinal": 123,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001123",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 123
+          }
+        },
+        {
+          "ordinal": 124,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001124",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 124
+          }
+        },
+        {
+          "ordinal": 125,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001125",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 125
+          }
+        },
+        {
+          "ordinal": 126,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001126",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 126
+          }
+        },
+        {
+          "ordinal": 127,
+          "entity_type": "node",
+          "entity_id": "01JG0000000000000000001127",
+          "operation": "create",
+          "after_revision": "1",
+          "after_value": {
+            "n": 127
+          }
+        }
+      ],
+      "line_bytes": 18374,
+      "line_sha256": "743363d7b7e8f9aa247d7aff2d16fb38eddeccf4735c24bce73e6036fc5b2804"
+    }
+  ],
+  "histories": [
+    {
+      "id": "core-lifecycle",
+      "events": [
+        {
+          "event_id": "01JG0000000000000001100001",
+          "delta_digest": "60e35d3b866034a70ff43de24d7ec20486d631db2db8cd723f4e7cc2de719723",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000101",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000101",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {
+                  "domain": "core"
+                },
+                "revision": "1",
+                "title": "Alpha"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000102",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000102",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Beta"
+              }
+            },
+            {
+              "ordinal": 2,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000103",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000103",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Gamma"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001100002",
+          "delta_digest": "0d8cdda581a4b61e86a2b4c0ec563c6c850e35fb297ab4cdd796594da83ee52e",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "edge",
+              "entity_id": "01JG0000000000000000000110",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "from_id": "01JG0000000000000000000101",
+                "id": "01JG0000000000000000000110",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "1",
+                "to_id": "01JG0000000000000000000102",
+                "type": "ex:relates"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "content",
+              "entity_id": "01JG0000000000000000000120",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "body": {
+                  "inline_text": "Alpha summary"
+                },
+                "id": "01JG0000000000000000000120",
+                "owner_node_id": "01JG0000000000000000000101",
+                "revision": "1"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001100003",
+          "delta_digest": "7a42f749d35b4882a2fab4741110efc880af9e1504b0e4b66a131e313949e652",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000101",
+              "operation": "update",
+              "before_revision": "1",
+              "after_revision": "2",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000101",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {
+                  "domain": "core"
+                },
+                "revision": "1",
+                "title": "Alpha"
+              },
+              "after_value": {
+                "description": "Updated description",
+                "description_source_id": null,
+                "id": "01JG0000000000000000000101",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {
+                  "domain": "core",
+                  "rank": 1
+                },
+                "revision": "2",
+                "title": "Alpha Revised"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001100004",
+          "delta_digest": "a8dc9827a009f1c630fcedffe4b79ce3e47b7f26ea0eeced8f3fd21d4124ce4f",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000103",
+              "operation": "archive",
+              "before_revision": "1",
+              "after_revision": "2",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000103",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Gamma"
+              },
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000103",
+                "kind": "Concept",
+                "lifecycle": "archived",
+                "lifecycle_revision": "2",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "2",
+                "title": "Gamma"
+              }
+            }
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "graph_seq": 1,
+          "creates": 3,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 1217
+        },
+        {
+          "graph_seq": 2,
+          "creates": 5,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 1962
+        },
+        {
+          "graph_seq": 3,
+          "creates": 5,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 2518
+        },
+        {
+          "graph_seq": 4,
+          "creates": 5,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 3028
+        }
+      ],
+      "worker_entities": 5,
+      "consumer_entities": 5
+    },
+    {
+      "id": "tag-membership-churn",
+      "events": [
+        {
+          "event_id": "01JG0000000000000001200001",
+          "delta_digest": "9d67f00cd3242fb67644c651cbb08f4d120a634c436efd66d4e81607a5d28d27",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000201",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000201",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Tagged Node"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "tag",
+              "entity_id": "01JG0000000000000000020001",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "id": "01JG0000000000000000020001",
+                "label": null,
+                "revision": "1",
+                "text": "priority"
+              }
+            },
+            {
+              "ordinal": 2,
+              "entity_type": "node_tag",
+              "entity_id": "01JG0000000000000000020002",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": null,
+              "before_value": null,
+              "after_value": {
+                "id": "01JG0000000000000000020002",
+                "node_id": "01JG0000000000000000000201",
+                "tag_id": "01JG0000000000000000020001"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001200002",
+          "delta_digest": "16f435ed5e9cdaf31c34110e33d56ec1f0cad1b73f562e86c52d6a2e33777cde",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000201",
+              "operation": "update",
+              "before_revision": "1",
+              "after_revision": "2",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000201",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Tagged Node"
+              },
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000201",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "2",
+                "title": "Tagged Node"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "node_tag",
+              "entity_id": "01JG0000000000000000020002",
+              "operation": "remove",
+              "before_revision": null,
+              "after_revision": null,
+              "before_value": {
+                "id": "01JG0000000000000000020002",
+                "node_id": "01JG0000000000000000000201",
+                "tag_id": "01JG0000000000000000020001"
+              },
+              "after_value": null
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001200003",
+          "delta_digest": "6bc7faeba5946aee94c2497c3bedb4785af484dd55cca03d4b81564b22521559",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000201",
+              "operation": "update",
+              "before_revision": "2",
+              "after_revision": "3",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000201",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "2",
+                "title": "Tagged Node"
+              },
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000201",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "3",
+                "title": "Tagged Node"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "node_tag",
+              "entity_id": "01JG0000000000000000020003",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": null,
+              "before_value": null,
+              "after_value": {
+                "id": "01JG0000000000000000020003",
+                "node_id": "01JG0000000000000000000201",
+                "tag_id": "01JG0000000000000000020001"
+              }
+            }
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "graph_seq": 1,
+          "creates": 3,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 976
+        },
+        {
+          "graph_seq": 2,
+          "creates": 3,
+          "review_creates": 0,
+          "removes": 1,
+          "export_bytes": 1631
+        },
+        {
+          "graph_seq": 3,
+          "creates": 4,
+          "review_creates": 0,
+          "removes": 1,
+          "export_bytes": 2394
+        }
+      ],
+      "worker_entities": 4,
+      "consumer_entities": 3
+    },
+    {
+      "id": "acknowledge-and-reverse",
+      "events": [
+        {
+          "event_id": "01JG0000000000000001300001",
+          "delta_digest": "13628414013884e642486a15b6c44673bcb3b84f745ecb3dcd7a77f509f71e5c",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000301",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000301",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Target"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000302",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000302",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "X"
+              }
+            },
+            {
+              "ordinal": 2,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000303",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000303",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "Y"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001300002",
+          "delta_digest": "bf1eccaf2ace9e343b3c198d51b35d838b9a91c2ca45c7baaef9da088adf8f6a",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "edge",
+              "entity_id": "01JG0000000000000000000310",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "from_id": "01JG0000000000000000000302",
+                "id": "01JG0000000000000000000310",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "1",
+                "to_id": "01JG0000000000000000000303",
+                "type": "ex:rel"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001300003",
+          "delta_digest": "113022e2adcb12095de498d65cde126b5b8ce0f3dc02e5a64da5c09256497a9a",
+          "descriptor": "graph.apply",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000302",
+              "operation": "archive",
+              "before_revision": "1",
+              "after_revision": "2",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000302",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "1",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "1",
+                "title": "X"
+              },
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000302",
+                "kind": "Concept",
+                "lifecycle": "archived",
+                "lifecycle_revision": "2",
+                "merged_into_id": "01JG0000000000000000000301",
+                "properties": {},
+                "revision": "2",
+                "title": "X"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "edge",
+              "entity_id": "01JG0000000000000000000310",
+              "operation": "update",
+              "before_revision": "1",
+              "after_revision": "2",
+              "before_value": {
+                "from_id": "01JG0000000000000000000302",
+                "id": "01JG0000000000000000000310",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "1",
+                "to_id": "01JG0000000000000000000303",
+                "type": "ex:rel"
+              },
+              "after_value": {
+                "from_id": "01JG0000000000000000000301",
+                "id": "01JG0000000000000000000310",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "2",
+                "to_id": "01JG0000000000000000000303",
+                "type": "ex:rel"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001300004",
+          "delta_digest": "c8bad73f6b7cbaa9e23a50b53a16101437a65b640e95bab00bf05e53326cdd0f",
+          "descriptor": "graph.acknowledge",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "review",
+              "entity_id": "01JG0000000000000000000320",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "id": "01JG0000000000000000000320",
+                "kind": "acknowledgement",
+                "reviewer_actor": "reviewer",
+                "revision": "1",
+                "target_delta_digest": "113022e2adcb12095de498d65cde126b5b8ce0f3dc02e5a64da5c09256497a9a",
+                "target_event_id": "01JG0000000000000001300003"
+              }
+            }
+          ]
+        },
+        {
+          "event_id": "01JG0000000000000001300005",
+          "delta_digest": "65766cf0293ca54db94119c91cde2e5f8d6864e9627fa7b9517b7f27d822f155",
+          "descriptor": "graph.reverse",
+          "ops": [
+            {
+              "ordinal": 0,
+              "entity_type": "edge",
+              "entity_id": "01JG0000000000000000000310",
+              "operation": "update",
+              "before_revision": "2",
+              "after_revision": "3",
+              "before_value": {
+                "from_id": "01JG0000000000000000000301",
+                "id": "01JG0000000000000000000310",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "2",
+                "to_id": "01JG0000000000000000000303",
+                "type": "ex:rel"
+              },
+              "after_value": {
+                "from_id": "01JG0000000000000000000302",
+                "id": "01JG0000000000000000000310",
+                "lifecycle": "active",
+                "properties": {},
+                "revision": "3",
+                "to_id": "01JG0000000000000000000303",
+                "type": "ex:rel"
+              }
+            },
+            {
+              "ordinal": 1,
+              "entity_type": "node",
+              "entity_id": "01JG0000000000000000000302",
+              "operation": "unarchive",
+              "before_revision": "2",
+              "after_revision": "3",
+              "before_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000302",
+                "kind": "Concept",
+                "lifecycle": "archived",
+                "lifecycle_revision": "2",
+                "merged_into_id": "01JG0000000000000000000301",
+                "properties": {},
+                "revision": "2",
+                "title": "X"
+              },
+              "after_value": {
+                "description": null,
+                "description_source_id": null,
+                "id": "01JG0000000000000000000302",
+                "kind": "Concept",
+                "lifecycle": "active",
+                "lifecycle_revision": "3",
+                "merged_into_id": null,
+                "properties": {},
+                "revision": "3",
+                "title": "X"
+              }
+            },
+            {
+              "ordinal": 2,
+              "entity_type": "review",
+              "entity_id": "01JG0000000000000000000321",
+              "operation": "create",
+              "before_revision": null,
+              "after_revision": "1",
+              "before_value": null,
+              "after_value": {
+                "id": "01JG0000000000000000000321",
+                "kind": "reversal",
+                "reviewer_actor": "ana",
+                "revision": "1",
+                "target_delta_digest": "113022e2adcb12095de498d65cde126b5b8ce0f3dc02e5a64da5c09256497a9a",
+                "target_event_id": "01JG0000000000000001300003"
+              }
+            }
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "graph_seq": 1,
+          "creates": 3,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 1196
+        },
+        {
+          "graph_seq": 2,
+          "creates": 4,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 1667
+        },
+        {
+          "graph_seq": 3,
+          "creates": 4,
+          "review_creates": 0,
+          "removes": 0,
+          "export_bytes": 2509
+        },
+        {
+          "graph_seq": 4,
+          "creates": 5,
+          "review_creates": 1,
+          "removes": 0,
+          "export_bytes": 3042
+        },
+        {
+          "graph_seq": 5,
+          "creates": 6,
+          "review_creates": 2,
+          "removes": 0,
+          "export_bytes": 4222
+        }
+      ],
+      "worker_entities": 4,
+      "consumer_entities": 6
+    }
+  ]
+}
