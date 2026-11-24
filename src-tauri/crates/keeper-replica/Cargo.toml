@@ -22,6 +22,11 @@ chrono = { workspace = true }
 url = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The file transfer (story 115.3): presigned `PUT`/`GET` to the object store,
+# streamed from and to disk. ureq 3 is already linked through syncular-client's
+# `native-transport`, so no new crate; MIT OR Apache-2.0.
+ureq = "3.5"
+base64 = { workspace = true }
 
 [features]
 # The outcome journal's test writer (`journal`). Only keeper-core's

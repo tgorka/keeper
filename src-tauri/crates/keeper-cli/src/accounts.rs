@@ -228,6 +228,7 @@ mod tests {
                 replaced_repository: Some("https://forge.example/tgdrive.git".to_owned()),
                 graph_root: None,
                 files_writes: None,
+                store: None,
             }],
             1,
         );

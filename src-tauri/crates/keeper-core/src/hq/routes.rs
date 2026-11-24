@@ -464,7 +464,7 @@ async fn discover(
     discovery_of_body(raw)
 }
 
-fn discovery_of_body(raw: serde_json::Value) -> Result<Discovery, RouteError> {
+pub(crate) fn discovery_of_body(raw: serde_json::Value) -> Result<Discovery, RouteError> {
     let entries = serde_json::from_value::<keeper_accounts_api::discovery::Discovery>(raw.clone())
         .map(|described| described.databases)
         .unwrap_or_default();

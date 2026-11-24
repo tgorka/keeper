@@ -98,7 +98,9 @@ use crate::hq::vm::{
 use crate::platform::{exclude_from_backup_best_effort, Platform};
 use keeper_accounts::{Answer, DomainsState, DomainsVm, Fate, Unsent};
 use keeper_ports::server::ServerUrl;
-use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Unit};
+use keeper_ports::{
+    Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, StoreOrigin, StoreSlot, Unit,
+};
 
 /// The keychain item of a server's pairing: this prefix and the base URL.
 const KEYCHAIN_PREFIX: &str = "agents-server/";
@@ -206,6 +208,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn store_slot(stores: &mut HashMap<String, StoreSlot>, database: &str) -> StoreSlot {
+    stores.entry(database.to_owned()).or_default().clone()
+}
+
 struct Db {
     name: String,
     replica: Arc<dyn Replica>,
@@ -260,6 +266,9 @@ struct Inner {
     /// replace it with an earlier one.
     discovery_wait: Option<(Instant, tokio::task::AbortHandle)>,
     refusals: HashMap<String, Refusal>,
+    /// The object store origin the server last announced for each database,
+    /// shared with its replica's [`Link`] and kept across re-opens (115.3).
+    stores: HashMap<String, StoreSlot>,
     /// The person's domains as this device knows them (114.5), kept beside
     /// the replicas ([`databases::load_domains`]).
     domains: DomainsVm,
@@ -520,6 +529,21 @@ impl Hq {
         servers
     }
 
+    /// The object stores the server announced for the databases this device holds, one per host and port.
+    pub fn stores(&self) -> Vec<String> {
+        let inner = lock(&self.inner);
+        let mut out: Vec<String> = Vec::new();
+        for db in &inner.dbs {
+            if let Some(origin) = inner.stores.get(&db.name).and_then(StoreSlot::get) {
+                let authority = origin.authority();
+                if !out.iter().any(|existing| existing == authority) {
+                    out.push(authority.to_owned());
+                }
+            }
+        }
+        out
+    }
+
     /// The replica of `database`, when this device holds one.
     pub fn replica(&self, database: &str) -> Option<Arc<dyn Replica>> {
         lock(&self.inner)
@@ -607,6 +631,7 @@ impl Hq {
         pairing: &Pairing,
         database: &str,
         linked: bool,
+        store: StoreSlot,
     ) -> ReplicaSpec {
         ReplicaSpec {
             database: database.to_owned(),
@@ -615,6 +640,7 @@ impl Hq {
             link: linked.then(|| Link {
                 base_url: server.mount(database),
                 token: pairing.token.clone(),
+                store,
             }),
             // The directory (actors, clients, agent profiles), this actor's
             // memberships and its preferences: one unit each.
@@ -763,6 +789,7 @@ impl Hq {
             let retired = Self::retire_all(&mut inner);
             if inner.server != server {
                 inner.refusals.clear();
+                inner.stores.clear();
             }
             inner.server = server.clone();
             inner.address_refused = address_refused;
@@ -807,8 +834,10 @@ impl Hq {
             _ => Vec::new(),
         };
         if let (Some(holding), Some(pairing)) = (&holding, &pairing) {
+            let mut inner = lock(&self.inner);
             for name in &held {
-                specs.push(Self::spec(&data_dir, holding, pairing, name, false));
+                let store = store_slot(&mut inner.stores, name);
+                specs.push(Self::spec(&data_dir, holding, pairing, name, false, store));
             }
         }
         let mut opened = self.open_all(specs).await?.into_iter();
@@ -1054,6 +1083,15 @@ impl Hq {
             match answer {
                 Ok(found) => {
                     inner.domains.discovered(&found.entries, sessions::now_ms());
+                    for name in &found.databases {
+                        let origin = found
+                            .entries
+                            .iter()
+                            .find(|entry| entry.name == *name)
+                            .and_then(|entry| entry.store.as_deref())
+                            .and_then(StoreOrigin::parse);
+                        store_slot(&mut inner.stores, name).set(origin);
+                    }
                     inner.answered = true;
                     inner.offline = false;
                     Some(Authorization {
@@ -1219,10 +1257,16 @@ impl Hq {
             }
             left.push((name.clone(), unsent));
         }
-        let specs = reopen
-            .iter()
-            .map(|(name, link)| Self::spec(&data_dir, &server, &pairing, name, *link))
-            .collect();
+        let specs = {
+            let mut inner = lock(&self.inner);
+            reopen
+                .iter()
+                .map(|(name, link)| {
+                    let store = store_slot(&mut inner.stores, name);
+                    Self::spec(&data_dir, &server, &pairing, name, *link, store)
+                })
+                .collect()
+        };
         let opened = self.open_all(specs).await?;
         let stale_contact = {
             let mut inner = lock(&self.inner);
@@ -1236,6 +1280,7 @@ impl Hq {
             for (name, unsent) in &left {
                 inner.dbs.retain(|db| db.name != *name);
                 inner.refusals.remove(name);
+                inner.stores.remove(name);
                 inner.domains.leave(name, *unsent, left_at);
             }
             for ((name, linked), replica) in reopen.into_iter().zip(opened) {
@@ -1573,6 +1618,7 @@ impl Hq {
         {
             let mut inner = lock(&self.inner);
             inner.refusals.clear();
+            inner.stores.clear();
             inner.offer = None;
         }
         tracing::info!(
@@ -1711,7 +1757,11 @@ impl Hq {
         if let Err(error) = databases::forget_server(&data_dir, &server) {
             tracing::warn!(%error, "keeper could not forget which agents server it synced with");
         }
-        lock(&self.inner).refusals.clear();
+        {
+            let mut inner = lock(&self.inner);
+            inner.refusals.clear();
+            inner.stores.clear();
+        }
         self.restart().await?;
         Ok(self.status.borrow().clone())
     }

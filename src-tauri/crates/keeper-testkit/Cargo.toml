@@ -20,3 +20,5 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # The harness's replica files.
 tempfile = { workspace = true }
+# The stand-in object store (`store`, story 115.3): part checksums, plan ids.
+base64 = { workspace = true }

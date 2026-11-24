@@ -1000,6 +1000,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
         spec.link = Some(keeper_ports::Link {
             base_url: format!("http://127.0.0.1:{port}/alpha"),
             token: "0123456789abcdef".to_owned(),
+            store: Default::default(),
         });
         source(Arc::new(SyncularReplica::open(spec).expect("opens")))
     };

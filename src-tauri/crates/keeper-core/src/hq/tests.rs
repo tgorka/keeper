@@ -3158,6 +3158,7 @@ fn entry(
         replaced_repository: None,
         graph_root: None,
         files_writes: None,
+        store: None,
     }
 }
 
@@ -4236,5 +4237,128 @@ async fn a_refused_link_asks_again_at_once_over_a_pending_rediscovery() {
         world.routes.discovered.load(Ordering::SeqCst) > asked
     })
     .await;
+    hq.shutdown().await;
+}
+
+#[test]
+fn discovery_store_origin_strips_signed_query_and_refuses_credentials() {
+    let found = routes::discovery_of_body(serde_json::json!({
+        "actorId": "ana",
+        "clientId": "ana.1",
+        "databases": [
+            {
+                "name": "alpha",
+                "mount": "/alpha",
+                "kind": "general",
+                "display_name": "Alpha",
+                "store": "https://store.example.org:9000/bucket/key?X-Amz-Signature=abc&X-Amz-Credential=AKIA",
+            },
+            {
+                "name": "beta",
+                "mount": "/beta",
+                "kind": "general",
+                "display_name": "Beta",
+                "store": "https://user:pw@store.example.org",
+            },
+        ],
+    }))
+    .expect("parses");
+
+    let alpha = found
+        .entries
+        .iter()
+        .find(|e| e.name == "alpha")
+        .and_then(|e| e.store.as_deref())
+        .and_then(StoreOrigin::parse)
+        .expect("alpha store parses");
+    assert_eq!(alpha.as_str(), "https://store.example.org:9000");
+    assert_eq!(alpha.authority(), "store.example.org:9000");
+    assert!(!alpha.as_str().contains('?'));
+    assert!(!alpha.as_str().contains("AKIA"));
+    assert!(!alpha.authority().contains('?'));
+    assert!(!alpha.authority().contains("AKIA"));
+
+    let beta = found
+        .entries
+        .iter()
+        .find(|e| e.name == "beta")
+        .and_then(|e| e.store.as_deref())
+        .and_then(StoreOrigin::parse);
+    assert_eq!(beta, None);
+}
+
+#[tokio::test]
+async fn discovery_sets_and_updates_store_slots_in_place() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha", "beta"]);
+    let announced = routes::discovery_of_body(serde_json::json!({
+        "actorId": "ana",
+        "clientId": "ana.1",
+        "databases": [
+            {
+                "name": "alpha",
+                "mount": "/alpha",
+                "kind": "general",
+                "display_name": "Alpha",
+                "store": "https://store.example.org:9000/bucket/key?X-Amz-Signature=abc&X-Amz-Credential=AKIA",
+            },
+            {
+                "name": "beta",
+                "mount": "/beta",
+                "kind": "general",
+                "display_name": "Beta",
+                "store": "https://store.example.org:9000/other",
+            },
+        ],
+    }))
+    .expect("parses");
+    *lock(&world.routes.discovery) = Some(Ok(announced));
+
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    until("alpha and beta link", || {
+        linked(&hq, "alpha") && linked(&hq, "beta")
+    })
+    .await;
+
+    assert_eq!(hq.stores(), vec!["store.example.org:9000".to_owned()]);
+    let alpha_slot = world.live("alpha")[0]
+        .spec
+        .link
+        .as_ref()
+        .expect("alpha linked")
+        .store
+        .clone();
+    assert_eq!(
+        alpha_slot.get().as_ref().map(StoreOrigin::as_str),
+        Some("https://store.example.org:9000")
+    );
+
+    let cleared = routes::discovery_of_body(serde_json::json!({
+        "actorId": "ana",
+        "clientId": "ana.1",
+        "databases": [
+            {
+                "name": "alpha",
+                "mount": "/alpha",
+                "kind": "general",
+                "display_name": "Alpha",
+            },
+            {
+                "name": "beta",
+                "mount": "/beta",
+                "kind": "general",
+                "display_name": "Beta",
+                "store": "https://user:pw@store.example.org",
+            },
+        ],
+    }))
+    .expect("parses");
+    hq.apply_discovery(generation(&hq), Ok(cleared))
+        .await
+        .expect("applies");
+
+    assert!(hq.stores().is_empty());
+    assert_eq!(alpha_slot.get(), None);
     hq.shutdown().await;
 }

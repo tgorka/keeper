@@ -55,6 +55,10 @@ pub struct DomainEntry {
     /// manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_writes: Option<FilesWrites>,
+    /// The object store the server announced for this domain, as the server
+    /// sent it (story 115.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// A `databases[]` entry as the server sends it, before an entry with a
@@ -71,6 +75,8 @@ struct WireEntry {
     graph_root: Option<String>,
     #[serde(default)]
     files_writes: Option<Lenient<FilesWrites>>,
+    #[serde(default)]
+    store: Option<String>,
 }
 
 impl WireEntry {
@@ -91,6 +97,7 @@ impl WireEntry {
             replaced_repository: self.replaced_repository,
             graph_root: self.graph_root,
             files_writes,
+            store: self.store,
         })
     }
 }

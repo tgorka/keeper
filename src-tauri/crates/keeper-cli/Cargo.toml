@@ -33,3 +33,5 @@ tokio = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["resource"] }
 sha2 = { workspace = true }
+keeper-testkit = { path = "../keeper-testkit" }
+tempfile = { workspace = true }

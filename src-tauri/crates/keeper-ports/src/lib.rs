@@ -19,7 +19,11 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tokio::sync::watch;
 
+pub mod layout;
 pub mod server;
+pub mod transfer;
+
+pub use transfer::{StoreOrigin, StoreSlot};
 
 /// Rows a query read, and the window units not complete when it read them.
 pub type Covered = (Vec<Map<String, Value>>, Vec<String>);
@@ -114,6 +118,10 @@ pub struct Link {
     pub base_url: String,
     /// The device's bearer token. Never logged, never in a view model.
     pub token: String,
+    /// The object store the server last announced for this database
+    /// (story 115.3): a presigned blob URL is fetched only there or on the
+    /// server's own origin. Discovery updates it in place.
+    pub store: StoreSlot,
 }
 
 impl std::fmt::Debug for Link {

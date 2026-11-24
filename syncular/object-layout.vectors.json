@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "database": "general",
+  "filePrefix": "files/general/",
+  "stagingPrefix": "files/general/staging/",
+  "contentKeys": [
+    {
+      "contentId": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "key": "files/general/sha256/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "contentId": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "key": "files/general/sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    },
+    {
+      "contentId": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "key": "files/general/sha256/0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "refusedContentIds": [
+    "sha256:E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+    "sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  ],
+  "stagingKeys": [
+    {
+      "planId": "01J00000000000000000000000",
+      "key": "files/general/staging/01J00000000000000000000000"
+    }
+  ],
+  "metadata": [
+    {
+      "meta": {
+        "contentId": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 0,
+        "uploadedAtMs": 1700000000000
+      },
+      "header": "x-amz-meta-keeper-file",
+      "value": "eyJjb250ZW50SWQiOiJzaGEyNTY6ZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsInNpemUiOjAsInVwbG9hZGVkQXRNcyI6MTcwMDAwMDAwMDAwMH0"
+    },
+    {
+      "meta": {
+        "contentId": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "size": 5,
+        "mediaType": "text/plain; charset=utf-8",
+        "uploadedAtMs": 1700000001234
+      },
+      "header": "x-amz-meta-keeper-file",
+      "value": "eyJjb250ZW50SWQiOiJzaGEyNTY6MmNmMjRkYmE1ZmIwYTMwZTI2ZTgzYjJhYzViOWUyOWUxYjE2MWU1YzFmYTc0MjVlNzMwNDMzNjI5MzhiOTgyNCIsInNpemUiOjUsIm1lZGlhVHlwZSI6InRleHQvcGxhaW47IGNoYXJzZXQ9dXRmLTgiLCJ1cGxvYWRlZEF0TXMiOjE3MDAwMDAwMDEyMzR9"
+    }
+  ],
+  "limits": {
+    "filePartThresholdBytes": 67108864,
+    "filePartBytes": 67108864,
+    "maxParts": 10000,
+    "partBytesOf": [
+      {
+        "size": 67108864,
+        "partBytes": 0
+      },
+      {
+        "size": 67108865,
+        "partBytes": 67108864
+      },
+      {
+        "size": 6442450944,
+        "partBytes": 67108864
+      },
+      {
+        "size": 1000000000000,
+        "partBytes": 100663296
+      }
+    ]
+  }
+}

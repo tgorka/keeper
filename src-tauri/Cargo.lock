@@ -4659,9 +4659,11 @@ dependencies = [
  "keeper-graph",
  "keeper-ports",
  "keeper-replica",
+ "keeper-testkit",
  "nix",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 
@@ -4836,6 +4838,7 @@ dependencies = [
 name = "keeper-ports"
 version = "0.12.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "serde_json",
  "sha2 0.10.9",
@@ -4848,6 +4851,7 @@ dependencies = [
 name = "keeper-replica"
 version = "0.12.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "hex",
  "keeper-ports",
@@ -4861,6 +4865,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tungstenite",
+ "ureq",
  "url",
 ]
 
@@ -4922,6 +4927,7 @@ dependencies = [
 name = "keeper-testkit"
 version = "0.12.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "keeper-ports",
  "rusqlite",

@@ -907,6 +907,7 @@ fn a_connected_socket_is_not_a_complete_view_of_who_is_online() {
             link: Some(keeper_ports::Link {
                 base_url: "https://hq.example.org/alpha".to_owned(),
                 token: "t".to_owned(),
+                store: Default::default(),
             }),
             units: Vec::new(),
             watch_presence: Some("dir:alpha".to_owned()),

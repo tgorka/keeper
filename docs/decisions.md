@@ -2205,3 +2205,23 @@ one small change each, and keeper builds both from copies under `tools/`, wired 
   which would make it a fork rather than a pinned patch.
 - **Status / owner:** decided within the owner's choice of the newest Syncular release (story
   115.6), 2026-11-19. Owner is the architect.
+
+## D-TBD — A file's bytes go to the object store the server names, by signed link
+
+keeper transfers a file's bytes directly between a device and its database's object store using
+presigned URLs the server grants; it will **not** hold S3 keys, send its own credentials to the
+store, or follow a server-issued URL to an unannounced origin.
+
+- **Origin and credential rule:** a presigned blob URL is fetched or sent only on the object-store
+  origin the server announced for that database in `GET /databases` (`store`: scheme, host and
+  port; no path, query or credential), or on the server's own origin; a segment URL stays on the
+  server's own origin. Anything else is refused with `transport.foreign_origin` without contact.
+  The device sends no credential of its own to the store and holds no S3 key.
+- **Large files and execution:** files above `filePartThresholdBytes` go in parts sized by
+  `filePartBytes` (`syncular/limits.json`) under the layout in `syncular/README.md` § *Objects in
+  parts*. An upload's resume plan lives in a device-local file, never in the replica SQLite.
+  Transfers run outside sync rounds with per-request deadlines.
+- **What it amends:** keeper's same-origin rule for server-issued URLs (not previously recorded as
+  a `D-` entry here) and `docs/egress.md` (amendments 3–5). D-4 still holds: keeper names no
+  store, and the server announces the origin per database.
+- **Status / owner:** decided for story 115.3, 2026-11-24. Owner is the architect.

@@ -298,6 +298,7 @@ mod tests {
             replaced_repository: None,
             graph_root: None,
             files_writes: None,
+            store: None,
         }
     }
 
