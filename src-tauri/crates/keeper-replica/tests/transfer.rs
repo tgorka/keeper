@@ -228,8 +228,8 @@ fn a_killed_upload_restarts_from_its_plan_file() {
     );
     let resent = s.store_bytes_received().saturating_sub(size);
     assert!(
-        resent <= 2 * PART_BYTES,
-        "re-sent bytes {resent} exceeded two parts"
+        resent <= PART_BYTES,
+        "re-sent bytes {resent} exceeded the one part in flight"
     );
     assert_eq!(
         s.object(&uploaded.content_id).as_deref(),

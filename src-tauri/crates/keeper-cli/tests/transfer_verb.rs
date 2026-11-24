@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keeper_testkit::store::StandIn;
 use serde_json::Value;
@@ -136,6 +136,15 @@ fn killed_put_resumes_from_plan_without_resending_held_parts() {
     hold.release();
     let _ = child.wait();
 
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stand_in.parts_accepted().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "stand-in did not accept held part within 10s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     let resumed = put_cmd(&stand_in.server_url(), stand_in.token(), &plan_dir, &src)
         .output()
         .expect("run resumed put");
@@ -156,10 +165,74 @@ fn killed_put_resumes_from_plan_without_resending_held_parts() {
         .store_bytes_received()
         .saturating_sub(FILE_SIZE as u64);
     assert!(
-        extra <= (PART as u64) * 2,
-        "resent too many bytes: received={}, size={}, extra={}",
+        extra <= PART as u64,
+        "re-sent more than the one part in flight: received={}, size={}, extra={}",
         stand_in.store_bytes_received(),
         FILE_SIZE,
         extra
     );
+}
+
+#[test]
+fn killed_get_resumes_from_its_part_file() {
+    let stand_in = StandIn::start("alpha");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dst = dir.path().join("out.bin");
+    let part = dir.path().join("out.bin.part");
+    let data = pattern_bytes(FILE_SIZE);
+    let content_id = stand_in.seed(&data);
+    let half = FILE_SIZE as u64 / 2;
+
+    stand_in.silence_next(half, Duration::from_secs(30));
+    let mut child = get_cmd(
+        &stand_in.server_url(),
+        stand_in.token(),
+        &content_id,
+        FILE_SIZE as u64,
+        &dst,
+    )
+    .spawn()
+    .expect("spawn get");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0) == half {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "part file did not reach {half} bytes within 10s (len={:?})",
+            std::fs::metadata(&part).ok().map(|m| m.len())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().expect("kill get child");
+    let _ = child.wait();
+
+    assert!(!dst.exists(), "destination file exists before resume");
+    assert_eq!(std::fs::metadata(&part).expect("part metadata").len(), half);
+
+    let served_before = stand_in.store_bytes_served();
+    let resumed = get_cmd(
+        &stand_in.server_url(),
+        stand_in.token(),
+        &content_id,
+        FILE_SIZE as u64,
+        &dst,
+    )
+    .output()
+    .expect("run resumed get");
+    assert!(resumed.status.success(), "resumed get failed: {resumed:?}");
+    let json = parse_json(&resumed);
+    assert_eq!(json["ok"], true);
+    assert_eq!(std::fs::read(&dst).expect("read out"), data);
+    assert!(!part.exists(), "part file still exists after resume");
+
+    let remaining = FILE_SIZE as u64 - half;
+    let resumed_served = stand_in.store_bytes_served() - served_before;
+    assert!(
+        resumed_served <= remaining,
+        "re-fetched too many bytes: resumed_served={resumed_served}, remaining={remaining}"
+    );
+    assert_eq!(stand_in.store_gets(), 2);
 }
