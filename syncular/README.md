@@ -18,7 +18,7 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
-| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; and `settingValueMaxBytes` (16,384), the longest `value` a `settings_values` or `config_values` row holds before it must be a blob (*Settings*); hand-written, never generated |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; `settingValueMaxBytes` (16,384), the longest `value` a `settings_values` or `config_values` row holds before it must be a blob (*Settings*); and the generic job bounds (*Jobs*): `jobRowMaxBytes` (65,536), the most bytes an encoded `jobs.*` command, and so a row it writes, may have; `jobInlineMaxBytes` (16,384), the most canonical bytes of an inline `input` or `result`; `jobNoteMaxBytes` (1,024), the most bytes of a progress note or a failure's sentence; `jobRefsMax` (64), the most references one job's input may name; `jobEffectsMax` (256), the most effects one completion or failure may report; `jobPlanMaxBytes` (1,048,576), the most bytes of a plan blob; `jobOpenMaxPerDomain` (10,000), the most jobs not yet ended one domain may hold; `jobAttemptsMax` (10), the highest `max_attempts`; `jobLeaseMinMs` (10,000) and `jobLeaseMaxMs` (600,000), the shortest and longest lease a claim may ask for; hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
@@ -28,6 +28,7 @@ keeper ships no server URL).
 | `files.media-types.json` | the closed extension-to-media-type table (*The drive*, decision 9) both sides read, with `default` (`application/octet-stream`) and `extensions`; hand-written, never generated |
 | `settings.vectors.json` | the settings contract's shared vectors (*Settings*): record ids and keys, who may write a record, a device record and shared configuration, adoption, the `settings_owner` scope, credential-shaped values, the domain-name check and the blob rule, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-settings-api`) |
 | `settings.travel.json` | every settings key's travel class (`every_device`, `this_device`, `never`) and which layer file may set it, generated from keeper-core's key registry (`config::keys::tests::travel::regenerate`) and pinned by its test |
+| `jobs.vectors.json` | the jobs contract's shared vectors (*Jobs*): envelopes and bound checks accepted or refused with a stable code, and command transitions over a job and its claim, including the attempt cases, a second plan, two fixture kinds and the move of an ended job to its month; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-jobs-api`, keeper-hq's server tests after 122.2's re-pin) |
 
 Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -140,6 +141,14 @@ Schema 11 (`0011_settings`, story 121.1) adds three tables and changes none: `se
 changes. The server serves the earlier schemas beside 11 with the three tables omitted, and grants
 `settings_owner` (*Settings*) before a schema-11 keeper writes a record; until it enforces every
 rule of *Settings* it refuses every write of the three tables.
+
+### Schema 12 release prerequisite
+
+Schema 12 (`0012_jobs`, story 122.1) adds `jobs`, `job_claims` and `job_capabilities` and nothing
+else; earlier migrations are unchanged. The server serves older schemas beside it with these three
+tables omitted, and refuses every `jobs.*` command until it enforces 122.2's fences, raw row writes
+to the three tables refused, service writes included. The number 12 is provisional while `0010`
+(116.1) and `0011` (121.1) are unmerged; the coordinator assigns the final one.
 
 ## Settings
 
@@ -319,6 +328,8 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `files_page` | `<domain>/<yyyy-mm>` (UTC month of `recorded_at_ms`) or `<domain>/import` | as `files_domain` | as `files_domain` | `files_events`, `files_event_ops` (schema 10; and `files_reviews` from 116.6) |
 | `files_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `files_receipts` (schema 10) |
 | `files_sources` | the name of the database (its drive's domain) | never, whatever the role | agent instances and tools with a file class in the domain | `files_entry_sources` (schema 10; reserved, holds no row until 120.2) |
+| `jobs_page` | `<domain>/open` or `<domain>/<yyyy-mm>` (*Jobs*) | as the domain's job-read policy grants (membership of the domain) | when the instance serves the domain | `jobs`, `job_claims` (schema 12) |
+| `jobs_nodes` | the domain's name | as `jobs_page` | as `jobs_page` | `job_capabilities` (schema 12) |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
@@ -1561,3 +1572,90 @@ graph line "none across units" has a self-test, `scripts/check-syncular-live.tes
 the four ledger tables under `kg_graph` as well, regenerates that contract beside a copy of the
 script, and expects the check to fail on that line. It needs a fresh schema of its own in
 `KEEPER_SYNC_TEST_PG_MUTANT_URL` and is skipped without one.
+
+## Jobs
+
+A job is a row in the domain it belongs to, with one claim the server fences (DF/AD-17; no
+Temporal). Its three tables change only through the registered `jobs.*` commands; a raw row write
+to `jobs`, `job_claims` or `job_capabilities` is refused, service writes included (122.2). `kind` is
+a namespaced lowercase name (`<namespace>.<name>`, at most 64 bytes) the contract never
+enumerates: kinds are closed in keeper-hq's registry (122.2), and no scope pattern names one
+(DF/AD-4). `keeper-jobs-api` is keeper's copy of these types and checks.
+
+**Tables** (`migrations/0012_jobs/up.sql`; no declared reference between `jobs` and `job_claims`,
+which move together):
+
+- `jobs`: `id` (ULID), `domain`, `page_key`, `kind`, `input`, `input_blob`, `input_digest`, `runs_on`
+  (`server`, `any` or `node:<capability>`), `state` (`queued`, `claimed`, `succeeded`, `failed`,
+  `cancelled`, `dead`), `attempt`, `max_attempts`, `not_before_ms`, `plan_blob`, `plan_attempt_id`,
+  `note`, `result`, `result_blob`, `effects`, `error_code`, `error_sentence`, `submitter_actor`,
+  `submitter_client`, `submitter_context`, `submitted_at_ms`, `updated_at_ms`, `ended_at_ms`,
+  `revision`, `author_actor`, `author_client`.
+- `job_claims`: `job_id` (key), `domain`, `page_key`, `holder_actor`, `holder_client`, `attempt_id`,
+  `epoch`, `lease_ms`, `acquired_at_ms`, `renewed_at_ms`, `released`, `revision`, authorship.
+- `job_capabilities`: `id` (the client scope, *Ids*), `domain`, `actor_id`, `client_id`,
+  `capabilities` (ascending, distinct), `declared_at_ms`, `revision`, authorship.
+
+**Scope and isolation.** While a job has not ended, its `jobs` and `job_claims` rows live under
+`jobs_page` = `<domain>/open`. The command that ends it (`jobs.complete`, a `jobs.fail` leaving it
+`failed` or `dead`, or `jobs.cancel`) moves both rows to `<domain>/<yyyy-mm>`, the UTC month it
+ended in, in the same commit, by Syncular's explicit scope move: an upsert and a `rescope` of the
+same row (0.97 `dist/push.js:215-275`, §2.2: only scope columns may differ; the delete under the
+old scopes and the upsert under the new are emitted at the next version). A client subscribing the
+current month and `<domain>/open` therefore holds every running job however old, and every job
+that ended this month (`scripts/jobs-scope-move.test.ts` runs the move on the real server). The
+scope promises **no per-kind isolation**: any reader of the domain, and any worker serving it,
+reads every job of the months it subscribes, inputs, plans and results included. A ceiling of
+kinds is enforced by the server on commands and byte grants, and by the trusted runtime on reads
+(DF/AD-7). A person who does not read a domain receives nothing of its jobs. A terminal state
+(`succeeded`, `failed`, `cancelled`, `dead`) never changes.
+
+**Commands.** Every `jobs.*` command's `params` is KG1's envelope `{version: 1, request_id: <ULID>,
+context_id: <ULID> | null, payload: {…}}` (*The knowledge graph*, Requests); its digest is the
+SHA-256 of the JCS bytes of `{version, descriptor, context_id, payload}`. The receipt is
+`{descriptor, request_id, request_digest, outcome: accepted | conflict | rejected, code?,
+commit_seq?, attempt_id?, epoch?}`; the same request id with the same digest is answered from the
+record, with another digest `idempotency_mismatch`.
+
+| descriptor | payload | caller | effect |
+| --- | --- | --- | --- |
+| `jobs.submit` | `{job_id, kind, input?: {refs, params}, input_blob?, runs_on, max_attempts, not_before_ms?}` | person, agent or tool | a `queued` job under `<domain>/open`, with `input_digest`; `input` and `input_blob` exclusive |
+| `jobs.cancel` | `{job_id}` | the submitter | ends an open job `cancelled`, releases its claim, moves both rows |
+| `jobs.claim` | `{job_id, lease_ms}` | a worker | acquires a due job; the receipt carries the new `attempt_id`, `epoch` and `commit_seq` |
+| `jobs.renew` | `{job_id, attempt_id}` | the holder | `renewed_at_ms` = the server's clock |
+| `jobs.release` | `{job_id, attempt_id}` | the holder | the claim `released`, the job `queued` |
+| `jobs.progress` | `{job_id, attempt_id, note?, plan_blob?, input_digest}` | the holder | a note and, once, the plan bound to `input_digest`: a second plan `plan_exists`, another digest `input_moved` |
+| `jobs.complete` | `{job_id, attempt_id, result? \| result_blob?, effects}` | the holder | ends the job `succeeded`, releases the claim, moves both rows |
+| `jobs.fail` | `{job_id, attempt_id, error_code, sentence, retryable, effects?}` | the holder | retryable with attempts left: `queued`; otherwise ends `failed` (not retryable) or `dead`, and moves both rows |
+| `jobs.declare_capability` | `{capabilities}` | any client | replaces the caller's own `job_capabilities` row (122.5 builds on it) |
+
+**References** (never inline bytes): `{type: row, table, id}`, `{type: job_blob, job_id, column:
+input_blob | plan_blob | result_blob}`, `{type: file, entry_id, content_id}` (plain ids, never a
+`blob_ref`; 116.1), `{type: graph_node, id, revision}`, `{type: graph_event, id}`, `{type: proposal,
+id}`. `input_blob`, `plan_blob` and `result_blob` are `BLOB_REF` columns of the conversation key
+space (DF/AD-8's third class), never the files one.
+
+**Effect identity** `(job_id, ordinal)`, carried in the effect where the domain replicates it: a
+graph change writes `<job_id>/<ordinal>` as a property (122.3's fixture `test:effect`, a later
+model kind the profile's reserved `okf:plan`); a proposal uses the id the plan fixed in advance; a
+file change carries `job_effect` `{job_id, ordinal, attempt_id}` in the files envelope's `job`
+field (116.1 decision 13). Through `job_id` every effect names its job, and the job its submitter.
+
+**Attempts, epoch and lapse.** `epoch` counts acquisitions and rises on every one: a first claim,
+a takeover, a re-claim after release, a restart with the same client, A→B→A. The session claim's
+rule (a rise only on a new holder client) is not reused: a same-client restart would keep its
+epoch and a stale attempt would pass. **Expiry (Ambiguity 1, settled):** the judge is the server's
+own clock against the `renewed_at_ms` it recorded on accepting the attempt's last `jobs.claim` or
+`jobs.renew` (lapsed when `now_ms >= renewed_at_ms + lease_ms`), as the turn ledger keeps its own
+record; never one host's wall clock against another's, because hosts' clocks differ and one
+worker's monotonic clock means nothing to another. A lapsed claim only permits a takeover; until
+one, the attempt stays current. The fence is the server-minted `attempt_id`: once another
+acquisition mints a new one, the old attempt's writes are refused `stale_attempt`.
+
+**Bounds and codes.** A command is checked in a fixed order: its encoded size (`jobRowMaxBytes`),
+the envelope (`unsupported_version` before anything else in it), the payload's shape, then each
+bound of `limits.json`. The stable codes: `invalid_request`, `unsupported_version`,
+`idempotency_mismatch`, `row_too_large`, `inline_too_large`, `note_too_large`, `too_many_refs`,
+`too_many_effects`, `plan_too_large`, `lease_out_of_range`, `attempts_out_of_range`,
+`too_many_open`, `job_exists`, `unknown_job`, `terminal`, `conflict`, `not_due`,
+`attempts_exhausted`, `stale_attempt`, `plan_exists`, `input_moved`, `invalid_effect`.

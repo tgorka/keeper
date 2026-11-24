@@ -11,6 +11,7 @@
   "keeper-graph-api": "contract",
   "keeper-graph-protocol": "contract",
   "keeper-graph-query": "legacy",
+  "keeper-jobs-api": "contract",
   "keeper-llm": "legacy",
   "keeper-nse": "legacy",
   "keeper-paths": "path-leaf",

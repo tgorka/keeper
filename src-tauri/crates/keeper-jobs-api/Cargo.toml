@@ -1,0 +1,20 @@
+[package]
+name = "keeper-jobs-api"
+description = "The jobs contract: a job and its claim as rows of their domain, the jobs.* commands, their bounds and the attempt fence"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Types and pure checks only (story 122.1): no storage, transport, Syncular,
+# SQLite, Tauri, async runtime or keeper-core. `bun run check:jobs-api-lean`
+# and `bun run check:module-edges` hold it to the contract role.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+sha2 = { workspace = true }
