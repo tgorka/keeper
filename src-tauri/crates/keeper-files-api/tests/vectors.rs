@@ -8,6 +8,7 @@ use keeper_files_api::names::{self, FileMode};
 use keeper_files_api::refusal::Code;
 use keeper_files_api::rows::{Drive, Entry, Head, Kind, Lifecycle};
 use keeper_files_api::rules::{self, Manifest, Server};
+use keeper_files_api::wire::WireOp;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -200,7 +201,8 @@ struct StepSpec {
     caller: Caller,
     descriptor: String,
     params: Value,
-    server: Server,
+    #[serde(default)]
+    server: Option<Server>,
     expect: Value,
 }
 
@@ -621,231 +623,543 @@ fn narrower() {
     assert_no_failures("narrower", &failures);
 }
 
-#[test]
-fn cases() {
-    let mut failures = Vec::new();
-    for case in section("cases") {
-        let case_id = case["id"].as_str().expect("cases[].id");
-        let fixture_name = case["fixture"].as_str().expect("cases[].fixture");
-        let steps = case["steps"].as_array().expect("cases[].steps");
-        let mut manifest = build_fixture(fixture_name);
+fn run_steps(case_id: &str, manifest: &mut Manifest, steps: &[Value], failures: &mut Vec<String>) {
+    for (step_idx, step_val) in steps.iter().enumerate() {
+        let step: StepSpec = serde_json::from_value(step_val.clone())
+            .unwrap_or_else(|err| panic!("{case_id} step {step_idx}: parse error: {err}"));
+        let before_entries = manifest.entries.clone();
+        let before_head = manifest.head.clone();
 
-        for (step_idx, step_val) in steps.iter().enumerate() {
-            let step: StepSpec = serde_json::from_value(step_val.clone())
-                .unwrap_or_else(|err| panic!("{case_id} step {step_idx}: parse error: {err}"));
-            let before_entries = manifest.entries.clone();
-            let before_head = manifest.head.clone();
-
-            let result = rules::evaluate(
-                &mut manifest,
-                &step.caller,
-                &step.descriptor,
-                &step.params,
-                &step.server,
-            );
-            let outcome = step.expect["outcome"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{case_id} step {step_idx}: missing expect.outcome"));
-
-            match outcome {
-                "rejected" => {
-                    let exp_code: Code = serde_json::from_value(step.expect["code"].clone())
-                        .unwrap_or_else(|err| {
-                            panic!("{case_id} step {step_idx}: invalid expect.code: {err}")
-                        });
-                    match result {
-                        Ok(accepted) => failures.push(format!(
-                            "{case_id} step {step_idx}: expected rejection {exp_code:?}, got accepted event {}",
-                            accepted.event.id
-                        )),
-                        Err(refusal) => {
-                            if refusal.code != exp_code {
+        if step.descriptor == "files.preview_reversal" {
+            let result = rules::preview_reversal(manifest, &step.caller, &step.params);
+            if let Some(exp_preview) = step.expect.get("preview") {
+                match result {
+                    Ok(preview) => {
+                        if let Some(exp_plan_val) = exp_preview.get("plan") {
+                            let exp_plan: Vec<WireOp> = serde_json::from_value(
+                                exp_plan_val.clone(),
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "{case_id} step {step_idx}: invalid expect.preview.plan: {err}"
+                                )
+                            });
+                            if preview.plan != exp_plan {
                                 failures.push(format!(
-                                    "{case_id} step {step_idx}: expected code {exp_code:?}, got {:?} (detail: {:?})",
-                                    refusal.code, refusal.detail
+                                    "{case_id} step {step_idx}: preview.plan mismatch:\n  expected: {exp_plan:?}\n  actual: {:?}",
+                                    preview.plan
                                 ));
                             }
-                            if let Some(exp_detail) =
-                                step.expect.get("detail").filter(|d| !d.is_null())
-                            {
-                                match &refusal.detail {
-                                    Some(act_detail) if subset(exp_detail, act_detail) => {}
-                                    other => failures.push(format!(
-                                        "{case_id} step {step_idx}: detail mismatch: expected subset {exp_detail}, got {other:?}"
-                                    )),
-                                }
+                        }
+                        let mut rest = exp_preview
+                            .as_object()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{case_id} step {step_idx}: expect.preview must be an object"
+                                )
+                            })
+                            .clone();
+                        rest.remove("plan");
+                        if !rest.is_empty() {
+                            let act_preview =
+                                serde_json::to_value(&preview).expect("serialize Preview");
+                            let exp_rest = Value::Object(rest);
+                            if !subset(&exp_rest, &act_preview) {
+                                failures.push(format!(
+                                    "{case_id} step {step_idx}: preview mismatch:\n  expected subset: {exp_rest}\n  actual: {act_preview}"
+                                ));
                             }
                         }
                     }
-                    if manifest.entries != before_entries {
-                        failures.push(format!(
-                            "{case_id} step {step_idx}: rejected step mutated manifest entries"
-                        ));
-                    }
-                    if manifest.head != before_head {
-                        failures.push(format!(
-                            "{case_id} step {step_idx}: rejected step mutated manifest head"
-                        ));
-                    }
+                    Err(refusal) => failures.push(format!(
+                        "{case_id} step {step_idx}: expected preview, got {refusal:?}"
+                    )),
                 }
-                "accepted" => {
-                    let accepted = match result {
-                        Ok(accepted) => accepted,
-                        Err(refusal) => {
+            } else if step.expect.get("outcome").and_then(Value::as_str) == Some("rejected")
+                || step.expect.get("code").is_some()
+            {
+                let exp_code: Code = serde_json::from_value(step.expect["code"].clone())
+                    .unwrap_or_else(|err| {
+                        panic!("{case_id} step {step_idx}: invalid expect.code: {err}")
+                    });
+                match result {
+                    Ok(preview) => failures.push(format!(
+                        "{case_id} step {step_idx}: expected preview refusal {exp_code:?}, got {preview:?}"
+                    )),
+                    Err(refusal) => {
+                        if refusal.code != exp_code {
                             failures.push(format!(
-                                "{case_id} step {step_idx}: expected accepted, got {refusal:?}"
-                            ));
-                            break;
-                        }
-                    };
-
-                    if let Some(exp_event) = step.expect.get("event") {
-                        let act_event =
-                            serde_json::to_value(&accepted.event).expect("serialize Event");
-                        if !subset(exp_event, &act_event) {
-                            failures.push(format!(
-                                "{case_id} step {step_idx}: event mismatch:\n  expected subset: {exp_event}\n  actual: {act_event}"
-                            ));
-                        }
-                    }
-
-                    if let Some(exp_count) = step.expect.get("op_count").and_then(Value::as_u64) {
-                        let exp_count = usize::try_from(exp_count).expect("op_count fits usize");
-                        if accepted.ops.len() != exp_count {
-                            failures.push(format!(
-                                "{case_id} step {step_idx}: op_count expected {exp_count}, got ops.len()={}",
-                                accepted.ops.len()
+                                "{case_id} step {step_idx}: expected code {exp_code:?}, got {:?} (detail: {:?})",
+                                refusal.code, refusal.detail
                             ));
                         }
-                        if accepted.event.op_count as usize != exp_count {
-                            failures.push(format!(
-                                "{case_id} step {step_idx}: event.op_count expected {exp_count}, got {}",
-                                accepted.event.op_count
-                            ));
-                        }
-                    }
-
-                    for (op_idx, op) in accepted.ops.iter().enumerate() {
-                        let act_op = serde_json::to_value(op).expect("serialize Op");
-                        if let Some(msg) = move_value_keys_failure(&act_op) {
-                            failures.push(format!("{case_id} step {step_idx} op {op_idx}: {msg}"));
-                        }
-                    }
-
-                    if let Some(exp_ops) = step.expect.get("ops").and_then(Value::as_array) {
-                        if accepted.ops.len() < exp_ops.len() {
-                            failures.push(format!(
-                                "{case_id} step {step_idx}: expected at least {} ops, got {}",
-                                exp_ops.len(),
-                                accepted.ops.len()
-                            ));
-                        } else {
-                            for (op_idx, exp_op) in exp_ops.iter().enumerate() {
-                                let act_op = serde_json::to_value(&accepted.ops[op_idx])
-                                    .expect("serialize Op");
-                                if !subset(exp_op, &act_op) {
-                                    failures.push(format!(
-                                        "{case_id} step {step_idx} op {op_idx}: mismatch:\n  expected subset: {exp_op}\n  actual: {act_op}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(exp_entries) = step.expect.get("entries").and_then(Value::as_object)
-                    {
-                        for (entry_id, exp_entry) in exp_entries {
-                            if exp_entry.is_null() {
-                                if let Some(act_entry) = manifest.entries.get(entry_id) {
-                                    failures.push(format!(
-                                        "{case_id} step {step_idx}: expected entry {entry_id} absent, got {act_entry:?}"
-                                    ));
-                                }
-                                continue;
-                            }
-                            match manifest.entries.get(entry_id) {
-                                Some(act_entry) => {
-                                    let act_val =
-                                        serde_json::to_value(act_entry).expect("serialize Entry");
-                                    if !subset(exp_entry, &act_val) {
-                                        failures.push(format!(
-                                            "{case_id} step {step_idx}: entry {entry_id} mismatch:\n  expected subset: {exp_entry}\n  actual: {act_val}"
-                                        ));
-                                    }
-                                }
-                                None => failures.push(format!(
-                                    "{case_id} step {step_idx}: expected entry {entry_id} missing"
+                        if let Some(exp_detail) =
+                            step.expect.get("detail").filter(|d| !d.is_null())
+                        {
+                            match &refusal.detail {
+                                Some(act_detail) if subset(exp_detail, act_detail) => {}
+                                other => failures.push(format!(
+                                    "{case_id} step {step_idx}: detail mismatch: expected subset {exp_detail}, got {other:?}"
                                 )),
                             }
                         }
                     }
+                }
+            } else {
+                failures.push(format!(
+                    "{case_id} step {step_idx}: files.preview_reversal expect missing 'preview' or 'code'"
+                ));
+            }
+            if manifest.entries != before_entries {
+                failures.push(format!(
+                    "{case_id} step {step_idx}: preview step mutated manifest entries"
+                ));
+            }
+            if manifest.head != before_head {
+                failures.push(format!(
+                    "{case_id} step {step_idx}: preview step mutated manifest head"
+                ));
+            }
+            continue;
+        }
 
-                    if let Some(unchanged) = step.expect.get("unchanged").and_then(Value::as_array)
-                    {
-                        for id_val in unchanged {
-                            let entry_id = id_val.as_str().expect("unchanged entry id string");
-                            if manifest.entries.get(entry_id) != before_entries.get(entry_id) {
-                                failures.push(format!(
-                                    "{case_id} step {step_idx}: entry {entry_id} changed when expected unchanged"
-                                ));
+        let server = step
+            .server
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case_id} step {step_idx}: missing server"));
+        let result = rules::evaluate(
+            manifest,
+            &step.caller,
+            &step.descriptor,
+            &step.params,
+            server,
+        );
+        let outcome = step.expect["outcome"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{case_id} step {step_idx}: missing expect.outcome"));
+
+        match outcome {
+            "rejected" => {
+                let exp_code: Code = serde_json::from_value(step.expect["code"].clone())
+                    .unwrap_or_else(|err| {
+                        panic!("{case_id} step {step_idx}: invalid expect.code: {err}")
+                    });
+                match result {
+                    Ok(accepted) => failures.push(format!(
+                        "{case_id} step {step_idx}: expected rejection {exp_code:?}, got accepted event {}",
+                        accepted.event.id
+                    )),
+                    Err(refusal) => {
+                        if refusal.code != exp_code {
+                            failures.push(format!(
+                                "{case_id} step {step_idx}: expected code {exp_code:?}, got {:?} (detail: {:?})",
+                                refusal.code, refusal.detail
+                            ));
+                        }
+                        if let Some(exp_detail) =
+                            step.expect.get("detail").filter(|d| !d.is_null())
+                        {
+                            match &refusal.detail {
+                                Some(act_detail) if subset(exp_detail, act_detail) => {}
+                                other => failures.push(format!(
+                                    "{case_id} step {step_idx}: detail mismatch: expected subset {exp_detail}, got {other:?}"
+                                )),
                             }
                         }
                     }
-
-                    if let Some(exp_head) = step.expect.get("head") {
-                        match &manifest.head {
-                            Some(act_head) => {
-                                let act_val =
-                                    serde_json::to_value(act_head).expect("serialize Head");
-                                if !subset(exp_head, &act_val) {
-                                    failures.push(format!(
-                                        "{case_id} step {step_idx}: head mismatch:\n  expected subset: {exp_head}\n  actual: {act_val}"
-                                    ));
-                                }
-                            }
-                            None if exp_head.is_null() => {}
-                            None => failures.push(format!(
-                                "{case_id} step {step_idx}: expected head {exp_head}, got None"
-                            )),
-                        }
+                }
+                if manifest.entries != before_entries {
+                    failures.push(format!(
+                        "{case_id} step {step_idx}: rejected step mutated manifest entries"
+                    ));
+                }
+                if manifest.head != before_head {
+                    failures.push(format!(
+                        "{case_id} step {step_idx}: rejected step mutated manifest head"
+                    ));
+                }
+            }
+            "accepted" => {
+                let accepted = match result {
+                    Ok(accepted) => accepted,
+                    Err(refusal) => {
+                        failures.push(format!(
+                            "{case_id} step {step_idx}: expected accepted, got {refusal:?}"
+                        ));
+                        break;
                     }
+                };
 
-                    if let Some(listings) = step.expect.get("listing").and_then(Value::as_object) {
-                        for (parent_id, exp_names_val) in listings {
-                            let exp_names: Vec<String> =
-                                serde_json::from_value(exp_names_val.clone())
-                                    .expect("listing names array");
-                            let got_names: Vec<String> = rules::list(&manifest, parent_id)
-                                .into_iter()
-                                .map(|entry| entry.name.clone())
-                                .collect();
-                            if got_names != exp_names {
-                                failures.push(format!(
-                                    "{case_id} step {step_idx}: listing[{parent_id}] expected {exp_names:?}, got {got_names:?}"
-                                ));
-                            }
-                        }
+                if let Some(exp_event) = step.expect.get("event") {
+                    let act_event = serde_json::to_value(&accepted.event).expect("serialize Event");
+                    if !subset(exp_event, &act_event) {
+                        failures.push(format!(
+                            "{case_id} step {step_idx}: event mismatch:\n  expected subset: {exp_event}\n  actual: {act_event}"
+                        ));
                     }
+                }
 
-                    if let Some(paths) = step.expect.get("paths").and_then(Value::as_object) {
-                        for (entry_id, exp_path_val) in paths {
-                            let got = rules::path_of(&manifest, entry_id);
-                            let expected = exp_path_val.as_str();
-                            if got.as_deref() != expected {
+                if let Some(exp_count) = step.expect.get("op_count").and_then(Value::as_u64) {
+                    let exp_count = usize::try_from(exp_count).expect("op_count fits usize");
+                    if accepted.ops.len() != exp_count {
+                        failures.push(format!(
+                            "{case_id} step {step_idx}: op_count expected {exp_count}, got ops.len()={}",
+                            accepted.ops.len()
+                        ));
+                    }
+                    if accepted.event.op_count as usize != exp_count {
+                        failures.push(format!(
+                            "{case_id} step {step_idx}: event.op_count expected {exp_count}, got {}",
+                            accepted.event.op_count
+                        ));
+                    }
+                }
+
+                for (op_idx, op) in accepted.ops.iter().enumerate() {
+                    let act_op = serde_json::to_value(op).expect("serialize Op");
+                    if let Some(msg) = move_value_keys_failure(&act_op) {
+                        failures.push(format!("{case_id} step {step_idx} op {op_idx}: {msg}"));
+                    }
+                }
+
+                if let Some(exp_ops) = step.expect.get("ops").and_then(Value::as_array) {
+                    if accepted.ops.len() < exp_ops.len() {
+                        failures.push(format!(
+                            "{case_id} step {step_idx}: expected at least {} ops, got {}",
+                            exp_ops.len(),
+                            accepted.ops.len()
+                        ));
+                    } else {
+                        for (op_idx, exp_op) in exp_ops.iter().enumerate() {
+                            let act_op =
+                                serde_json::to_value(&accepted.ops[op_idx]).expect("serialize Op");
+                            if !subset(exp_op, &act_op) {
                                 failures.push(format!(
-                                    "{case_id} step {step_idx}: path_of({entry_id}) expected {expected:?}, got {got:?}"
+                                    "{case_id} step {step_idx} op {op_idx}: mismatch:\n  expected subset: {exp_op}\n  actual: {act_op}"
                                 ));
                             }
                         }
                     }
                 }
-                other => failures.push(format!(
-                    "{case_id} step {step_idx}: unknown expect.outcome {other:?}"
+
+                if let Some(exp_entries) = step.expect.get("entries").and_then(Value::as_object) {
+                    for (entry_id, exp_entry) in exp_entries {
+                        if exp_entry.is_null() {
+                            if let Some(act_entry) = manifest.entries.get(entry_id) {
+                                failures.push(format!(
+                                    "{case_id} step {step_idx}: expected entry {entry_id} absent, got {act_entry:?}"
+                                ));
+                            }
+                            continue;
+                        }
+                        match manifest.entries.get(entry_id) {
+                            Some(act_entry) => {
+                                let act_val =
+                                    serde_json::to_value(act_entry).expect("serialize Entry");
+                                if !subset(exp_entry, &act_val) {
+                                    failures.push(format!(
+                                        "{case_id} step {step_idx}: entry {entry_id} mismatch:\n  expected subset: {exp_entry}\n  actual: {act_val}"
+                                    ));
+                                }
+                            }
+                            None => failures.push(format!(
+                                "{case_id} step {step_idx}: expected entry {entry_id} missing"
+                            )),
+                        }
+                    }
+                }
+
+                if let Some(unchanged) = step.expect.get("unchanged").and_then(Value::as_array) {
+                    for id_val in unchanged {
+                        let entry_id = id_val.as_str().expect("unchanged entry id string");
+                        if manifest.entries.get(entry_id) != before_entries.get(entry_id) {
+                            failures.push(format!(
+                                "{case_id} step {step_idx}: entry {entry_id} changed when expected unchanged"
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(exp_head) = step.expect.get("head") {
+                    match &manifest.head {
+                        Some(act_head) => {
+                            let act_val = serde_json::to_value(act_head).expect("serialize Head");
+                            if !subset(exp_head, &act_val) {
+                                failures.push(format!(
+                                    "{case_id} step {step_idx}: head mismatch:\n  expected subset: {exp_head}\n  actual: {act_val}"
+                                ));
+                            }
+                        }
+                        None if exp_head.is_null() => {}
+                        None => failures.push(format!(
+                            "{case_id} step {step_idx}: expected head {exp_head}, got None"
+                        )),
+                    }
+                }
+
+                if let Some(listings) = step.expect.get("listing").and_then(Value::as_object) {
+                    for (parent_id, exp_names_val) in listings {
+                        let exp_names: Vec<String> = serde_json::from_value(exp_names_val.clone())
+                            .expect("listing names array");
+                        let got_names: Vec<String> = rules::list(manifest, parent_id)
+                            .into_iter()
+                            .map(|entry| entry.name.clone())
+                            .collect();
+                        if got_names != exp_names {
+                            failures.push(format!(
+                                "{case_id} step {step_idx}: listing[{parent_id}] expected {exp_names:?}, got {got_names:?}"
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(paths) = step.expect.get("paths").and_then(Value::as_object) {
+                    for (entry_id, exp_path_val) in paths {
+                        let got = rules::path_of(manifest, entry_id);
+                        let expected = exp_path_val.as_str();
+                        if got.as_deref() != expected {
+                            failures.push(format!(
+                                "{case_id} step {step_idx}: path_of({entry_id}) expected {expected:?}, got {got:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+            other => failures.push(format!(
+                "{case_id} step {step_idx}: unknown expect.outcome {other:?}"
+            )),
+        }
+    }
+}
+
+fn run_case_section(name: &str) {
+    let mut failures = Vec::new();
+    for case in section(name) {
+        let case_id = case["id"].as_str().unwrap_or_else(|| panic!("{name}[].id"));
+        let fixture_name = case["fixture"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}[].fixture"));
+        let steps = case["steps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}[].steps"));
+        let mut manifest = build_fixture(fixture_name);
+        run_steps(case_id, &mut manifest, steps, &mut failures);
+    }
+    assert_no_failures(name, &failures);
+}
+
+#[test]
+fn cases() {
+    run_case_section("cases");
+}
+
+#[test]
+fn reversals() {
+    run_case_section("reversals");
+}
+
+#[test]
+fn inverses() {
+    let mut failures = Vec::new();
+    for case in section("inverses") {
+        let case_id = case["id"].as_str().expect("inverses[].id");
+        let fixture_name = case["fixture"].as_str().expect("inverses[].fixture");
+        let steps = case["steps"].as_array().expect("inverses[].steps");
+        let target_event_id = case["target_event_id"]
+            .as_str()
+            .expect("inverses[].target_event_id");
+        let expect = &case["expect"];
+        let mut manifest = build_fixture(fixture_name);
+
+        let before_failures = failures.len();
+        run_steps(case_id, &mut manifest, steps, &mut failures);
+        if failures.len() != before_failures {
+            continue;
+        }
+
+        let result = rules::inverse(&manifest, target_event_id);
+        if let Some(exp_plan_val) = expect.get("plan") {
+            let exp_plan: Vec<WireOp> = serde_json::from_value(exp_plan_val.clone())
+                .unwrap_or_else(|err| panic!("{case_id}: invalid expect.plan: {err}"));
+            match result {
+                Ok(act_plan) => {
+                    if act_plan != exp_plan {
+                        failures.push(format!(
+                            "{case_id}: inverse plan mismatch:\n  expected: {exp_plan:?}\n  actual: {act_plan:?}"
+                        ));
+                    }
+                }
+                Err(refusal) => {
+                    failures.push(format!("{case_id}: expected inverse plan, got {refusal:?}"))
+                }
+            }
+        } else {
+            let exp_code: Code = serde_json::from_value(expect["code"].clone())
+                .unwrap_or_else(|err| panic!("{case_id}: invalid expect.code: {err}"));
+            match result {
+                Ok(act_plan) => failures.push(format!(
+                    "{case_id}: expected inverse refusal {exp_code:?}, got plan {act_plan:?}"
                 )),
+                Err(refusal) => {
+                    if refusal.code != exp_code {
+                        failures.push(format!(
+                            "{case_id}: expected code {exp_code:?}, got {:?} (detail: {:?})",
+                            refusal.code, refusal.detail
+                        ));
+                    }
+                    if let Some(exp_detail) = expect.get("detail").filter(|d| !d.is_null()) {
+                        match &refusal.detail {
+                            Some(act_detail) if subset(exp_detail, act_detail) => {}
+                            other => failures.push(format!(
+                                "{case_id}: detail mismatch: expected subset {exp_detail}, got {other:?}"
+                            )),
+                        }
+                    }
+                }
             }
         }
     }
-    assert_no_failures("cases", &failures);
+    assert_no_failures("inverses", &failures);
+}
+
+#[test]
+fn history() {
+    let mut failures = Vec::new();
+    for case in section("history") {
+        let case_id = case["id"].as_str().expect("history[].id");
+        let fixture_name = case["fixture"].as_str().expect("history[].fixture");
+        let steps = case["steps"].as_array().expect("history[].steps");
+        let queries = case["queries"].as_array().expect("history[].queries");
+        let mut manifest = build_fixture(fixture_name);
+
+        let before_failures = failures.len();
+        run_steps(case_id, &mut manifest, steps, &mut failures);
+        if failures.len() != before_failures {
+            continue;
+        }
+
+        for (query_idx, query) in queries.iter().enumerate() {
+            let params = &query["params"];
+            let expect = &query["expect"];
+            let result = rules::history(&manifest, params);
+
+            if let Some(exp_code_val) = expect.get("code").filter(|c| !c.is_null()) {
+                let exp_code: Code =
+                    serde_json::from_value(exp_code_val.clone()).unwrap_or_else(|err| {
+                        panic!("{case_id} query {query_idx}: invalid expect.code: {err}")
+                    });
+                match result {
+                    Ok(page) => failures.push(format!(
+                        "{case_id} query {query_idx}: expected refusal {exp_code:?}, got {} event(s)",
+                        page.events.len()
+                    )),
+                    Err(refusal) => {
+                        if refusal.code != exp_code {
+                            failures.push(format!(
+                                "{case_id} query {query_idx}: expected code {exp_code:?}, got {:?} (detail: {:?})",
+                                refusal.code, refusal.detail
+                            ));
+                        }
+                        if let Some(exp_detail) = expect.get("detail").filter(|d| !d.is_null()) {
+                            match &refusal.detail {
+                                Some(act_detail) if subset(exp_detail, act_detail) => {}
+                                other => failures.push(format!(
+                                    "{case_id} query {query_idx}: detail mismatch: expected subset {exp_detail}, got {other:?}"
+                                )),
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let page = match result {
+                Ok(page) => page,
+                Err(refusal) => {
+                    failures.push(format!(
+                        "{case_id} query {query_idx}: expected history page, got {refusal:?}"
+                    ));
+                    continue;
+                }
+            };
+
+            let exp_event_ids: Vec<String> = serde_json::from_value(expect["event_ids"].clone())
+                .unwrap_or_else(|err| {
+                    panic!("{case_id} query {query_idx}: invalid expect.event_ids: {err}")
+                });
+            let got_event_ids: Vec<String> = page
+                .events
+                .iter()
+                .map(|item| item.event.id.clone())
+                .collect();
+            if got_event_ids != exp_event_ids {
+                failures.push(format!(
+                    "{case_id} query {query_idx}: event_ids expected {exp_event_ids:?}, got {got_event_ids:?}"
+                ));
+            }
+
+            let exp_scanned = expect["scanned_through"].as_str().unwrap_or_else(|| {
+                panic!("{case_id} query {query_idx}: missing expect.scanned_through")
+            });
+            if page.scanned_through != exp_scanned {
+                failures.push(format!(
+                    "{case_id} query {query_idx}: scanned_through expected {exp_scanned:?}, got {:?}",
+                    page.scanned_through
+                ));
+            }
+
+            if let Some(exp_ops_map) = expect.get("ops").and_then(Value::as_object) {
+                let got_ops_map: BTreeMap<&str, Vec<u32>> = page
+                    .events
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.event.id.as_str(),
+                            item.ops.iter().map(|op| op.ordinal).collect(),
+                        )
+                    })
+                    .collect();
+                for (event_id, exp_ordinals_val) in exp_ops_map {
+                    let exp_ordinals: Vec<u32> = serde_json::from_value(exp_ordinals_val.clone())
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "{case_id} query {query_idx}: invalid expect.ops[{event_id}]: {err}"
+                            )
+                        });
+                    match got_ops_map.get(event_id.as_str()) {
+                        Some(got_ordinals) if *got_ordinals == exp_ordinals => {}
+                        other => failures.push(format!(
+                            "{case_id} query {query_idx}: ops[{event_id}] expected {exp_ordinals:?}, got {other:?}"
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    assert_no_failures("history", &failures);
+}
+
+#[test]
+fn conflict_copies() {
+    let mut failures = Vec::new();
+    for item in section("conflict_copies") {
+        let id = item["id"].as_str().expect("conflict_copies[].id");
+        let name = item["name"].as_str().expect("conflict_copies[].name");
+        let now_utc = item["now_utc"].as_str().expect("conflict_copies[].now_utc");
+        let device = item["device"].as_str().expect("conflict_copies[].device");
+        let taken: Vec<String> = serde_json::from_value(item["taken"].clone())
+            .unwrap_or_else(|err| panic!("{id}: invalid taken: {err}"));
+        let expected: Option<String> = serde_json::from_value(item["expect"].clone())
+            .unwrap_or_else(|err| panic!("{id}: invalid expect: {err}"));
+
+        let got = names::conflict_copy_name(name, now_utc, device, &taken);
+        if got != expected {
+            failures.push(format!(
+                "{id}: conflict_copy_name({name:?}, {now_utc:?}, {device:?}, {taken:?}) expected {expected:?}, got {got:?}"
+            ));
+        }
+    }
+    assert_no_failures("conflict_copies", &failures);
 }
 
 #[test]

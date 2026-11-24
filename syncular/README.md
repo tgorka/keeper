@@ -1155,7 +1155,8 @@ command runs with lock mode `shared`.
 - `files.import`: `{"operations": [op…], "change_set_id": <ULID>, "event_time_ms": <int>}` (both
   required), each operation carrying `provenance: {"drive", "commit", "path"}` and `git_mode`
   instead of `mode` on file creates/replaces, with no `mtime_ms`.
-- `files.reverse`: `{"event_id": <ULID>}` (implemented in 116.3; rules and inverse shape fixed here).
+- `files.reverse`: `{"event_id": <ULID>}` (implemented in 116.3). `files.preview_reversal` and
+  `files.history` are read-only queries (like `files.freshness`), not commands.
 - Story 116.6 adds `files.propose`, `files.decide` and `files.acknowledge`.
 
 **Outcomes.** `files_receipts.outcome` is `accepted`, `proposed` (from 116.6, `detail` carrying
@@ -1177,11 +1178,12 @@ row in one commit; a refused command mutates no manifest row and writes only a r
 5. Grant read (rooted callers): unknown mode → `unknown_mode`; unknown class → `invalid_change`.
 6. Payload parse and shape → `invalid_change`; any `sources` member → `reserved_field`; invalid
    entry or drive name → `invalid_name`.
-7. Authority: person `reader` → `forbidden`; drive create by non-owner or rooted caller →
-   `forbidden` (import may create a drive only as operation 0 of `files.import`); drive name folding
-   to `.keeper-logs` → `reserved_name` for every sender; rooted caller touching any location outside
-   its covering `write` (or `reverse_own` for own-event reversal) roots → `outside_roots`; strictest
-   mode `propose` → `propose_required`.
+7. Authority: person `reader` (write or reverse), person `editor` or rooted caller reversing another
+   actor's event, or drive create by non-owner or rooted caller → `forbidden` (import may create a
+   drive only as operation 0 of `files.import`); drive name folding to `.keeper-logs` →
+   `reserved_name` for every sender; rooted caller touching any location outside its covering `write`
+   (and, for a reversal, `reverse_own`) roots → `outside_roots`; strictest mode `propose` →
+   `propose_required`.
 8. Per-operation preconditions in order: create of an existing id → `conflict` (`absent`); missing
    entry or wrong revision → `conflict` (`revision`); wrong lifecycle → `conflict` (`lifecycle`);
    replace of a `dir` or move of a drive root → `invalid_change`; absent, deleted or non-`dir`
@@ -1204,13 +1206,15 @@ row in one commit; a refused command mutates no manifest row and writes only a r
 - `reserved_name`: drive name folds to `.keeper-logs`.
 - `reserved_field`: a reserved field (`approval_id`, `job`, `context_id` from non-agent, any
   `sources` member, or non-null `approval_id`/`origin_chain`/`context_id` on a `release` event).
-- `forbidden`: caller lacks role/identity authority (reader write, non-owner drive create, non-import
-  `files.import`, or agent with null `context_id`).
-- `outside_roots`: rooted caller touches an entry or parent outside its covering `write` (or
-  `reverse_own`) roots, or tries to reverse another actor's event.
+- `forbidden`: caller lacks role/identity authority (reader write, a reader reversing, an editor or
+  agent/tool/job reversing another's event, non-owner drive create, non-import `files.import`, or
+  agent with null `context_id`).
+- `outside_roots`: rooted caller touches an entry or parent outside its covering `write` (and, for a
+  reversal, `reverse_own`) roots.
 - `propose_required`: strictest covering mode for a rooted caller's write or reversal is `propose`.
 - `unknown_mode`: caller's grant carries a mode outside `ask`, `propose`, `apply`.
-- `conflict`: precondition failure (`absent`, `revision`, `lifecycle` or sibling/drive `name`).
+- `conflict`: precondition failure (`absent`, `revision`, `lifecycle`, `dependency` or sibling/drive
+  `name`).
 - `parent_invalid`: named parent does not exist, is `deleted`, or is not a `dir`.
 - `move_into_self`: a `dir` is moved into itself or one of its descendants.
 - `not_empty`: a `delete` targets a `dir` (including a drive root) that still has a live child.
@@ -1226,6 +1230,60 @@ be reversed whole. At this bound, a first import of 157,516 entries requires at 
 ⌈157,516 / 128⌉ = 1,231 changes/events and 157,516 operation rows, all under page key
 `<domain>/import`; a within-drive move of a folder holding 38,178 entries is 1 operation (one row
 updated; descendants are not rewritten).
+
+**Reversals (116.3).** `files.reverse` takes only the closed payload `{"event_id": <ULID>}` (any
+other member, such as `entity_ids` or `operations`, is refused `invalid_change`; no partial reversal).
+The server plans the inverse solely from the retained event's entry ops in reverse ordinal order
+(carried cross-drive descendant ops and `review` ops are skipped, so the 38,178-entry within-drive
+move reverses as one operation), each inverse op expecting the target op's `after_revision`:
+`create` → `delete`, `restore` → `delete`, `delete` → `restore`, `replace` → `replace` with
+`before_content_id`, before `size`, before `mtime_ms` (and before `mode` if recorded), and `move` →
+`move` to before `parent_id`/`name`. An unknown event is refused `conflict` (`absent`, `entity_id` =
+event id); an event with no entry op is refused `invalid_change`. Reversal is all or nothing (any
+refusal writes nothing), and a reversal event is itself reversible (re-applying the original).
+Authority: person `editor` may reverse only own events, `reviewer`/`owner` any event of the domain,
+`reader` none (`forbidden`); rooted callers (agent/tool/job) may reverse only own events (`forbidden`
+otherwise), and every touched location (where the entry sits now — before — and, for a move, the
+parent it returns to — after) must lie inside both a `reverse_own` root and a `write` root
+(`outside_roots` otherwise), taking the strictest `write` mode over those locations (`propose` →
+`propose_required`; until 116.6 the server admits only `ask` for an agent and refuses others with
+116.2's `mode_unavailable`, a server admission rule outside the closed set above). Where forward
+would answer `not_empty` (inverse deletes a `dir` with a live child not also deleted by the inverse)
+or `parent_invalid` (restored or moved-back entry would sit under an absent, deleted or non-`dir`
+parent), reversal answers `conflict` (`dependency`, naming the smallest such child id or that parent
+id); later edits stay `conflict` (`revision`/`lifecycle`) and another live entry now folding equal at
+the move-back target stays `conflict` (`name`). An accepted reversal records `reverses_event_id` and
+appends one `review` op (`entity_type` `review`, `operation` `create`, outside the 128 bound; 116.6
+adds `files_reviews`). `files.preview_reversal` is a read-only query with closed params
+`{"version": 1, "event_id": <ULID>}` (`version` ≠ 1 → `unsupported_version`, other shape →
+`invalid_change`) that runs inverse, authority, preconditions and final state as `files.reverse`
+would for this caller, writing nothing and binding no request, returning
+`{"target_event_id", "status", "plan", "code", "detail"}` with `status` `ready`, `conflict` or
+`rejected`. Vectors: `inverses[]`, `reversals[]`.
+
+**History (116.3).** `files.history` is a read-only query with closed params
+`{"version": 1, "after": <decimal>, "limit": 1..=100, "filter"?: {"entity_id"?, "actor_id"?, "origin_class"?}}`
+(`version` ≠ 1 → `unsupported_version`; non-canonical decimal `after`, `limit` outside `1..=100`,
+unknown member or empty-string filter value → `invalid_change`). It returns
+`{"events": [{"event", "ops"}…], "scanned_through": <decimal>}`: events with `seq > after` matching
+every given filter field, ascending numerically by `seq`, at most `limit`; each item's `ops` are
+ascending by ordinal (under `entity_id`, only ops of that entity); `scanned_through` is the last
+event's `seq` when the page is full (`len == limit`), else `max(after, head.seq)` (`"0"` with no
+head). Queries read through indexes (`files_event_ops(entity_id)`, `files_events(domain, actor_id, seq)`,
+`files_events(domain, origin_class, seq)` from `0010`), never a scan-then-filter (unlike
+`graph.history`'s 1,000-position scan). The `<domain>/import` page is read like any other. Authority
+is the server's: a caller not granted the domain's `files_page` rows is refused as for an unknown
+domain. Vectors: `history[]`.
+
+**Two devices, one file (116.3).** When a client's `files.put` replace is refused `conflict`
+(`revision`), it writes its own bytes as a new entry (`files.put` create, new ULID, the entry's
+current parent, its `content_id`) named `<stem>.sync-conflict-<now_utc>-<device>.<ext>` via
+`keeper_paths::conflict_name`, trying numbered ordinals `2..=1000` (`conflict_name_numbered`) until
+a `name_fold` not among the parent's live children is free (`None` if invalid or none free); the
+server never invents a name. Modification beats deletion: a replace refused `conflict` (`lifecycle`,
+deleted by another device) is written the same way, using the plain `name` when its fold is free. A
+stale delete refused `conflict` (`revision`) is dropped and the edited file stays live. Vectors:
+`conflict_copies[]`, `cases: conflict-copy-two-clients`, `cases: conflict-stale-delete-refused`.
 
 **`files.freshness` and server-only tables.** `files.freshness` is a read-only query with params
 `{"version": 1, "domain": <domain>}` returning

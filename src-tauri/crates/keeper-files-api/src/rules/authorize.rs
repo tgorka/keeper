@@ -52,31 +52,45 @@ pub(crate) fn authorize(
             if matches!(role, Role::Reader) {
                 return Err(Refusal::new(Code::Forbidden));
             }
+            if matches!(role, Role::Editor)
+                && reverses.is_some_and(|event_id| {
+                    !m.events
+                        .get(event_id)
+                        .is_some_and(|(event, _)| event.actor_id == caller.actor_id())
+                })
+            {
+                return Err(Refusal::new(Code::Forbidden));
+            }
             Ok(ApprovalBasis::Direct)
         }
-        Caller::Import { .. } => Ok(ApprovalBasis::Import),
+        Caller::Import { .. } => {
+            if reverses.is_some() {
+                return Err(Refusal::new(Code::Forbidden));
+            }
+            Ok(ApprovalBasis::Import)
+        }
         Caller::Agent { grant, files, .. }
         | Caller::Tool { grant, files, .. }
         | Caller::Job { grant, files, .. } => {
             let items = caller::parse_file_part(files)?;
             // A reversal lands by the `write` class's mode; `reverse_own` only gates
             // whose events may be reversed (decision 3).
-            let reversal = if let Some(event_id) = reverses {
-                match m.events.get(event_id) {
-                    Some((event, _)) if event.actor_id == caller.actor_id() => {}
-                    _ => return Err(Refusal::new(Code::OutsideRoots)),
+            if let Some(event_id) = reverses {
+                let is_own = m
+                    .events
+                    .get(event_id)
+                    .is_some_and(|(event, _)| event.actor_id == caller.actor_id());
+                if !is_own {
+                    return Err(Refusal::new(Code::Forbidden));
                 }
-                true
-            } else {
-                false
-            };
+            }
 
             let mut change_mode: Option<GrantMode> = None;
             let mut check_location = |op_idx: usize, raw_id: &str| -> Result<(), Refusal> {
                 let resolved = resolve_location(ops, op_idx, raw_id)
                     .ok_or_else(|| Refusal::new(Code::OutsideRoots))?;
-                if reversal {
-                    location_mode(m, &items, FileClass::ReverseOwn, resolved)?;
+                if reverses.is_some() {
+                    let _ = location_mode(m, &items, FileClass::ReverseOwn, resolved)?;
                 }
                 let mode = location_mode(m, &items, FileClass::Write, resolved)?;
                 change_mode = Some(match change_mode {

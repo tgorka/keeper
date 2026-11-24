@@ -1,5 +1,7 @@
 //! Names, folds, media types and modes (decisions 5, 9, 10, 14).
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::refusal::{Code, Refusal};
@@ -24,6 +26,45 @@ pub fn admit_name(name: &str) -> Result<(), Refusal> {
 #[must_use]
 pub fn fold(name: &str) -> String {
     keeper_paths::names::name_fold(name)
+}
+
+/// Conflict-copy name for a file whose `files.put` replace was refused with
+/// `conflict` (`revision`), given UTC stamp `now_utc`, `device` label and the
+/// `name_fold`s of the parent folder's live children (`taken`).
+///
+/// Delegates to `keeper_paths::conflict::conflict_name` and then
+/// `conflict_name_numbered` for ordinals `2..=1000`, returning the first
+/// candidate whose [`fold`] is not in `taken` and that passes [`admit_name`].
+/// Returns `None` if a candidate is not valid UTF-8, fails [`admit_name`], or
+/// no ordinal up to 1000 is free.
+#[must_use]
+pub fn conflict_copy_name(
+    name: &str,
+    now_utc: &str,
+    device: &str,
+    taken: &[String],
+) -> Option<String> {
+    let path = Path::new(name);
+    let first = keeper_paths::conflict::conflict_name(path, now_utc, device)
+        .into_string()
+        .ok()?;
+    admit_name(&first).ok()?;
+    let first_fold = fold(&first);
+    if !taken.iter().any(|existing| existing == &first_fold) {
+        return Some(first);
+    }
+    for ordinal in 2..=1000 {
+        let candidate =
+            keeper_paths::conflict::conflict_name_numbered(path, now_utc, device, ordinal)
+                .into_string()
+                .ok()?;
+        admit_name(&candidate).ok()?;
+        let candidate_fold = fold(&candidate);
+        if !taken.iter().any(|existing| existing == &candidate_fold) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// `syncular/files.media-types.json`, the one table a name's media type

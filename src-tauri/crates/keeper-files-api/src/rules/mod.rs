@@ -10,7 +10,9 @@
 mod authorize;
 mod commit;
 mod helpers;
+mod history;
 mod parse;
+mod reversal;
 mod stage;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde_json::Value;
 
+pub use commit::inverse;
 pub use helpers::{canonical, check_event, is_inside, list, narrower_or_equal, path_of};
+pub use history::history;
+pub use reversal::preview_reversal;
 
 use crate::caller::Caller;
 use crate::refusal::{Code, Refusal};
@@ -176,7 +181,7 @@ fn run(
         ),
     };
     let basis = authorize::authorize(m, caller, &request, &ops, reverses)?;
-    let staged = stage::stage(m, caller, &ops, import, event_time_ms)?;
+    let staged = stage::stage(m, caller, &ops, import, event_time_ms, reverses.is_some())?;
     Ok(commit::commit(
         m, caller, &request, basis, staged, reverses, server,
     ))

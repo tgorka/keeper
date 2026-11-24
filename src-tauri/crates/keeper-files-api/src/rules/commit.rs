@@ -15,8 +15,12 @@ use crate::wire::WireOp;
 
 /// The inverse of every entry operation of event `event_id`, in reverse
 /// ordinal order, each expecting the target operation's `after_revision`.
-/// An absent event is `conflict` `{entity_id: event_id, precondition: "absent"}`.
-pub(crate) fn inverse(m: &Manifest, event_id: &str) -> Result<Vec<WireOp>, Refusal> {
+///
+/// Carried cross-drive descendant operations and `review` operations are
+/// skipped. Returns `conflict` `{entity_id: event_id, precondition: "absent"}`
+/// when the event is absent, or `invalid_change` when the event has no entry
+/// operation to invert.
+pub fn inverse(m: &Manifest, event_id: &str) -> Result<Vec<WireOp>, Refusal> {
     let Some((_, ops)) = m.events.get(event_id) else {
         return Err(Refusal::with_detail(
             Code::Conflict,
@@ -31,6 +35,9 @@ pub(crate) fn inverse(m: &Manifest, event_id: &str) -> Result<Vec<WireOp>, Refus
         .iter()
         .filter(|op| op.entity_type == EntityType::Entry && !is_carried_move(op))
         .collect();
+    if entry_ops.is_empty() {
+        return Err(Refusal::new(Code::InvalidChange));
+    }
     entry_ops.sort_by_key(|op| Reverse(op.ordinal));
 
     let mut out = Vec::with_capacity(entry_ops.len());
