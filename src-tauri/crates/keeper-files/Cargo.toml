@@ -1,0 +1,31 @@
+[package]
+name = "keeper-files"
+description = "A drive's tree read from the replica, files fetched on demand into a device-local cache, and puts committed through the files commands (story 116.4)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# An implementation (DF/AD-2/3): contracts, ports and the path leaf only —
+# never keeper-core, keeper-sync or another implementation. `bun run
+# check:module-edges` holds it there.
+[dependencies]
+keeper-files-api = { path = "../keeper-files-api" }
+keeper-ports = { path = "../keeper-ports" }
+keeper-paths = { path = "../keeper-paths" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+keeper-testkit = { path = "../keeper-testkit" }
+keeper-replica = { path = "../keeper-replica" }
+tempfile = { workspace = true }
+keeper-accounts-api = { path = "../keeper-accounts-api" }
