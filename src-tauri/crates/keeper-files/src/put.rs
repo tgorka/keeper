@@ -40,6 +40,30 @@ pub enum PutOutcome {
     /// Sent, and its receipt has not reached the replica yet; it stays in
     /// the queue and the next flush asks again under the same request id.
     Sent,
+    /// Its source file is gone or no longer holds the bytes it was queued
+    /// with: it was taken out of the queue unsent, so it can never hold
+    /// the puts behind it.
+    Dropped(Dropped),
+}
+
+/// Why a queued put was taken out of the queue without a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dropped {
+    /// The source file can no longer be found.
+    SourceGone,
+    /// The source file no longer hashes to the queued content id.
+    SourceChanged,
+}
+
+impl Dropped {
+    /// The word an answer names it by.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::SourceGone => "source_gone",
+            Self::SourceChanged => "source_changed",
+        }
+    }
 }
 
 /// One put and what became of it.
@@ -178,7 +202,8 @@ impl Files {
 
     /// Commit every waiting put, oldest first; what became of each. Stops
     /// at the first that cannot reach the server (the rest wait behind it,
-    /// in order).
+    /// in order). A queued put whose source disappeared or changed is
+    /// dropped and does not stop the flush.
     pub fn flush(&self) -> Result<Vec<PutReport>, FilesError> {
         let mut reports = Vec::new();
         for pending in self.queue.load()? {
@@ -265,6 +290,20 @@ impl Files {
                 let Some(transfer) = &self.transfer else {
                     return Ok(report);
                 };
+                match crate::cache::digest_file(&body) {
+                    Ok((hex, _)) if format!("sha256:{hex}") == pending.content_id => {}
+                    Ok(_) => {
+                        self.queue.settle(&pending.request_id, None)?;
+                        report.outcome = PutOutcome::Dropped(Dropped::SourceChanged);
+                        return Ok(report);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.queue.settle(&pending.request_id, None)?;
+                        report.outcome = PutOutcome::Dropped(Dropped::SourceGone);
+                        return Ok(report);
+                    }
+                    Err(error) => return Err(FilesError::storage("put", &error)),
+                }
                 let name = pending.place().1.to_owned();
                 match transfer.upload(
                     &body,
@@ -273,10 +312,9 @@ impl Files {
                 ) {
                     Ok(uploaded) => {
                         if uploaded.content_id != pending.content_id {
-                            return Err(FilesError::Storage(format!(
-                                "the queued body of {} no longer hashes to {}",
-                                pending.request_id, pending.content_id
-                            )));
+                            self.queue.settle(&pending.request_id, None)?;
+                            report.outcome = PutOutcome::Dropped(Dropped::SourceChanged);
+                            return Ok(report);
                         }
                         report.bytes_sent += uploaded.bytes_sent;
                         report.parts_sent += uploaded.parts_sent;

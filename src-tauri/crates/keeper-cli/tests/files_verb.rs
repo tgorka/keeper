@@ -507,3 +507,163 @@ fn a_killed_put_continues_from_its_plan_file() {
         "files-queue.json must name {content_id}; got {queue_text}"
     );
 }
+
+#[test]
+fn a_wedged_queue_neither_fails_online_verbs_nor_survives_them() {
+    let store = StandIn::start("alpha");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let bytes = pattern_bytes(300_000);
+    store.seed(&bytes);
+    let ids = seed(&state, &store.server_url(), &[("a.bin", &bytes)]);
+
+    let changed_path = dir.path().join("changed.bin");
+    std::fs::write(&changed_path, b"after-edit").expect("write changed.bin");
+    let changed_cid = sha256_content_id(b"before-edit");
+    let gone_path = dir.path().join("gone.bin");
+    let gone_cid = sha256_content_id(b"never-there");
+
+    let queue = json!([
+        {
+            "request_id": ulid(600),
+            "drive": "notes",
+            "op": {
+                "op": "create",
+                "entry_id": ulid(500),
+                "parent_id": ids.docs,
+                "name": "changed.bin",
+            },
+            "content_id": changed_cid,
+            "size": 11,
+            "mtime_ms": 1_700_000_000_000_i64,
+            "body": changed_path,
+        },
+        {
+            "request_id": ulid(601),
+            "drive": "notes",
+            "op": {
+                "op": "create",
+                "entry_id": ulid(501),
+                "parent_id": ids.docs,
+                "name": "gone.bin",
+            },
+            "content_id": gone_cid,
+            "size": 11,
+            "mtime_ms": 1_700_000_000_000_i64,
+            "body": gone_path,
+        },
+    ]);
+    std::fs::write(
+        state.join("files-queue.json"),
+        serde_json::to_vec(&queue).expect("serialize queue"),
+    )
+    .expect("write files-queue.json");
+
+    let drives = files_cmd(&state, &store.server_url(), store.token())
+        .arg("drives")
+        .output()
+        .expect("run drives");
+    assert_eq!(drives.status.code(), Some(0), "drives failed: {drives:?}");
+    let drives_json = parse_json(&drives);
+    assert_eq!(drives_json["ok"], true);
+    assert!(
+        drives_json.get("flush_error").is_none(),
+        "unexpected flush_error: {drives_json}"
+    );
+    let flushed = drives_json["flushed"].as_array().expect("flushed array");
+    assert_eq!(flushed.len(), 2, "flushed: {flushed:?}");
+    assert_eq!(flushed[0]["outcome"], "dropped");
+    assert_eq!(flushed[0]["dropped"], "source_changed");
+    assert_eq!(flushed[1]["outcome"], "dropped");
+    assert_eq!(flushed[1]["dropped"], "source_gone");
+    // Nothing of the edited source reached the store (no orphan blob).
+    assert!(store.object(&sha256_content_id(b"after-edit")).is_none());
+
+    let remaining: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(state.join("files-queue.json")).expect("read files-queue.json"),
+    )
+    .expect("parse files-queue.json");
+    assert!(remaining.is_empty(), "queue not drained: {remaining:?}");
+
+    let ls = files_cmd(&state, &store.server_url(), store.token())
+        .args(["ls", "--drive", "notes", "Docs"])
+        .output()
+        .expect("run ls");
+    assert_eq!(ls.status.code(), Some(0), "ls failed: {ls:?}");
+
+    let get = files_cmd(&state, &store.server_url(), store.token())
+        .args(["get", "--drive", "notes", "Docs/a.bin"])
+        .output()
+        .expect("run get");
+    assert_eq!(get.status.code(), Some(0), "get failed: {get:?}");
+    let get_json = parse_json(&get);
+    assert_eq!(get_json["ok"], true);
+    assert_eq!(get_json["fetched"], true);
+}
+
+#[test]
+fn a_failing_flush_is_reported_and_every_verb_still_answers() {
+    let store = StandIn::start("alpha");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let bytes = pattern_bytes(300_000);
+    store.seed(&bytes);
+    let ids = seed(&state, &store.server_url(), &[("a.bin", &bytes)]);
+
+    // A queued body that cannot be read (a folder): the flush fails with a
+    // storage error that is neither "gone" nor "changed".
+    let unreadable = dir.path().join("a-folder");
+    std::fs::create_dir(&unreadable).expect("create folder");
+    let queue = json!([{
+        "request_id": ulid(610),
+        "drive": "notes",
+        "op": {"op": "create", "entry_id": ulid(510), "parent_id": ids.docs, "name": "x.bin"},
+        "content_id": sha256_content_id(b"x"),
+        "size": 1,
+        "mtime_ms": null,
+        "body": unreadable,
+    }]);
+    std::fs::write(
+        state.join("files-queue.json"),
+        serde_json::to_vec(&queue).expect("serialize queue"),
+    )
+    .expect("write files-queue.json");
+
+    let src = dir.path().join("new.txt");
+    std::fs::write(&src, b"new bytes").expect("write new.txt");
+    let verbs: [Vec<std::ffi::OsString>; 4] = [
+        vec!["drives".into()],
+        vec!["ls".into(), "--drive".into(), "notes".into(), "Docs".into()],
+        vec![
+            "get".into(),
+            "--drive".into(),
+            "notes".into(),
+            "Docs/a.bin".into(),
+        ],
+        vec![
+            "put".into(),
+            "--file".into(),
+            src.clone().into(),
+            "--drive".into(),
+            "notes".into(),
+            "Docs/new.txt".into(),
+        ],
+    ];
+    for verb in verbs {
+        let out = files_cmd(&state, &store.server_url(), store.token())
+            .args(&verb)
+            .output()
+            .expect("run verb");
+        let answer = parse_json(&out);
+        assert_eq!(answer["ok"], true, "{verb:?}: {answer}");
+        assert_eq!(
+            answer["flush_error"]["code"], "storage",
+            "{verb:?}: {answer}"
+        );
+        assert_eq!(answer["flushed"], json!([]), "{verb:?}: {answer}");
+        // drives/ls/get answer in full; the put itself is sent (no
+        // receipt from the stand-in) and waits, as any put would.
+        let expected = if verb[0] == "put" { 4 } else { 0 };
+        assert_eq!(out.status.code(), Some(expected), "{verb:?}: {answer}");
+    }
+}

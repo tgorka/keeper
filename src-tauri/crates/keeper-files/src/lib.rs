@@ -33,7 +33,7 @@ use keeper_ports::{ReplicaError, Source, Unit};
 use serde_json::Value;
 
 pub use fetch::Fetched;
-pub use put::{PutOutcome, PutReport};
+pub use put::{Dropped, PutOutcome, PutReport};
 pub use tree::{Listed, Listing};
 
 use crate::cache::Cache;

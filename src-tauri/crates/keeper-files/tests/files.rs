@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keeper_accounts_api::Role;
-use keeper_files::{Files, FilesError, Layout, Listing, PutOutcome, Target};
+use keeper_files::{Dropped, Files, FilesError, Layout, Listing, PutOutcome, Target};
 use keeper_ports::transfer::FileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
@@ -339,6 +339,85 @@ fn an_offline_put_waits_and_commits_on_reconnect() {
         listing.entries[0].entry.content_id.as_deref(),
         Some(expected_cid.as_str())
     );
+}
+
+#[test]
+fn a_changed_or_deleted_queued_source_is_dropped_and_the_puts_behind_it_commit() {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+
+    let one_bytes = pattern(1_024, 11);
+    let two_original = pattern(1_024, 12);
+    let two_changed = pattern(1_024, 99);
+    let three_bytes = pattern(1_024, 13);
+    let four_bytes = pattern(1_024, 14);
+
+    let one_cid = sha(&one_bytes);
+    let two_changed_cid = sha(&two_changed);
+    let four_cid = sha(&four_bytes);
+
+    let one_local = write_local(dev.dir.path(), "one.txt", &one_bytes);
+    let two_local = write_local(dev.dir.path(), "two.txt", &two_original);
+    let three_local = write_local(dev.dir.path(), "three.txt", &three_bytes);
+    let four_local = write_local(dev.dir.path(), "four.txt", &four_bytes);
+
+    dev.replica.set_online(false);
+    let offline = Files::new(
+        SERVER_URL,
+        dev.replica.source(DOMAIN),
+        None,
+        &Layout::under(dev.dir.path()),
+    )
+    .expect("open offline files");
+    for (local, target) in [
+        (&one_local, "Docs/one.txt"),
+        (&two_local, "Docs/two.txt"),
+        (&three_local, "Docs/three.txt"),
+        (&four_local, "Docs/four.txt"),
+    ] {
+        let report = offline
+            .put(local, &path_target(target), &mut |_| {})
+            .expect("queue offline put");
+        assert_eq!(report.outcome, PutOutcome::Queued);
+    }
+    drop(offline);
+
+    let pending = dev.files.pending().expect("pending");
+    assert_eq!(pending.len(), 4);
+    assert!(pending.iter().all(|item| item.body.is_some()));
+
+    fs::write(&two_local, &two_changed).expect("overwrite two.txt");
+    fs::remove_file(&three_local).expect("remove three.txt");
+
+    dev.replica.set_online(true);
+    let flushed = dev.files.flush().expect("flush");
+    let outcomes: Vec<PutOutcome> = flushed.into_iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            PutOutcome::Accepted,
+            PutOutcome::Dropped(Dropped::SourceChanged),
+            PutOutcome::Dropped(Dropped::SourceGone),
+            PutOutcome::Accepted,
+        ]
+    );
+    assert!(dev.files.pending().expect("pending after flush").is_empty());
+
+    dev.replica.pull();
+    let listing = dev.files.list(&path_target("Docs")).expect("list Docs");
+    let entries: BTreeMap<String, Option<String>> = listing
+        .entries
+        .into_iter()
+        .map(|row| (row.entry.name, row.entry.content_id))
+        .collect();
+    assert_eq!(
+        entries,
+        BTreeMap::from([
+            ("one.txt".to_owned(), Some(one_cid)),
+            ("four.txt".to_owned(), Some(four_cid)),
+        ])
+    );
+    assert!(world.store.object(&two_changed_cid).is_none());
 }
 
 #[test]

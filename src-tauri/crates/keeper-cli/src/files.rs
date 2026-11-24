@@ -3,7 +3,10 @@
 //! `keeper-files`: a listing reads the replica alone, offline as online;
 //! `get` fetches into the device's cache only what is not cached already;
 //! `put` uploads, then commits, and waits in the queue when the server
-//! cannot be reached. Every verb first commits what waits in the queue.
+//! cannot be reached. Every verb first commits what waits in the queue; a
+//! queued put whose source is gone or changed is dropped and named in
+//! `flushed`, and a flush that fails is reported as `flush_error` without
+//! failing the verb.
 //!
 //! The replica, the cache (`cache/`), the upload plans (`plans/`) and the
 //! queue (`files-queue.json`) live under `--state`; the bearer token is read
@@ -166,6 +169,7 @@ fn exit_code(answer: &Value) -> u8 {
     if answer["ok"] == true {
         return match answer["outcome"].as_str() {
             Some("queued" | "sent") => EXIT_DEFERRED,
+            Some("dropped") => EXIT_FAILURE,
             _ => EXIT_OK,
         };
     }
@@ -287,9 +291,16 @@ fn put_answer(report: &PutReport) -> Value {
         PutOutcome::ConflictCopy { .. } => "conflict_copy",
         PutOutcome::Queued => "queued",
         PutOutcome::Sent => "sent",
+        PutOutcome::Dropped(_) => "dropped",
     });
-    if let PutOutcome::ConflictCopy { of, entry_id, name } = &report.outcome {
-        answer["conflict"] = json!({"of": of, "entry_id": entry_id, "name": name});
+    match &report.outcome {
+        PutOutcome::ConflictCopy { of, entry_id, name } => {
+            answer["conflict"] = json!({"of": of, "entry_id": entry_id, "name": name});
+        }
+        PutOutcome::Dropped(reason) => {
+            answer["dropped"] = json!(reason.word());
+        }
+        PutOutcome::Accepted | PutOutcome::Queued | PutOutcome::Sent => {}
     }
     answer
 }
@@ -321,12 +332,10 @@ fn run(args: &Args) -> Value {
         )
         .map_err(|e| files_failure(&e))?;
         settle(&source, &files, Duration::from_millis(args.wait_ms));
-        let flushed = files
-            .flush()
-            .map_err(|e| files_failure(&e))?
-            .iter()
-            .map(put_answer)
-            .collect::<Vec<_>>();
+        let (flushed, flush_error) = match files.flush() {
+            Ok(reports) => (reports.iter().map(put_answer).collect::<Vec<_>>(), None),
+            Err(e) => (Vec::new(), Some(files_failure(&e))),
+        };
         let at = json!(files.at());
         let mut answer = match &args.command {
             Command::Drives => json!({
@@ -363,6 +372,9 @@ fn run(args: &Args) -> Value {
         answer["ok"] = json!(true);
         answer["at"] = at;
         answer["flushed"] = json!(flushed);
+        if let Some(flush_error) = flush_error {
+            answer["flush_error"] = flush_error;
+        }
         Ok::<Value, Value>(answer)
     })()
     .unwrap_or_else(|answer| answer);
