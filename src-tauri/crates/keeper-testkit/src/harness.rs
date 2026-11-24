@@ -103,6 +103,7 @@ pub fn harness_of(database: &str, over: Over<'_>) -> Harness {
             let link = Link {
                 base_url: format!("http://127.0.0.1:{port}/{database}"),
                 token: "0123456789abcdef".to_owned(),
+                store: Default::default(),
             };
             let replica = opener.open(spec(Some(link))).expect("opens");
             bootstrapped(&path);

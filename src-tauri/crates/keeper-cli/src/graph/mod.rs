@@ -358,6 +358,7 @@ fn open(args: &Args) -> Result<Source, Value> {
         link: Some(Link {
             base_url: format!("{}/{}", args.url.trim_end_matches('/'), args.database),
             token,
+            store: Default::default(),
         }),
         units: units(&args.database, &args.actor, &args.client),
         watch_presence: None,

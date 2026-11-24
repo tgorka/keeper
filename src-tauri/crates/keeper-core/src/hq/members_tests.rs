@@ -947,6 +947,7 @@ fn an_unreadable_answer_keeps_its_request_and_a_retry_replays_it() {
         link: Some(keeper_ports::Link {
             base_url: format!("http://127.0.0.1:{port}/alpha"),
             token: "0123456789abcdef".to_owned(),
+            store: Default::default(),
         }),
         units: Vec::new(),
         watch_presence: None,

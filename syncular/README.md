@@ -18,10 +18,11 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
-| `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; and `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
+| `object-layout.vectors.json` | the file object-store contract's shared vectors (*Objects in parts*): file and staging prefixes, content and staging keys, refused content ids, encoded user metadata, and part-size limits; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-ports`) |
 
 Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -1048,6 +1049,72 @@ domain-visible reference written after the target) is a `conflict` whose precond
 `inverse_caps[]` (the 128-operation cap as generators: `creates` node creates, reversed, fit
 with their review at 127 and refuse `change_limit` at 128), `reversals[]`, `reviews[]`,
 `previews[]` (preview rows decoded or refused), `proposals[]` and `outcomes[]` pin these.
+
+## Objects in parts
+
+Files travel between a device and its database's object store over presigned URLs the server
+grants, never through the replica SQLite or a sync round (story 115.3). A file's content id is
+`sha256:<64 lowercase hex>` of the whole file; a part's digest is standard base64 (with padding)
+of its raw SHA-256 (the `x-amz-checksum-sha256` form).
+
+**Key spaces and metadata.** Each database `<db>` keeps its files under `files/<db>/`, separate
+from Syncular's conversation blob space (`conv/<db>/blob/<partition>/sha256/<hex>`); the two never
+overlap:
+
+- content key of `sha256:<hex>`: `files/<db>/sha256/<hex>`
+- staging prefix: `files/<db>/staging/`; a plan's staging key: `files/<db>/staging/<plan_id>`
+- user metadata: one header `x-amz-meta-keeper-file`, whose value is unpadded base64url of the
+  compact UTF-8 JSON `{"contentId":"sha256:<hex>","size":<n>,"mediaType":"<type>","uploadedAtMs":<ms>}`
+  in that exact key order, with `mediaType` omitted when absent.
+
+`object-layout.vectors.json` pins the prefixes, keys, refused ids, metadata encodings and
+part-size rule (`limits.json`: `filePartThresholdBytes` for one `PUT`, `filePartBytes` per part
+grown to `ceil(size / 10000)` rounded up to a MiB when a file would exceed 10,000 parts, with no
+file size bound).
+
+**Grant wire.** JSON over HTTP relative to the database mount `<server>/<db>` with
+`Authorization: Bearer <token>`. A non-2xx answer carries `{"code","message"}` (`401`/`403` maps
+to `sync.credential_refused`; `5xx` is retryable):
+
+- `POST /files/upload-grant` `{contentId, size, mediaType?, partBytes, parts:[{number, sha256}]}`
+  → `{present:true}` | `{url, expiresAtMs}` (single `PUT`) | `{planId, parts:[{number, url, expiresAtMs}]}`
+- `POST /files/plans/<planId>/part-urls` `{numbers}` → `{parts:[{number, url, expiresAtMs}]}`
+- `GET /files/plans/<planId>/parts` → `{parts:[{number, size}]}`
+- `POST /files/plans/<planId>/complete` `{}` → `{status:"placed"|"verifying"}` (hash mismatch:
+  `409` `files.hash_mismatch`)
+- `POST /files/download-grant` `{contentId}` → `{url, expiresAtMs}`
+
+Two rules of this wire the client enforces:
+
+- **`planId` grammar.** A `planId` matches `[A-Za-z0-9._-]{1,128}` and is neither `.` nor `..`
+  (it names the staging key and goes into the paths above). The client refuses any other
+  `planId` and fails the upload; a server must therefore mint its own id, never pass a store's
+  multipart `UploadId` through.
+- **A forgotten plan.** For a plan the server no longer holds (unknown, aborted by the staging
+  sweep, or already completed), `GET …/parts`, `POST …/part-urls` and `POST …/complete` answer
+  `404` `{"code":"files.plan_unknown"}`. On that answer to `GET …/parts` (which the client asks
+  first when it resumes from a plan file) the client deletes its plan file and asks
+  `upload-grant` again; from `part-urls` or `complete` it fails the attempt, and the next
+  attempt does the same. Any other answer keeps the plan file, so every later upload of that file
+  on that device fails until the plan file is removed by hand.
+
+**Store wire and origin check.** The client sends no credential to the object store:
+
+- single `PUT <url>` with `Content-Length: <size>` and `x-amz-checksum-sha256: <whole-file b64>` → `200`
+- part `PUT <url>` with `Content-Length: <part len>` and `x-amz-checksum-sha256: <part b64>` → `200`
+  (wrong length or bytes → `400`/`403`)
+- `GET <url>` with optional `Range: bytes=<from>-` → `200` or `206` (`Content-Range: bytes <from>-<last>/<size>`);
+  an expired URL answers `403`
+
+A presigned URL is only ever contacted if its origin matches either the store origin the server
+announced in `GET /databases`'s `store` field (`scheme://host[:port]`, with no path, query or
+credential) or the server's own origin; any other origin is refused locally with
+`transport.foreign_origin`.
+
+**Plan file.** A multipart upload's plan stays on the device at `<plan_dir>/<hex>.plan.json`
+(`{contentId, size, partBytes, planId, parts, fileLen, fileModifiedMs}`), never in the replica
+SQLite. It is written after the upload grant, removed on completion, and discarded on resume if
+the local file's length or modification time has changed.
 
 ## The live check
 

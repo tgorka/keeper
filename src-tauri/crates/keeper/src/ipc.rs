@@ -13309,6 +13309,7 @@ pub async fn egress_list(
         &sync_remotes,
         &provider_base_urls,
         &agents_servers,
+        &crate::hq_ipc::stores(),
         if cfg!(desktop) {
             EGRESS_UPDATE_ENDPOINT
         } else {

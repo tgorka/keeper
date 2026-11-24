@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub mod harness;
+pub mod store;
 
 pub use harness::{harness, Harness, Over};
 

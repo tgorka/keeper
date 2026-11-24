@@ -24,6 +24,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod accounts;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod debug;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod graph;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod output;
@@ -67,6 +69,9 @@ mod cli {
         /// The person's domains, as a device last showed them.
         #[command(subcommand)]
         Accounts(super::accounts::Args),
+        /// Test-only verbs; not part of keeper-cli's surface.
+        #[command(subcommand, hide = true)]
+        Debug(super::debug::Args),
     }
 }
 
@@ -80,6 +85,7 @@ fn main() -> std::process::ExitCode {
     let code = match cli.module {
         cli::Module::Graph(args) => graph::main(args, &printer),
         cli::Module::Accounts(args) => accounts::main(args, &printer),
+        cli::Module::Debug(args) => debug::main(args, &printer),
     };
     std::process::ExitCode::from(code)
 }

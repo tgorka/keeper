@@ -71,6 +71,7 @@ fn open_at(index: u8, database: &str, url: &str, name: &str) -> Source {
         link: Some(Link {
             base_url: format!("{url}/{database}"),
             token: env(&format!("KEEPER_HQ_LIVE_TOKEN_{index}")),
+            store: Default::default(),
         }),
         units: units(database, &actor, &client),
         watch_presence: None,
@@ -1032,6 +1033,7 @@ fn reviewer() -> Source {
         link: Some(Link {
             base_url: format!("{}/{database}", env("KEEPER_HQ_LIVE_URL")),
             token: env("KEEPER_HQ_LIVE_REVIEWER_TOKEN"),
+            store: Default::default(),
         }),
         units: units(&database, &actor, &client),
         watch_presence: None,

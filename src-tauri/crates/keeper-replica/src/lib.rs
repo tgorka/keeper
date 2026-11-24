@@ -4,10 +4,10 @@
 //!
 //! Every request the client makes passes through a [`GatedTransport`]: a gate
 //! any thread can close, after which no request starts, and an origin check
-//! that refuses a server-issued blob URL on any host but the replica's own
-//! server — the only host the egress list names for it. Closing a replica
-//! closes its gate before anything else; a refused credential closes it for
-//! good and turns the client's own transport switch off.
+//! that allows a server-issued segment URL only on the server's origin, and a
+//! blob URL also on the object store the server announced for the database.
+//! Closing a replica closes its gate before anything else; a refused credential
+//! closes it for good and turns the client's own transport switch off.
 //!
 //! The owner thread is the only thread that touches the client. Its timing is
 //! [`Schedule`]'s: a round at least every [`HEARTBEAT`], because the client
@@ -76,7 +76,8 @@ pub fn schema() -> Result<&'static Value, ReplicaError> {
 }
 
 pub mod blob_cache;
-mod limits;
+pub mod limits;
+pub mod transfer;
 
 #[cfg(any(test, feature = "outcome-journal"))]
 pub mod journal;
@@ -90,8 +91,6 @@ fn now_ms() -> i64 {
 
 /// The code a request refused by a closed gate fails with.
 const CLOSED: &str = "transport.closed";
-/// The code a server-issued URL off the server's origin fails with.
-const FOREIGN: &str = "transport.foreign_origin";
 
 /// The client's transport behind a gate and an origin check.
 pub(crate) struct GatedTransport {
@@ -99,6 +98,8 @@ pub(crate) struct GatedTransport {
     open: Arc<AtomicBool>,
     /// The replica's server; `None` for a replica that never links.
     origin: Option<url::Origin>,
+    /// The object store the server last announced for this database.
+    store: keeper_ports::StoreSlot,
     /// What became of the last remote operation ([`Reach`]): `None` while
     /// none left this device (the gate was closed, or the transport refused
     /// it before sending).
@@ -122,9 +123,8 @@ impl GatedTransport {
         }
     }
 
-    /// A URL the server handed out (a signed segment, a blob download or
-    /// upload grant) is fetched only on the server's own origin.
-    fn check_url(&self, url: &str) -> Result<(), TransportError> {
+    /// A server-issued segment URL is fetched only on the server's own origin.
+    fn check_segment_url(&self, url: &str) -> Result<(), TransportError> {
         self.check()?;
         let same = url::Url::parse(url)
             .ok()
@@ -133,8 +133,27 @@ impl GatedTransport {
             Ok(())
         } else {
             Err(TransportError::new(
-                FOREIGN,
-                "the server named a host other than its own; keeper contacts only the agents server",
+                crate::transfer::FOREIGN,
+                crate::transfer::FOREIGN_SENTENCE,
+            ))
+        }
+    }
+
+    /// A server-issued blob URL is fetched on the server's own origin or on
+    /// the object store the server last announced for this database.
+    fn check_blob_url(&self, url: &str) -> Result<(), TransportError> {
+        self.check()?;
+        let allowed = self.origin.as_ref().is_some_and(|server_origin| {
+            url::Url::parse(url).ok().is_some_and(|parsed| {
+                crate::transfer::blob_url_allowed(&parsed, server_origin, self.store.get().as_ref())
+            })
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(TransportError::new(
+                crate::transfer::FOREIGN,
+                crate::transfer::FOREIGN_SENTENCE,
             ))
         }
     }
@@ -238,7 +257,7 @@ impl Transport for GatedTransport {
         byte_length: u64,
         on_progress: &mut dyn FnMut(u64),
     ) -> Result<Vec<u8>, TransportError> {
-        self.check_url(url)?;
+        self.check_segment_url(url)?;
         self.inner.fetch_url(url, byte_length, on_progress)
     }
     fn segment_fetch_started_at(&self, url: &str) -> Option<i64> {
@@ -268,7 +287,7 @@ impl Transport for GatedTransport {
         url: &str,
         byte_length: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
-        self.check_url(url)?;
+        self.check_blob_url(url)?;
         self.inner.fetch_blob_url(url, byte_length)
     }
     fn blob_upload_grant(
@@ -291,7 +310,7 @@ impl Transport for GatedTransport {
         bytes: &[u8],
         media_type: Option<&str>,
     ) -> Result<(), TransportError> {
-        self.check_url(url)?;
+        self.check_blob_url(url)?;
         let put = self.inner.blob_put_url(blob_id, url, bytes, media_type);
         self.refused(blob_id, put.as_ref().err(), true);
         put
@@ -1125,13 +1144,13 @@ impl Owner {
         let superseded_waiting = cache.log.superseded_waiting().map_err(|error| {
             ReplicaError::Client(format!("the replica's superseded commits: {error}"))
         })?;
-        let (config, origin) = match &spec.link {
+        let (config, origin, store) = match &spec.link {
             Some(link) => {
                 let (config, origin) = link_config(link)?;
-                (config, Some(origin))
+                (config, Some(origin), link.store.clone())
             }
             // No `baseUrl`: the transport that refuses every network call.
-            None => (json!({}), None),
+            None => (json!({}), None, keeper_ports::StoreSlot::default()),
         };
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = wake.send(Command::Wake);
@@ -1146,6 +1165,7 @@ impl Owner {
             inner,
             open: gate,
             origin,
+            store,
             reached: None,
             refused_uploads: Vec::new(),
         };
@@ -1939,6 +1959,7 @@ fn link_config(link: &keeper_ports::Link) -> Result<(Value, url::Origin), Replic
 struct Remote {
     config: Value,
     origin: url::Origin,
+    store: keeper_ports::StoreSlot,
     client_id: String,
 }
 
@@ -1979,6 +2000,7 @@ impl SyncularReplica {
                 Some(Remote {
                     config,
                     origin,
+                    store: link.store.clone(),
                     client_id: client_id.clone(),
                 })
             }
@@ -2408,6 +2430,7 @@ impl Replica for SyncularReplica {
             inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
+            store: remote.store.clone(),
             reached: None,
             refused_uploads: Vec::new(),
         };
@@ -2437,6 +2460,7 @@ impl Replica for SyncularReplica {
             inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
+            store: remote.store.clone(),
             reached: None,
             refused_uploads: Vec::new(),
         };
@@ -2621,6 +2645,7 @@ pub(crate) mod tests {
             .expect("transport"),
             open: Arc::new(AtomicBool::new(true)),
             origin: Some(url::Url::parse(&base).expect("url").origin()),
+            store: keeper_ports::StoreSlot::default(),
             reached: None,
             refused_uploads: Vec::new(),
         };
@@ -2922,6 +2947,7 @@ pub(crate) mod tests {
                     .expect("url")
                     .origin(),
             ),
+            store: keeper_ports::StoreSlot::default(),
             reached: None,
             refused_uploads: Vec::new(),
         }
@@ -2949,21 +2975,60 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 code(open.fetch_blob_url(foreign, None)).as_deref(),
-                Some(FOREIGN),
+                Some(crate::transfer::FOREIGN),
                 "{foreign}"
             );
             assert_eq!(
                 code(open.fetch_url(foreign, 1, &mut |_| {})).as_deref(),
-                Some(FOREIGN)
+                Some(crate::transfer::FOREIGN)
             );
             assert_eq!(
                 open.blob_put_url("sha256:00", foreign, b"x", None)
                     .err()
                     .map(|e| e.code)
                     .as_deref(),
-                Some(FOREIGN)
+                Some(crate::transfer::FOREIGN)
             );
         }
+        let store_url = "http://127.0.0.1:9/files/x";
+        open.store
+            .set(keeper_ports::StoreOrigin::parse("http://127.0.0.1:9"));
+        assert_eq!(
+            code(open.fetch_blob_url("https://cdn.example.net/x", None)).as_deref(),
+            Some(crate::transfer::FOREIGN)
+        );
+        assert_eq!(
+            open.blob_put_url("sha256:00", "https://cdn.example.net/x", b"x", None)
+                .err()
+                .map(|e| e.code)
+                .as_deref(),
+            Some(crate::transfer::FOREIGN)
+        );
+        let store_get = code(open.fetch_blob_url(store_url, None));
+        assert!(store_get.is_some());
+        assert_ne!(store_get.as_deref(), Some(crate::transfer::FOREIGN));
+        let store_put = open
+            .blob_put_url("sha256:00", store_url, b"x", None)
+            .err()
+            .map(|e| e.code);
+        assert!(store_put.is_some());
+        assert_ne!(store_put.as_deref(), Some(crate::transfer::FOREIGN));
+        assert_eq!(
+            code(open.fetch_url(store_url, 1, &mut |_| {})).as_deref(),
+            Some(crate::transfer::FOREIGN)
+        );
+        open.store.set(None);
+        assert_eq!(
+            code(open.fetch_blob_url(store_url, None)).as_deref(),
+            Some(crate::transfer::FOREIGN)
+        );
+        assert_eq!(
+            open.blob_put_url("sha256:00", store_url, b"x", None)
+                .err()
+                .map(|e| e.code)
+                .as_deref(),
+            Some(crate::transfer::FOREIGN)
+        );
         let mut closed = gated(false);
         assert_eq!(code(closed.sync(b"x")).as_deref(), Some(CLOSED));
         assert_eq!(code(closed.realtime_sync(b"x")).as_deref(), Some(CLOSED));
@@ -3595,6 +3660,7 @@ pub(crate) mod tests {
             link: Some(keeper_ports::Link {
                 base_url: format!("http://127.0.0.1:{port}/alpha"),
                 token: "0123456789abcdef".to_owned(),
+                store: Default::default(),
             }),
             units: vec![Unit::of("dir", "alpha")],
             watch_presence: Some("dir:alpha".to_owned()),

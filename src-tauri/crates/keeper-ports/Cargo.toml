@@ -18,3 +18,5 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 url = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The object layout's metadata value (`layout`, story 115.3): base64url.
+base64 = { workspace = true }

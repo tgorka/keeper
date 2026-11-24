@@ -202,6 +202,11 @@ pub fn contacting() -> Vec<String> {
     HQ.get().map(|hq| hq.contacting()).unwrap_or_default()
 }
 
+/// The object stores the agents server announced for the databases this device holds (story 115.3).
+pub fn stores() -> Vec<String> {
+    HQ.get().map(|hq| hq.stores()).unwrap_or_default()
+}
+
 /// A `keeper://agents/pair` link opened this app (a scanned QR): Rust checks
 /// it and keeps it; the window opens Settings, where the person confirms.
 pub fn link_arrived(app: &tauri::AppHandle, link: &str) {
