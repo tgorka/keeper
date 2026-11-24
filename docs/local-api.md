@@ -70,7 +70,7 @@ An error carries a code (`NOT_FOUND`, `INVALID_ARGUMENT`, `REFUSED`, `UNAVAILABL
 
 ## A second keeper on the same data directory
 
-keeper holds `<data dir>/keeper.lock` for its whole run, wire on or off. A second keeper process on the same data directory (a development build beside the installed app, say) opens nothing there and names the holder.
+keeper holds `<data dir>/keeper.lock` for its whole run, wire on or off. A second keeper process on the same data directory (a development build beside the installed app, say) asks again for ten seconds, then opens nothing there, names the holder and offers to try again. Where the lock cannot be asked for at all (a file system without locks), keeper opens its data, logs one warning, and the socket stays off.
 
 ## Graph rows of an unlisted domain
 

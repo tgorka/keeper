@@ -15,6 +15,7 @@
 
 mod conn;
 mod dispatch;
+mod switch;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +30,7 @@ use tokio::task::JoinSet;
 
 pub use dispatch::{Dispatch, Stream};
 pub use keeper_runtime::WireDispatcher;
+pub use switch::{debug_override, follow_switch, DEBUG_ON_VAR, SWITCH_POLL};
 
 /// Every number of the envelope (MA/AD-3 *Limits*, *Streamed answers*,
 /// *Deadlines*). The composition root passes [`Limits::default`].

@@ -25,6 +25,8 @@ pub enum Args {
     /// Upload or download a file through the database's object store.
     #[command(subcommand)]
     Transfer(Transfer),
+    /// Test composition of the macOS app's start (story 123.3).
+    AppStart(crate::app_start::Args),
 }
 
 /// File transfer subcommands.
@@ -82,6 +84,7 @@ pub struct Common {
 pub fn main(args: Args, printer: &Printer) -> u8 {
     match args {
         Args::Transfer(transfer) => run_transfer(transfer, printer),
+        Args::AppStart(app_start) => crate::app_start::main(app_start, printer),
     }
 }
 

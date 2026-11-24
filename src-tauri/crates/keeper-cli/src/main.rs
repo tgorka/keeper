@@ -24,6 +24,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod accounts;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod app_start;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compose;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod debug;

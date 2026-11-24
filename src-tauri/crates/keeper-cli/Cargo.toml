@@ -39,10 +39,15 @@ tokio = { workspace = true, features = ["signal"] }
 # `serve` (story 123.3): the local socket and the state's lock.
 keeper-wire = { path = "../keeper-wire" }
 keeper-wire-api = { path = "../keeper-wire-api" }
+# `debug app-start` (story 123.3): settings table and WARN log capture.
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Only the P1 measurement example `rc_spawner` (never shipped) uses these.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["resource"] }
+nix = { version = "=0.31.3", default-features = false, features = ["resource", "inotify"] }
+rusqlite = { workspace = true }
 sha2 = { workspace = true }
 keeper-testkit = { path = "../keeper-testkit" }
 tempfile = { workspace = true }

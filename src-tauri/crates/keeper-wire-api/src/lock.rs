@@ -145,4 +145,27 @@ impl DataLock {
     pub fn file(&self) -> &File {
         &self.file
     }
+
+    /// [`DataLock::acquire`], asked again every [`RETRY_EVERY`] while another
+    /// process holds the lock, for up to `wait` (the app: ten seconds, then it
+    /// opens nothing and names the holder). Every other answer is returned at
+    /// once.
+    pub fn acquire_waiting(
+        data_dir: &Path,
+        holder: &str,
+        wait: std::time::Duration,
+    ) -> Result<Self, LockError> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            match Self::acquire(data_dir, holder) {
+                Err(LockError::Held { .. }) if std::time::Instant::now() < until => {
+                    std::thread::sleep(RETRY_EVERY);
+                }
+                answer => return answer,
+            }
+        }
+    }
 }
+
+/// How often [`DataLock::acquire_waiting`] asks again.
+pub const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(200);

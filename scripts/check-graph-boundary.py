@@ -232,12 +232,22 @@ class Mutation:
 #   the enumeration of members by cargo rather than by directory.
 MACOS = "[target.'cfg(target_os = \"macos\")'.dependencies]\n"
 FULL = 'human-reads = []\nfull = ["human-reads"]\n'
+# The shell's macOS table already links the graph module (story 123.3); the plant
+# widens that line's features, or adds the line where there is none.
+SHELL_GRAPH = 'keeper-graph = { path = "../keeper-graph", features = ["module"] }\n'
+
+
+def plant_macos_full(text):
+    if SHELL_GRAPH in text:
+        return text.replace(SHELL_GRAPH, SHELL_GRAPH.replace('["module"]', '["module", "full"]'))
+    return text.replace(MACOS, MACOS + 'keeper-graph = { path = "../keeper-graph", features = ["full"] }\n')
+
+
 OUTSIDE = MANIFEST.parent / 'kg1-guard-selftest/people'
 SELF_TESTS = {
     'N8 indirect feature from a macOS table': lambda m: (
         m.write(MEMBER_PATH[GRAPH_CLIENT], GRAPH.replace('human-reads = []\n', FULL)),
-        m.write(MEMBER_PATH['keeper'], MEMBER_TEXT['keeper'].replace(
-            MACOS, MACOS + 'keeper-graph = { path = "../keeper-graph", features = ["full"] }\n'))),
+        m.write(MEMBER_PATH['keeper'], plant_macos_full(MEMBER_TEXT['keeper']))),
     'N11 indirect feature from a non-default member feature': lambda m: (
         m.write(MEMBER_PATH[GRAPH_CLIENT], GRAPH.replace('human-reads = []\n', FULL)),
         m.write(MEMBER_PATH['keeper-agent'],

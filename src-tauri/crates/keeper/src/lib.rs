@@ -167,6 +167,9 @@ mod zero_egress;
 mod web_auth;
 #[cfg(target_os = "ios")]
 mod web_auth_apple;
+// keeper's local socket and the data directory's lock (story 123.3).
+#[cfg(target_os = "macos")]
+mod wire;
 
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -434,6 +437,21 @@ pub fn run() {
     );
     let builder = builder
         .setup(|app| {
+            // The data directory's lock, before anything opens the data
+            // (story 123.3, A-2, SR-4): held for the whole run, whether the
+            // local socket is on or off. Held elsewhere: open nothing, name
+            // the holder and offer to try again.
+            #[cfg(target_os = "macos")]
+            let wire_lock = match app.state::<ipc::AppState>().platform.data_dir() {
+                Ok(data_dir) => match wire::take_lock(&data_dir) {
+                    wire::Taken::Refused(sentence) => {
+                        wire::refuse(app, sentence);
+                        return Ok(());
+                    }
+                    taken => Some(taken),
+                },
+                Err(_) => None,
+            };
             telemetry_ipc::init(app);
             // The one account-layer transition (consent, then the default
             // agent; R488 × R496), before any layer is installed.
@@ -491,6 +509,11 @@ pub fn run() {
                 telemetry_ipc::start_problem_export(app);
                 // First, so every line under it can be read as "this build said".
                 build_identity::announce();
+                // The lock's answer, once logging can carry its one WARN.
+                #[cfg(target_os = "macos")]
+                if let Some(taken) = &wire_lock {
+                    taken.announce();
+                }
                 for fault in keeper_core::config::faults() {
                     // `Display`, not `summary()`: the log form keeps `toml`'s
                     // own caret diagram over the offending line, which is the
@@ -538,6 +561,12 @@ pub fn run() {
             // The agents server (AD-418): after the layers, so its address is
             // read through them; opens the replicas this device holds.
             hq_ipc::init(app);
+            // keeper's local socket follows `wire.enabled` from here on
+            // (story 123.3); off unless the person switched it on.
+            #[cfg(target_os = "macos")]
+            if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                wire::start(data_dir);
+            }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
             // starts a turn (Story 63.5, FR-422), an organisation account's
