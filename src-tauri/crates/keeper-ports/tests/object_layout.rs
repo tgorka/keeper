@@ -7,15 +7,6 @@ use serde_json::Value;
 const VECTORS_JSON: &str = include_str!("../../../../syncular/object-layout.vectors.json");
 const LIMITS_JSON: &str = include_str!("../../../../syncular/limits.json");
 
-fn part_bytes(size: u64, threshold: u64, base_part: u64, max_parts: u64) -> u64 {
-    if size <= threshold {
-        return 0;
-    }
-    const MIB: u64 = 1 << 20;
-    let least = size.div_ceil(max_parts).div_ceil(MIB) * MIB;
-    least.max(base_part)
-}
-
 #[test]
 fn object_layout_vectors_match() {
     let vectors: Value = serde_json::from_str(VECTORS_JSON).expect("parse object-layout vectors");
@@ -98,16 +89,4 @@ fn limits_vectors_match_contract_limits() {
     );
     assert_eq!(Some(part), limits_file["filePartBytes"].as_u64());
     assert_eq!(max_parts, 10_000);
-
-    let cases = v_limits["partBytesOf"].as_array().expect("partBytesOf");
-    assert!(!cases.is_empty());
-    for case in cases {
-        let size = case["size"].as_u64().expect("size");
-        let expected = case["partBytes"].as_u64().expect("partBytes");
-        assert_eq!(
-            part_bytes(size, threshold, part, max_parts),
-            expected,
-            "size={size}"
-        );
-    }
 }

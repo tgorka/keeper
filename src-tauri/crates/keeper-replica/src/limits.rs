@@ -12,26 +12,11 @@ pub const ATTACHMENT_MAX_BYTES: u64 = contract_number(LIMITS, b"\"attachmentMaxB
 pub const FILE_PART_THRESHOLD_BYTES: u64 = contract_number(LIMITS, b"\"filePartThresholdBytes\"");
 
 /// The size of every part but the last (`filePartBytes`), unless a file
-/// needs more than [`MAX_PARTS`] of them: then [`part_bytes`] grows it.
+/// needs more than [`MAX_PARTS`] of them: then `TransferConfig::part_size` grows it.
 pub const FILE_PART_BYTES: u64 = contract_number(LIMITS, b"\"filePartBytes\"");
 
 /// The most parts one upload may have (the store's limit).
 pub const MAX_PARTS: u64 = 10_000;
-
-/// The part size of a file of `size` bytes: `0` for one `PUT`; else
-/// `max(FILE_PART_BYTES, ⌈size / MAX_PARTS⌉)` rounded up to a MiB.
-pub const fn part_bytes(size: u64) -> u64 {
-    if size <= FILE_PART_THRESHOLD_BYTES {
-        return 0;
-    }
-    const MIB: u64 = 1 << 20;
-    let least = size.div_ceil(MAX_PARTS).div_ceil(MIB) * MIB;
-    if least > FILE_PART_BYTES {
-        least
-    } else {
-        FILE_PART_BYTES
-    }
-}
 
 /// The whole number `key` (with its quotes) names in the JSON `text`.
 const fn contract_number(text: &str, key: &[u8]) -> u64 {
