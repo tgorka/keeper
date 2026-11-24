@@ -425,14 +425,30 @@ enum StoreRead {
     Eof,
 }
 
+/// A throttled upload body's pace: `pace.0` bytes per `pace.1`, except its last `unpaced_tail`
+/// bytes, which are read at full speed ([`StandIn::unpaced_upload_tail`]).
+#[derive(Clone, Copy)]
+struct UploadPace {
+    pace: (usize, Duration),
+    unpaced_tail: u64,
+}
+
+impl UploadPace {
+    fn of(state: &State) -> Option<UploadPace> {
+        state.pace.map(|pace| UploadPace {
+            pace,
+            unpaced_tail: state.unpaced_upload_tail,
+        })
+    }
+}
+
 fn read_store_body(
     stream: &mut TcpStream,
     initial: &[u8],
     expected_len: u64,
     cut_limit: Option<u64>,
     silence: Option<(u64, Duration)>,
-    pace: Option<(usize, Duration)>,
-    unpaced_tail: u64,
+    pace: Option<UploadPace>,
     counter: &AtomicU64,
 ) -> StoreRead {
     let max_read = silence
@@ -445,7 +461,10 @@ fn read_store_body(
     if take > 0 {
         counter.fetch_add(take as u64, Ordering::SeqCst);
     }
-    let paced_until = expected_len.saturating_sub(unpaced_tail);
+    let paced_until = pace.map_or(expected_len, |p| {
+        expected_len.saturating_sub(p.unpaced_tail)
+    });
+    let pace = pace.map(|p| p.pace);
     let mut buf = [0u8; 16_384];
     let started = std::time::Instant::now();
     while (body.len() as u64) < max_read {
@@ -948,7 +967,7 @@ fn handle_store_put_part(
     plan_id: &str,
     part_num: u32,
 ) {
-    let (expected_size, expected_sha256, cut_limit, silence, pace, unpaced_tail) = {
+    let (expected_size, expected_sha256, cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
         let Some(plan) = state.plans.get(plan_id) else {
             write_xml_error(stream, 404, "NoSuchUpload", "Unknown plan");
@@ -978,16 +997,8 @@ fn handle_store_put_part(
         }
         let cut_limit = state.cut_next.take();
         let silence = state.silence_next.take();
-        let pace = state.pace;
-        let unpaced_tail = state.unpaced_upload_tail;
-        (
-            expected_size,
-            expected_sha256,
-            cut_limit,
-            silence,
-            pace,
-            unpaced_tail,
-        )
+        let pace = UploadPace::of(&state);
+        (expected_size, expected_sha256, cut_limit, silence, pace)
     };
 
     let body = match read_store_body(
@@ -997,7 +1008,6 @@ fn handle_store_put_part(
         cut_limit,
         silence,
         pace,
-        unpaced_tail,
         &shared.bytes_received,
     ) {
         StoreRead::Complete(body) => body,
@@ -1054,14 +1064,10 @@ fn handle_store_put_single(
         );
         return;
     };
-    let (cut_limit, silence, pace, unpaced_tail) = {
+    let (cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
-        (
-            state.cut_next.take(),
-            state.silence_next.take(),
-            state.pace,
-            state.unpaced_upload_tail,
-        )
+        let pace = UploadPace::of(&state);
+        (state.cut_next.take(), state.silence_next.take(), pace)
     };
     let body = match read_store_body(
         stream,
@@ -1070,7 +1076,6 @@ fn handle_store_put_single(
         cut_limit,
         silence,
         pace,
-        unpaced_tail,
         &shared.bytes_received,
     ) {
         StoreRead::Complete(body) => body,
