@@ -2206,7 +2206,7 @@ one small change each, and keeper builds both from copies under `tools/`, wired 
 - **Status / owner:** decided within the owner's choice of the newest Syncular release (story
   115.6), 2026-11-19. Owner is the architect.
 
-## D-TBD — A file's bytes go to the object store the server names, by signed link
+## D-40 — A file's bytes go to the object store the server names, by signed link
 
 keeper transfers a file's bytes directly between a device and its database's object store using
 presigned URLs the server grants; it will **not** hold S3 keys, send its own credentials to the
