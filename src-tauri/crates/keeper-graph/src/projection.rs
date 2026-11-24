@@ -415,6 +415,30 @@ pub(crate) struct Exporter {
     pub(crate) last: Option<Last>,
     pub(crate) bytes: u64,
     images: HashMap<(u8, String), [u8; 32]>,
+    limits: Limits,
+}
+
+/// What one generation holds: the worker's limits by default, smaller in
+/// tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub(crate) events: u64,
+    pub(crate) entities: u64,
+    pub(crate) export_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            events: MAX_EVENTS,
+            entities: MAX_ENTITIES,
+            export_bytes: MAX_EXPORT_BYTES,
+        }
+    }
+}
+
+fn capacity(at: u64, measure: &'static str) -> PrefixError {
+    PrefixError::Capacity { at, measure }
 }
 
 /// How far [`Exporter::extend`] got.
@@ -428,7 +452,17 @@ pub(crate) struct Extended {
 
 impl Exporter {
     /// An empty prefix over a new export file at `path`.
+    #[cfg(test)]
     pub(crate) fn genesis(domain: &str, path: &Path) -> Result<Self, QueryError> {
+        Self::genesis_within(domain, path, Limits::default())
+    }
+
+    /// [`Exporter::genesis`] under `limits`.
+    pub(crate) fn genesis_within(
+        domain: &str,
+        path: &Path,
+        limits: Limits,
+    ) -> Result<Self, QueryError> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -444,11 +478,19 @@ impl Exporter {
             last: None,
             bytes: 0,
             images: HashMap::new(),
+            limits,
         })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How many live images the verified prefix holds (the consumer's
+    /// entity count, reviews included).
+    #[cfg(test)]
+    pub(crate) fn images(&self) -> usize {
+        self.images.len()
     }
 
     /// Verify and export the events `source` holds after the prefix.
@@ -460,11 +502,10 @@ impl Exporter {
         }
         let mut batch = Some(first);
         while self.n < head {
-            if head > MAX_EVENTS {
-                return Err(corrupt(
-                    self.n + 1,
-                    "prefix longer than one generation holds",
-                ));
+            // A capacity refusal leaves the verified prefix as it was, so
+            // the next refresh resumes here instead of replaying it.
+            if head > self.limits.events {
+                return Err(capacity(self.n + 1, "events"));
             }
             let current = match batch.take() {
                 Some(batch) => batch,
@@ -481,6 +522,9 @@ impl Exporter {
                     });
                 };
                 event.check().map_err(|_| corrupt(at, "digest or count"))?;
+                // The event's effect on the live images, applied only once
+                // every check below has passed.
+                let mut changed: HashMap<(u8, String), Option<[u8; 32]>> = HashMap::new();
                 for op in &event.ops {
                     let key = (tag(op.entity_type), op.entity_id.clone());
                     let before = op
@@ -489,30 +533,51 @@ impl Exporter {
                         .map(digest_of)
                         .transpose()
                         .map_err(|()| corrupt(at, "before-image"))?;
-                    if self.images.get(&key).copied() != before {
+                    let held = match changed.get(&key) {
+                        Some(pending) => *pending,
+                        None => self.images.get(&key).copied(),
+                    };
+                    if held != before {
                         return Err(corrupt(at, "before-image"));
                     }
-                    match &op.after_value {
-                        None => {
-                            self.images.remove(&key);
-                        }
-                        Some(after) => {
-                            let d = digest_of(after).map_err(|()| corrupt(at, "after-image"))?;
-                            self.images.insert(key, d);
-                        }
-                    }
+                    let after = op
+                        .after_value
+                        .as_ref()
+                        .map(digest_of)
+                        .transpose()
+                        .map_err(|()| corrupt(at, "after-image"))?;
+                    changed.insert(key, after);
                 }
-                if self.images.len() as u64 > MAX_ENTITIES {
-                    return Err(corrupt(at, "more entities than one generation holds"));
+                let mut images = self.images.len() as u64;
+                for (key, after) in &changed {
+                    match (self.images.contains_key(key), after.is_some()) {
+                        (false, true) => images += 1,
+                        (true, false) => images -= 1,
+                        _ => {}
+                    }
                 }
                 let frame =
                     EventFrame::new(at, &event.event.id, &event.event.delta_digest, &event.ops);
                 frame.check(at).map_err(|_| corrupt(at, "frame"))?;
                 let line = frame.encode().map_err(|_| corrupt(at, "frame size"))?;
-                self.bytes += line.len() as u64;
-                if self.bytes > MAX_EXPORT_BYTES {
-                    return Err(corrupt(at, "export larger than one generation holds"));
+                if images > self.limits.entities {
+                    return Err(capacity(at, "entities"));
                 }
+                let bytes = self.bytes + line.len() as u64;
+                if bytes > self.limits.export_bytes {
+                    return Err(capacity(at, "export_bytes"));
+                }
+                for (key, after) in changed {
+                    match after {
+                        None => {
+                            self.images.remove(&key);
+                        }
+                        Some(after) => {
+                            self.images.insert(key, after);
+                        }
+                    }
+                }
+                self.bytes = bytes;
                 self.file
                     .write_all(&line)
                     .map_err(|_| corrupt(at, "export write"))?;

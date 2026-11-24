@@ -803,3 +803,59 @@ fn outcome_codes_follow_the_shared_vectors() {
         assert_eq!(outcome.code(&key), entry["code"].as_str(), "{entry}");
     }
 }
+
+/// Fails if change_limit/detail decoding breaks or resolve treats it as pending/fenced.
+#[test]
+fn a_domain_capacity_refusal_is_a_terminal_rejection() {
+    let (held, tgdrive) = owner("tgdrive");
+    let mine = key(&tgdrive, REQUEST);
+    for measure in ["events", "entities", "export_bytes"] {
+        let detail_object = json!({"limit": "domain", "measure": measure});
+        let expected_detail = detail_object.as_object().expect("detail object").clone();
+        for detail in [Value::String(detail_object.to_string()), detail_object] {
+            let receipt = held_receipt(
+                &held,
+                &tgdrive,
+                &mine,
+                vec![row_for(
+                    &mine,
+                    "rejected",
+                    json!({"reason": "change_limit", "detail": detail}),
+                )],
+            );
+            assert_eq!(receipt.key(), &mine, "{measure}");
+            assert_eq!(
+                receipt.outcome(),
+                &ReceiptOutcome::Rejected {
+                    reason: "change_limit".into(),
+                },
+                "{measure}"
+            );
+            assert_eq!(
+                receipt.detail().get("limit"),
+                Some(&json!("domain")),
+                "{measure}"
+            );
+            assert_eq!(
+                receipt.detail().get("measure"),
+                Some(&json!(measure)),
+                "{measure}"
+            );
+            assert_eq!(receipt.detail(), &expected_detail, "{measure}");
+            for attempt in [acknowledged(&mine, REQUEST, 4), lost(&mine)] {
+                let outcome = tgdrive.resolve(&mine, &attempt, Some(&receipt));
+                assert_eq!(
+                    outcome,
+                    GraphOutcome::Rejected {
+                        reason: "change_limit".into(),
+                        detail: expected_detail.clone(),
+                    },
+                    "{measure}"
+                );
+                assert_eq!(outcome.code(&mine), Some("change_limit"), "{measure}");
+                assert!(!outcome.revokes(), "{measure}");
+                assert!(outcome.fence_cause().is_none(), "{measure}");
+            }
+        }
+    }
+}

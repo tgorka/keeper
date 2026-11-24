@@ -14,6 +14,8 @@ use serde_json::{json, Map, Value};
 
 use super::*;
 use crate::admission::Process;
+use crate::prefix::PrefixError;
+use crate::projection::{Exporter, Limits};
 use crate::protocol::candidate::{self, State, Verdict};
 use crate::protocol::change::{Change, ChangeOp, NodeFields};
 use crate::protocol::delta::Op;
@@ -377,6 +379,7 @@ fn edge(w: &World, id: &str, from: &str, to: &str, kind: &str, properties: Value
 struct Replicated {
     source: Source,
     scope: Mutex<Checkpoint>,
+    reads: Mutex<Vec<u64>>,
 }
 
 impl GraphSource for Replicated {
@@ -384,6 +387,7 @@ impl GraphSource for Replicated {
         &self.source.database
     }
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError> {
+        self.reads.lock().expect("reads").push(after);
         self.source.prefix_batch(after, limit)
     }
     fn checkpoint(&self) -> Result<Checkpoint, SourceError> {
@@ -486,16 +490,22 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        Self::within(Limits::default())
+    }
+
+    fn within(limits: Limits) -> Self {
         let dir = tempfile::tempdir().expect("dir");
         let world = World::new(dir.path());
         let source = Arc::new(Replicated {
             source: world.source.clone(),
             scope: Mutex::new(granted()),
+            reads: Mutex::new(Vec::new()),
         });
         let root = dir.path().join("projection");
         let admission = Admission::new(Process::Agentd);
         let reads =
-            GraphReads::open(source.clone(), &root, admission.clone(), worker()).expect("reads");
+            GraphReads::open_within(source.clone(), &root, admission.clone(), worker(), limits)
+                .expect("reads");
         Self {
             _dir: dir,
             world,
@@ -2499,4 +2509,158 @@ mod offline {
         let (fresh, _reader) = reopened(&o);
         assert_eq!(o.lifecycle.regrant(&status, granted(), &fresh), Ok(()));
     }
+}
+
+// Mutation: mapping capacity to Corrupt, applying event 2 first, or using >= fails this.
+#[test]
+fn each_capacity_site_is_typed_and_leaves_the_prefix_as_it_was() {
+    let setup = || {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut world = World::new(dir.path());
+        world.accept(vec![node(&ulid(1), "Concept", "A", json!({}))]);
+        world.accept(vec![node(&ulid(2), "Concept", "B", json!({}))]);
+        let source = Replicated {
+            source: world.source.clone(),
+            scope: Mutex::new(granted()),
+            reads: Mutex::new(Vec::new()),
+        };
+        (dir, world, source)
+    };
+
+    let (dir, world, source) = setup();
+    let mut measure = Exporter::genesis_within(DB, &dir.path().join("m.export"), Limits::default())
+        .expect("measure exporter");
+    world.replicate(1, 1, 1, None);
+    let ext1 = measure.extend(&source).expect("measure 1");
+    assert_eq!((ext1.head, ext1.complete, measure.n), (1, true, 1));
+    let b1 = measure.bytes;
+    let i1 = measure.images();
+    let i1_u64 = u64::try_from(i1).expect("images");
+
+    world.replicate(2, 2, 2, None);
+    let ext2 = measure.extend(&source).expect("measure 2");
+    assert_eq!((ext2.head, ext2.complete, measure.n), (2, true, 2));
+    let b2 = measure.bytes;
+    assert!(b2 > b1, "event 2 adds export bytes");
+
+    let cases = [
+        (
+            "events",
+            Limits {
+                events: 1,
+                ..Limits::default()
+            },
+        ),
+        (
+            "entities",
+            Limits {
+                entities: i1_u64,
+                ..Limits::default()
+            },
+        ),
+        (
+            "export_bytes",
+            Limits {
+                export_bytes: b2 - 1,
+                ..Limits::default()
+            },
+        ),
+    ];
+
+    for (expected_measure, limits) in cases {
+        let (dir, world, source) = setup();
+        let mut exporter = Exporter::genesis_within(DB, &dir.path().join("case.export"), limits)
+            .expect("case exporter");
+        world.replicate(1, 1, 1, None);
+        let ext1 = exporter.extend(&source).expect("event 1 fits");
+        assert_eq!((ext1.head, ext1.complete, exporter.n), (1, true, 1));
+        let digest1 = exporter.digest.clone();
+
+        world.replicate(2, 2, 2, None);
+        let err = exporter.extend(&source).expect_err("event 2 exceeds limit");
+        assert!(
+            !matches!(err, PrefixError::Corrupt { .. }),
+            "capacity refusal must never be Corrupt: {err:?}"
+        );
+        assert_eq!(
+            err,
+            PrefixError::Capacity {
+                at: 2,
+                measure: expected_measure,
+            }
+        );
+        assert_eq!(exporter.n, 1);
+        assert_eq!(exporter.bytes, b1);
+        assert_eq!(exporter.images(), i1);
+        assert_eq!(exporter.digest, digest1);
+    }
+
+    let (dir, world, source) = setup();
+    let mut exporter = Exporter::genesis_within(
+        DB,
+        &dir.path().join("boundary.export"),
+        Limits {
+            events: 2,
+            entities: i1_u64 + 1,
+            export_bytes: b2,
+        },
+    )
+    .expect("boundary exporter");
+    world.replicate(1, 2, 2, None);
+    let ext = exporter.extend(&source).expect("exact limit succeeds");
+    assert_eq!((ext.head, ext.complete, exporter.n), (2, true, 2));
+    assert_eq!(exporter.bytes, b2);
+    assert_eq!(exporter.images(), i1 + 1);
+}
+
+// Mutation: setting *held = None on the capacity arm or mapping it to prefix.corrupt fails this.
+#[tokio::test(flavor = "current_thread")]
+async fn a_domain_past_capacity_is_unavailable_as_capacity_and_resumes() {
+    let mut rig = Rig::within(Limits {
+        events: 1,
+        ..Limits::default()
+    });
+    let a = ulid(1);
+    let b = ulid(2);
+    rig.world.accept(vec![node(&a, "Concept", "A", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    let refreshed = reader.refresh(&Cancellation::default()).await.expect("g1");
+    assert_eq!(refreshed.graph_seq, 1);
+
+    rig.world.accept(vec![node(&b, "Concept", "B", json!({}))]);
+    rig.world.replicate(2, 2, 2, None);
+    assert_eq!(
+        reader.refresh(&Cancellation::default()).await.err(),
+        Some(QueryError::Unavailable("prefix.capacity"))
+    );
+
+    let q = "MATCH (n) RETURN n.title AS t LIMIT 1";
+    let stale = reader
+        .query(q, b"{}", Freshness::AllowStale, &Cancellation::default())
+        .await
+        .expect("g1 stale");
+    assert_eq!(
+        (
+            stale.graph_seq,
+            stale.completeness,
+            stale.rows[0]["t"].clone()
+        ),
+        (1, Completeness::Stale, json!("A"))
+    );
+
+    rig.source.reads.lock().expect("reads").clear();
+    assert_eq!(
+        reader.refresh(&Cancellation::default()).await.err(),
+        Some(QueryError::Unavailable("prefix.capacity"))
+    );
+    let reads = rig.source.reads.lock().expect("reads").clone();
+    assert!(
+        !reads.is_empty(),
+        "second refresh must read from the source"
+    );
+    assert!(
+        reads.iter().all(|&after| after >= 1),
+        "exporter must resume from n >= 1, never replay from 0: {reads:?}"
+    );
 }
