@@ -326,9 +326,15 @@ struct RequestHead {
     initial_body: Vec<u8>,
 }
 
-/// The store's loopback listener, with [`STORE_RECV_BUFFER`] and an Ethernet-sized
-/// segment set before `listen` so every accepted connection inherits them (loopback's
-/// 64 KiB segments would otherwise grow the client's send buffer to megabytes).
+/// The store's loopback listener, with [`STORE_RECV_BUFFER`] set before `listen` so every
+/// accepted connection inherits it and the client's in-flight bytes stay link-sized.
+///
+/// Linux grows a sender's buffer from its congestion window times the segment size, so
+/// loopback's 64 KiB segments would still grow the client's send buffer to megabytes; an
+/// Ethernet-sized segment, set here and inherited by accepted sockets, keeps it small.
+/// macOS refuses `TCP_MAXSEG` on an unconnected socket (EINVAL) and does not need it: it
+/// grows a send buffer only while the peer's advertised window is at least 4/5 of it, and
+/// the 64 KiB receive buffer caps that window below the default 128 KiB send space.
 fn bind_store_listener() -> TcpListener {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let socket =
@@ -336,7 +342,7 @@ fn bind_store_listener() -> TcpListener {
     socket
         .set_recv_buffer_size(STORE_RECV_BUFFER)
         .expect("store receive buffer");
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     socket.set_tcp_mss(1400).expect("store segment size");
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
     socket.bind(&SockAddr::from(addr)).expect("bind store");
