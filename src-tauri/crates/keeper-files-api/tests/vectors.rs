@@ -34,6 +34,48 @@ fn subset(expected: &Value, actual: &Value) -> bool {
     }
 }
 
+fn move_value_keys_failure(op: &Value) -> Option<String> {
+    if op.get("operation").and_then(Value::as_str) != Some("move") {
+        return None;
+    }
+    let (Some(before), Some(after)) = (
+        op.get("before_value").and_then(Value::as_object),
+        op.get("after_value").and_then(Value::as_object),
+    ) else {
+        return Some(format!(
+            "move op missing before_value/after_value object: {op}"
+        ));
+    };
+    let before_keys: BTreeSet<&str> = before.keys().map(String::as_str).collect();
+    let after_keys: BTreeSet<&str> = after.keys().map(String::as_str).collect();
+    if before_keys != after_keys {
+        return Some(format!(
+            "move op key sets differ: before={before_keys:?}, after={after_keys:?}"
+        ));
+    }
+    if before_keys == BTreeSet::from(["drive_key"]) {
+        return None;
+    }
+    let mut expected = BTreeSet::from(["parent_id", "name", "name_fold"]);
+    for opt in ["media_type", "drive_key"] {
+        if before.contains_key(opt) {
+            if before.get(opt) == after.get(opt) {
+                return Some(format!(
+                    "move op includes unchanged optional key '{opt}' (value={})",
+                    before[opt]
+                ));
+            }
+            expected.insert(opt);
+        }
+    }
+    if before_keys != expected {
+        return Some(format!(
+            "move op value keys mismatch: expected {expected:?}, got {before_keys:?}"
+        ));
+    }
+    None
+}
+
 fn assert_no_failures(section_name: &str, failures: &[String]) {
     assert!(
         failures.is_empty(),
@@ -680,6 +722,13 @@ fn cases() {
                                 "{case_id} step {step_idx}: event.op_count expected {exp_count}, got {}",
                                 accepted.event.op_count
                             ));
+                        }
+                    }
+
+                    for (op_idx, op) in accepted.ops.iter().enumerate() {
+                        let act_op = serde_json::to_value(op).expect("serialize Op");
+                        if let Some(msg) = move_value_keys_failure(&act_op) {
+                            failures.push(format!("{case_id} step {step_idx} op {op_idx}: {msg}"));
                         }
                     }
 

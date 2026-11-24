@@ -59,21 +59,26 @@ pub(crate) fn authorize(
         | Caller::Tool { grant, files, .. }
         | Caller::Job { grant, files, .. } => {
             let items = caller::parse_file_part(files)?;
-            let needed = if let Some(event_id) = reverses {
+            // A reversal lands by the `write` class's mode; `reverse_own` only gates
+            // whose events may be reversed (decision 3).
+            let reversal = if let Some(event_id) = reverses {
                 match m.events.get(event_id) {
                     Some((event, _)) if event.actor_id == caller.actor_id() => {}
                     _ => return Err(Refusal::new(Code::OutsideRoots)),
                 }
-                FileClass::ReverseOwn
+                true
             } else {
-                FileClass::Write
+                false
             };
 
             let mut change_mode: Option<GrantMode> = None;
             let mut check_location = |op_idx: usize, raw_id: &str| -> Result<(), Refusal> {
                 let resolved = resolve_location(ops, op_idx, raw_id)
                     .ok_or_else(|| Refusal::new(Code::OutsideRoots))?;
-                let mode = location_mode(m, &items, needed, resolved)?;
+                if reversal {
+                    location_mode(m, &items, FileClass::ReverseOwn, resolved)?;
+                }
+                let mode = location_mode(m, &items, FileClass::Write, resolved)?;
                 change_mode = Some(match change_mode {
                     Some(current) => stricter(current, mode),
                     None => mode,
