@@ -211,12 +211,69 @@ W8: the three fixed tools' `tools` array is 590 B and 124 tokens
 (`tiktoken-rs` 0.9.1, `o200k_base`). Each pinned candidate adds 222–243 B
 (46–52 tokens). Two runs give identical bytes and SHA-256.
 
+**delectra** (Linux 6.17.0-41-generic, x86_64, `rustc` 1.99.0, `tonic`
+0.14.9, `prost` 0.14.4, `rmcp` 3.10.0; spike `6e1b4f76` from base
+`df74c488`; run 2026-11-24 19:34–19:43 UTC, after the thresholds commit
+`c4dda2bf` of 17:18 UTC). Command, on the spike branch:
+`CLEAN=1 bash src-tauri/crates/spike-wire/scripts/run-linux-legs.sh <out>`.
+Load average 0.29 at the start of W1.
+
+W1: the schema-checked echo, 10 000 warm calls, p50 / p99 in µs, one connection:
+
+| Payload | gRPC, socket | NDJSON, socket | `tonic` over `duplex` | direct call |
+| --- | --- | --- | --- | --- |
+| 64 B | 172.9 / 336.9 | 37.0 / 80.1 | 107.5 / 190.0 | 0.1 / 0.1 |
+| 4 KiB | 179.9 / 303.8 | 42.3 / 94.2 | 123.7 / 210.5 | 0.2 / 0.2 |
+| 64 KiB | 277.8 / 539.2 | 144.8 / 257.6 | 244.9 / 432.4 | 1.1 / 2.4 |
+| 1 MiB | 3 341 / 5 957 | 2 241 / 4 184 | 3 350 / 5 266 | 22.2 / 60.3 |
+
+4 KiB at 64 concurrent calls: gRPC 2 453 / 4 491, NDJSON 265 / 736. 47 of
+48 cells ran; the 48th, gRPC at 64 B and 64 concurrent calls, broke with the
+same `BrokenPipe` as on hesperia and is recorded under `failures` in the
+run's `w1.json`. The break is therefore seen on both hosts, not only under
+hesperia's load.
+
+W4: `keeper-cli`, stripped release binary: 11 769 488 B without the wire;
+17 067 832 B with `tonic`/`prost`/`tower` and `jsonschema`; 19 720 952 B
+with `rmcp` as well (+7.58 MiB). Build times: base 89 s after
+`cargo clean`, then +gRPC 46 s and +`rmcp` 62 s incremental, and 6 s after
+touching `spike-wire`. delectra builds through `sccache`, so the "clean"
+build was sccache-warm, not cold. `cargo deny` is not installed there; the
+crates added to `Cargo.lock` are listed in the run's `added-crates.txt`
+without a licence check.
+
+W7 (a), `rmcp`'s client only: in `Discover` mode the server answered
+`2026-07-28`, in `Initialize` mode `2025-11-25`; both listed the three
+tools and called `search_operations`, `describe_operation` and
+`call_operation` through the socket, every line teed.
+
+W8: identical to hesperia: the three fixed tools' `tools` array is 590 B and
+124 tokens (`tiktoken-rs` 0.9.1, `o200k_base`); with one pinned candidate
+833 B / 176 (`graph.query`), 819 B / 172 (`notes.search`), 812 B / 170
+(`sessions.list`). Two runs give identical bytes and SHA-256.
+
+W12, `bwrap` 0.11.0 against the spike's socket at
+`~/.spike-123-1/wire/wire.sock`: with `--ro-bind / / --unshare-all` and the
+home visible, **connected**; with `--tmpfs $HOME` as well, **refused**
+(transport error). Not a gate (CR-9).
+
 | # | hesperia | delectra |
 | --- | --- | --- |
-| T1 | **met**: +42.2 µs p50, +85.7 µs p99 | pending |
-| T2 | **not met**: gRPC's added p50 is 3.01 × NDJSON's | pending |
-| T3 | **met**: +6.58 MiB | pending |
+| T1 | **met**: +42.2 µs p50, +85.7 µs p99 | **met**: +179.8 µs p50, +303.6 µs p99 |
+| T2 | **not met**: gRPC's added p50 is 3.01 × NDJSON's (42.2 / 14.0 µs) | **not met**: 4.27 × (179.8 / 42.1 µs) |
+| T3 | **met**: +6.58 MiB | **met**: +7.58 MiB |
 | T4 | not measured (app build owed) | — |
 
-The delectra figures and the rest of W7, W11 and W12 follow in 123.1's
-report.
+**Owed** (no figure is given for any of them):
+
+- W4: the app build and T4 (hesperia); `cargo deny check licenses bans
+  sources` over the added crates (both hosts).
+- W7 (a) in Claude Code, W7 (b) in Claude Code, Cursor and VS Code, and
+  Claude Code's `/context` figure for W8 (hesperia, after the owner signs
+  Claude Code in).
+- W11's Linux leg (delectra, behind the program's keeper-hq instance) and
+  W11 (a)–(d) on the Mac.
+- W12's Mac leg.
+- The second-user legs: W9's two refusals on delectra and a second
+  logged-in session on hesperia.
+- W2, W3, W5, W6, W9's uid/gid/pid and W10 were run on neither host.
