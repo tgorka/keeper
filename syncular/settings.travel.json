@@ -425,6 +425,12 @@
       "family": false,
       "key": "voice.stop_phrase",
       "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "wire.enabled",
+      "settable": "never"
     }
   ]
 }
