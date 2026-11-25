@@ -48,9 +48,15 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{Result, SyncError};
+use crate::error::{FolderError, Result};
 use crate::exclude::ExcludeSet;
-use crate::profile::{SyncProfile, CLOSE_WRITE_SETTLE_MS, SETTLE_CEILING_MS};
+
+/// Window after a Linux `IN_CLOSE_WRITE`: the writer demonstrably let go, so
+/// this only has to absorb mtime granularity.
+pub const CLOSE_WRITE_SETTLE_MS: u64 = 1_000;
+/// Hard ceiling. A continuously appended log must eventually sync; Syncthing
+/// caps its own `notifyTimeout` at the same 60 s.
+pub const SETTLE_CEILING_MS: u64 = 60_000;
 
 const NANOS_PER_MILLI: i128 = 1_000_000;
 
@@ -98,7 +104,7 @@ impl FileSample {
         match std::fs::symlink_metadata(path) {
             Ok(md) => Ok(Some(Self::from_metadata(&md))),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(SyncError::io("stat", path, err)),
+            Err(err) => Err(FolderError::io("stat", path, err)),
         }
     }
 
@@ -113,7 +119,7 @@ impl FileSample {
     }
 
     #[cfg(unix)]
-    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         const NANOS_PER_SEC: i128 = 1_000_000_000;
         Self {
@@ -125,7 +131,7 @@ impl FileSample {
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(md: &std::fs::Metadata) -> Self {
         // No portable `ctime` or inode exists, so both are pinned to zero and
         // the tuple degrades to `(size, mtime)`. That is strictly weaker — an
         // atomic-rename replacement carrying an identical size and mtime
@@ -174,7 +180,7 @@ pub fn is_dataless(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(md) => Ok(metadata_is_dataless(&md)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(SyncError::io("stat", path, err)),
+        Err(err) => Err(FolderError::io("stat", path, err)),
     }
 }
 
@@ -247,16 +253,6 @@ impl StabilityGate {
             entries: HashMap::new(),
             pending_close_write: HashSet::new(),
         }
-    }
-
-    /// Build the gate a profile implies: its root, its excludes, and its
-    /// effective window (which already accounts for removable media).
-    pub fn for_profile(profile: &SyncProfile) -> Result<Self> {
-        Ok(Self::new(
-            profile.local_path.clone(),
-            ExcludeSet::new(&profile.excludes)?,
-            profile.effective_settle_ms(),
-        ))
     }
 
     /// The window this gate applies when no close-write was seen.
@@ -925,7 +921,7 @@ fn verify_while_reading_hooked(
 }
 
 /// Tier 4 on the **staging read**: the file's bytes, proven to be one coherent
-/// version of the file, or [`SyncError::Integrity`] (Epic 70, AD-232).
+/// version of the file, or [`FolderError::Integrity`] (Epic 70, AD-232).
 ///
 /// `git::commit::stage_and_commit` used to read a non-LFS blob with a bare
 /// `std::fs::read`, so the module's whole safety argument — tier 2 may be
@@ -973,13 +969,13 @@ fn read_guarded(
     mut consume: impl FnMut(&[u8]),
     mut after_first_chunk: impl FnMut(),
 ) -> Result<()> {
-    let md = std::fs::symlink_metadata(path).map_err(|err| SyncError::io("stat", path, err))?;
+    let md = std::fs::symlink_metadata(path).map_err(|err| FolderError::io("stat", path, err))?;
 
     if metadata_is_dataless(&md) {
         // Defence in depth: `is_stable` already reports `Dataless`, but this is
         // the function that actually opens the file, so the guard has to live
         // here too. Opening it would start a silent multi-gigabyte download.
-        return Err(SyncError::InvalidPathForRemote {
+        return Err(FolderError::InvalidPathForRemote {
             path: path.to_path_buf(),
             reason: "dataless iCloud placeholder; opening it would materialize the file".into(),
         });
@@ -987,22 +983,22 @@ fn read_guarded(
     if !md.is_file() {
         // Not pedantry: opening a FIFO blocks until a writer appears, which
         // would hang the profile supervisor forever.
-        return Err(SyncError::io(
+        return Err(FolderError::io(
             "verify",
             path,
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
         ));
     }
 
-    let mut file = File::open(path).map_err(|err| SyncError::io("open", path, err))?;
+    let mut file = File::open(path).map_err(|err| FolderError::io("open", path, err))?;
     let before = FileSample::from_metadata(
         &file
             .metadata()
-            .map_err(|err| SyncError::io("fstat", path, err))?,
+            .map_err(|err| FolderError::io("fstat", path, err))?,
     );
     if let Some(approved) = approved {
         if *approved != before {
-            return Err(SyncError::Integrity {
+            return Err(FolderError::Integrity {
                 subject: path.display().to_string(),
                 expected: describe(approved),
                 actual: describe(&before),
@@ -1015,7 +1011,7 @@ fn read_guarded(
     loop {
         let read = file
             .read(&mut buf)
-            .map_err(|err| SyncError::io("read", path, err))?;
+            .map_err(|err| FolderError::io("read", path, err))?;
         if read == 0 {
             break;
         }
@@ -1029,10 +1025,10 @@ fn read_guarded(
     let after = FileSample::from_metadata(
         &file
             .metadata()
-            .map_err(|err| SyncError::io("fstat", path, err))?,
+            .map_err(|err| FolderError::io("fstat", path, err))?,
     );
     if before != after {
-        return Err(SyncError::Integrity {
+        return Err(FolderError::Integrity {
             subject: path.display().to_string(),
             expected: describe(&before),
             actual: describe(&after),
@@ -1649,7 +1645,7 @@ mod tests {
         .expect_err("a torn read must not produce a digest");
 
         assert!(
-            matches!(err, SyncError::Integrity { .. }),
+            matches!(err, FolderError::Integrity { .. }),
             "expected Integrity, got {err:?}"
         );
         assert_eq!(err.code(), "integrity");
@@ -1670,7 +1666,7 @@ mod tests {
         // A directory stands in for the whole class; the hazard the guard
         // actually exists for is a FIFO, whose `open` blocks forever.
         let err = verify_while_reading(dir.path()).expect_err("a directory is not verifiable");
-        assert!(matches!(err, SyncError::Io { .. }), "got {err:?}");
+        assert!(matches!(err, FolderError::Io { .. }), "got {err:?}");
     }
 
     #[test]
@@ -1678,7 +1674,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = verify_while_reading(&dir.path().join("nope.bin"))
             .expect_err("an absent file cannot be verified");
-        assert!(matches!(err, SyncError::Io { .. }), "got {err:?}");
+        assert!(matches!(err, FolderError::Io { .. }), "got {err:?}");
     }
 
     #[test]
@@ -1759,22 +1755,6 @@ mod tests {
         // would silently sync nothing.
         assert!(!is_dataless(&path).expect("probe succeeds"));
         assert!(!is_dataless(&dir.path().join("absent")).expect("absent is not an error"));
-    }
-
-    #[test]
-    fn a_gate_built_from_a_profile_inherits_its_window_and_excludes() {
-        let mut profile =
-            SyncProfile::new("01J", "docs", "/tmp/docs", "https://example.test/r.git");
-        profile.excludes = vec!["*.scratch".to_owned()];
-        profile.removable = true;
-        let mut g = StabilityGate::for_profile(&profile).expect("profile compiles");
-        // `removable` widens the default window; taking `settle_ms` raw would
-        // silently drop that.
-        assert_eq!(g.settle_ms(), profile.effective_settle_ms());
-        assert_eq!(
-            g.is_stable(Path::new("/tmp/docs/notes.scratch"), 0),
-            StabilityVerdict::Excluded
-        );
     }
 
     #[test]
@@ -2111,7 +2091,7 @@ mod tests {
             ..approved
         };
         let err = read_verified(&path, Some(&stale)).expect_err("a stale sample is refused");
-        assert!(matches!(err, SyncError::Integrity { .. }), "got {err:?}");
+        assert!(matches!(err, FolderError::Integrity { .. }), "got {err:?}");
 
         // Rewritten during the read.
         let big = dir.path().join("big.bin");
@@ -2124,7 +2104,7 @@ mod tests {
             appended.write_all(b"b").expect("append");
         })
         .expect_err("a torn read must not produce bytes");
-        assert!(matches!(err, SyncError::Integrity { .. }), "got {err:?}");
+        assert!(matches!(err, FolderError::Integrity { .. }), "got {err:?}");
     }
 
     /// A timestamp far in the future is a broken clock, and `verdict` skips the

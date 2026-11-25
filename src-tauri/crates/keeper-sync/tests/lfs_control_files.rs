@@ -20,6 +20,7 @@ use keeper_sync::git;
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::stage::{self, LfsPolicy};
 use keeper_sync::lfs::store::LfsStore;
+use keeper_sync::lfs::virtual_policy::CompileForProfile;
 use keeper_sync::lfs::virtual_policy::{VirtualPolicy, VIRTUAL_PATTERN_FILE};
 use keeper_sync::profile::SyncProfile;
 use keeper_sync::provenance::{Provenance, SyncSource};

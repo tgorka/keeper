@@ -43,7 +43,7 @@
 
 pub mod cli;
 pub mod commit;
-pub mod conflict;
+pub use keeper_folder::conflict;
 pub mod fetch;
 pub mod history;
 pub mod push_http;

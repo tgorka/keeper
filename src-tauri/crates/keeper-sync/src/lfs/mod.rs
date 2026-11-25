@@ -89,7 +89,7 @@ pub mod hydrate;
 pub mod listing;
 pub mod local;
 pub mod pktline;
-pub mod pointer;
+pub use keeper_folder::pointer;
 pub mod prune;
 pub mod ssh;
 pub mod stage;

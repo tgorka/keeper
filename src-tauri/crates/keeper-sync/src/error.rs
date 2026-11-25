@@ -16,22 +16,9 @@
 
 use std::path::PathBuf;
 
-/// Whether a failed unit of work is worth attempting again unchanged.
-///
-/// This is a *policy* answer, not a transport detail: the scheduler consults it
-/// to decide between re-queueing with backoff (Story 26.6) and parking the unit
-/// for a human. Keeping it on the error means the classification lives next to
-/// the thing being classified instead of in a match at every call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Retriability {
-    /// Try again after backoff — the world may change (network, quota, lock).
-    Transient,
-    /// Never retry unchanged; something must be reconfigured or fixed first.
-    Permanent,
-    /// Not an error the scheduler should retry: the work is *deliberately*
-    /// deferred until an external condition holds (a volume is re-attached).
-    Deferred,
-}
+/// Whether a failed unit of work is worth attempting again unchanged. Moved to
+/// `keeper-folder` with the machinery that raises it (story 119.1).
+pub use keeper_folder::Retriability;
 
 /// Errors raised by the sync engine.
 #[derive(Debug, thiserror::Error)]
@@ -481,6 +468,39 @@ impl SyncError {
             oid: oid.into(),
             path: None,
             made_by: None,
+        }
+    }
+}
+
+/// The folder machinery's errors are the four variants it raised before it
+/// moved out of this crate (story 119.1): each maps onto the identical variant,
+/// so its message, code and retry class are unchanged.
+impl From<keeper_folder::FolderError> for SyncError {
+    fn from(err: keeper_folder::FolderError) -> Self {
+        use keeper_folder::FolderError;
+        match err {
+            FolderError::InvalidPathForRemote { path, reason } => {
+                Self::InvalidPathForRemote { path, reason }
+            }
+            FolderError::Integrity {
+                subject,
+                expected,
+                actual,
+            } => Self::Integrity {
+                subject,
+                expected,
+                actual,
+            },
+            FolderError::Io {
+                operation,
+                path,
+                source,
+            } => Self::Io {
+                operation,
+                path,
+                source,
+            },
+            FolderError::Config(message) => Self::Config(message),
         }
     }
 }

@@ -35,7 +35,7 @@
 //!   copies, never a modal ([`git::conflict`]).
 //! * **An absent volume is never a deletion** ([`volume`]).
 
-pub mod anomaly;
+pub use keeper_folder::anomaly;
 pub mod backoff;
 pub mod bots_fs;
 pub mod browse;
@@ -45,8 +45,8 @@ pub mod credential;
 pub mod db;
 pub mod engine;
 pub mod error;
-pub mod exclude;
-pub mod export;
+pub use keeper_folder::exclude;
+pub use keeper_folder::export;
 pub mod file_serve;
 pub mod files_write;
 pub mod footprint;
@@ -65,8 +65,8 @@ pub mod provenance;
 pub mod sparse;
 pub mod stability;
 pub mod tasks;
-pub mod volume;
-pub mod watch;
+pub use keeper_folder::volume;
+pub use keeper_folder::watch;
 #[cfg(unix)]
 pub mod xdg;
 

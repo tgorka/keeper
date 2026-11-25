@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
     names = {"keeper-scratch": "implementation", "keeper-core": "legacy",
              "keeper-sync": "legacy", "keeper-port": "port",
              "keeper-provider": "provider", "keeper-testkit": "composition-root",
-             "keeper-paths": "path-leaf", "keeper-folders": "folder-leaf",
+             "keeper-paths": "path-leaf", "keeper-folder": "folder-leaf",
              "keeper-scratch-api": "contract", "keeper-app": "composition-root",
              "keeper-rt": "runtime", "keeper-tp": "transport", "keeper-ad": "adapter"}
     (root / "Cargo.toml").write_text(
@@ -99,8 +99,8 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("implementation normal core", "keeper-scratch", "keeper-core", "dependencies", False),
         ("implementation build provider", "keeper-scratch", "keeper-provider", "build-dependencies", False),
         ("path leaf port", "keeper-paths", "keeper-port", "dependencies", False),
-        ("folder leaf port", "keeper-folders", "keeper-port", "dependencies", False),
-        ("folder leaf sync", "keeper-folders", "keeper-sync", "dependencies", False),
+        ("folder leaf port", "keeper-folder", "keeper-port", "dependencies", False),
+        ("folder leaf sync", "keeper-folder", "keeper-sync", "dependencies", False),
         ("port provider", "keeper-port", "keeper-provider", "dependencies", False),
         ("legacy build provider", "keeper-core", "keeper-provider", "build-dependencies", False),
         ("optional provider", "keeper-port", "keeper-provider", "dependencies", True),
@@ -117,7 +117,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         ("provider adapter", "keeper-provider", "keeper-ad", "dependencies", False),
         ("contract runtime", "keeper-scratch-api", "keeper-rt", "dependencies", False),
         ("path leaf transport", "keeper-paths", "keeper-tp", "dependencies", False),
-        ("folder leaf adapter", "keeper-folders", "keeper-ad", "dependencies", False),
+        ("folder leaf adapter", "keeper-folder", "keeper-ad", "dependencies", False),
         ("legacy runtime", "keeper-core", "keeper-rt", "dependencies", False),
     ]
     for label, name, dependency, kind, feature in cases:
@@ -133,7 +133,7 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
     run("undeclared member reverted GREEN", "check-module-edges.py", env=env)
     for name, dependency, kind in [
         ("keeper-scratch", "keeper-testkit", "dev-dependencies"),
-        ("keeper-folders", "keeper-paths", "dependencies"),
+        ("keeper-folder", "keeper-paths", "dependencies"),
         ("keeper-app", "keeper-provider", "dependencies"),
         ("keeper-core", "keeper-provider", "dev-dependencies"),
         ("keeper-rt", "keeper-scratch-api", "dependencies"),
@@ -142,6 +142,15 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
         crate(name, dependency, kind)
         run(f"allowed {name} {kind} {dependency} GREEN", "check-module-edges.py", env=env)
         crate(name)
+    # DF/AD-2 through a port: an implementation reaching legacy transitively.
+    crate("keeper-port", "keeper-sync")
+    run("port legacy GREEN", "check-module-edges.py", env=env)
+    crate("keeper-scratch", "keeper-port")
+    run("implementation transitive legacy RED", "check-module-edges.py",
+        "keeper-scratch (implementation) reaches legacy keeper-sync", env)
+    crate("keeper-port")
+    run("implementation transitive legacy reverted GREEN", "check-module-edges.py", env=env)
+    crate("keeper-scratch")
     crate("keeper-scratch-api", "bridge")
     crate("bridge", "tokio")
     run("transitive contract tokio RED", "check-module-edges.py", "tokio", env)

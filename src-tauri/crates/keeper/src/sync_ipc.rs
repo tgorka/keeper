@@ -3696,7 +3696,8 @@ pub async fn sync_browse(
     let engine = engine_of(&state)?;
     let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
     let profile = find_profile(&profiles, &id)?.clone();
-    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+    let excludes =
+        ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&SyncError::from(e)))?;
 
     // Before the walk, so one answer covers every entry in the directory and a
     // thousand-row folder asks the engine once — and bounded, so a folder whose
@@ -5363,7 +5364,8 @@ pub async fn sync_delete_plan(
 ) -> Result<FilesDeletePlanVm, IpcError> {
     let profile = routable_profile(&state, &id)?;
     let (vault, scope) = vault_and_scope(&profile);
-    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+    let excludes =
+        ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&SyncError::from(e)))?;
     let engine = engine_of(&state)?;
     // Once for the whole selection, exactly as the listing asks once for a
     // whole directory.

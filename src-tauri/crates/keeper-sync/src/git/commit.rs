@@ -431,7 +431,7 @@ fn stage_and_commit_inner(
                 // checked against the sample the gate cleared the path on.
                 None => match read_verified(&absolute, changes.samples.get(rela)) {
                     Ok(bytes) => (mode, bytes),
-                    Err(SyncError::Integrity { .. }) if torn.is_some() => {
+                    Err(keeper_folder::FolderError::Integrity { .. }) if torn.is_some() => {
                         // Not this pass. The engine's next walk samples it
                         // again and commits it once it holds still.
                         tracing::info!(
@@ -446,7 +446,7 @@ fn stage_and_commit_inner(
                         files_done += 1;
                         continue;
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => return Err(err.into()),
                 },
             }
         } else {

@@ -1,0 +1,41 @@
+[package]
+name = "keeper-folder"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+description = "keeper's folder machinery: watcher, completeness gate, excludes, volume marker, release rules"
+
+# DF/AD-13's leaf rule (story 119.1, decision 3): `keeper-paths` is this
+# crate's one first-party dependency. `keeper-sync`, `keeper-files` and
+# `keeper-agent` depend on it; it depends on none of them. `bun run
+# check:module-edges` holds the rule (role `folder-leaf`).
+[dependencies]
+keeper-paths = { path = "../keeper-paths" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+globset = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+
+# `files_write::finder_trash` sends an out-of-vault delete to the OS trash
+# through `NSFileManager trashItemAtURL:resultingItemURL:error:`, a SAFE objc2
+# binding (Story 46.14, AD-102, NFR-30). Moved here with the effect from
+# `keeper-sync` (119.1); no new crate or version.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

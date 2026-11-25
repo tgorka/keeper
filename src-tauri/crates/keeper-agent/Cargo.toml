@@ -14,6 +14,7 @@ workspace = true
 # `bun run check:agent-tauri-free` asserts it over `cargo tree`.
 [dependencies]
 keeper-paths = { path = "../keeper-paths" }
+keeper-folder = { path = "../keeper-folder" }
 keeper-core = { path = "../keeper-core" }
 keeper-sync = { path = "../keeper-sync" }
 tracing = { workspace = true }

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SyncError};
+use crate::error::{FolderError, Result};
 
 /// Directory holding the marker at a volume's mount root.
 pub const MARKER_DIR: &str = ".keeper-sync";
@@ -143,10 +143,10 @@ impl VolumeMarker {
         let raw = match std::fs::read(&path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(SyncError::io("read volume marker", &path, err)),
+            Err(err) => return Err(FolderError::io("read volume marker", &path, err)),
         };
         let marker: Self = serde_json::from_slice(&raw).map_err(|err| {
-            SyncError::Config(format!(
+            FolderError::Config(format!(
                 "volume marker {} is corrupt ({err}); \
                  inspect it and delete it to let keeper re-adopt this volume",
                 path.display()
@@ -174,7 +174,7 @@ impl VolumeMarker {
         // here too rather than being quietly replaced.
         if let Some(existing) = Self::read(mount_root)? {
             if existing.schema_version > MARKER_VERSION {
-                return Err(SyncError::Config(format!(
+                return Err(FolderError::Config(format!(
                     "volume marker {} has schema version {} but this build understands {}; \
                      refusing to rewrite it — upgrade keeper instead",
                     marker_path(mount_root).display(),
@@ -186,30 +186,30 @@ impl VolumeMarker {
 
         let dir = mount_root.join(MARKER_DIR);
         std::fs::create_dir_all(&dir)
-            .map_err(|err| SyncError::io("create volume marker directory", &dir, err))?;
+            .map_err(|err| FolderError::io("create volume marker directory", &dir, err))?;
 
         let json = serde_json::to_vec_pretty(marker).map_err(|err| {
-            SyncError::Config(format!("volume marker is not serializable: {err}"))
+            FolderError::Config(format!("volume marker is not serializable: {err}"))
         })?;
 
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)
-            .map_err(|err| SyncError::io("create volume marker temp file", &dir, err))?;
+            .map_err(|err| FolderError::io("create volume marker temp file", &dir, err))?;
         tmp.write_all(&json)
-            .map_err(|err| SyncError::io("write volume marker temp file", &dir, err))?;
+            .map_err(|err| FolderError::io("write volume marker temp file", &dir, err))?;
         // A removable volume is by definition the device most likely to be
         // yanked between the write and the rename; get the bytes down before
         // publishing them.
         tmp.as_file()
             .sync_all()
-            .map_err(|err| SyncError::io("flush volume marker temp file", &dir, err))?;
+            .map_err(|err| FolderError::io("flush volume marker temp file", &dir, err))?;
         relax_marker_permissions(tmp.as_file())
-            .map_err(|err| SyncError::io("set volume marker permissions", &dir, err))?;
+            .map_err(|err| FolderError::io("set volume marker permissions", &dir, err))?;
 
         let path = marker_path(mount_root);
         // `NamedTempFile` deletes the staged file when the `PersistError` it
         // hands back is dropped, so a failed rename litters nothing.
         tmp.persist(&path)
-            .map_err(|err| SyncError::io("publish volume marker", &path, err.error))?;
+            .map_err(|err| FolderError::io("publish volume marker", &path, err.error))?;
         Ok(())
     }
 

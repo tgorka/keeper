@@ -1612,71 +1612,9 @@ pub fn materialized_paths(
     Ok(out)
 }
 
-/// One row of the `materialized` ledger, late columns included (Stories 56.2,
-/// 56.5 and 56.17).
-///
-/// A struct rather than a tuple because six of the nine fields are
-/// `Option`s of two types and five of them are timestamps: a transposition
-/// between `last_used_ms` and `synced_at_ms` would compile, pass every type
-/// check, and make a release decision on the wrong fact.
-///
-/// **Every late timestamp is an `Option` and that is a fact, not a
-/// placeholder.** A row written before Story 56.2 — or by
-/// [`remember_materialized`], which sets `at_ms` and nothing else — reads back
-/// `None` for all of them, and `None` means "nobody recorded this" rather than
-/// zero, epoch, or absent-from-the-remote. Story 56.5's writers
-/// ([`note_use`], [`note_arrival`], [`note_local_authorship`], [`note_synced`],
-/// [`set_pinned`]) fill them in, each one fact at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaterializedRow {
-    /// Repository-relative, `/`-joined — the same frame every other path in
-    /// this database is in.
-    pub path: String,
-    /// When content for this path last landed here. The one column with a
-    /// writer.
-    pub at_ms: i64,
-    /// When the content was last read through keeper.
-    pub last_used_ms: Option<i64>,
-    /// When the remote last confirmed it holds the object.
-    pub synced_at_ms: Option<i64>,
-    /// The object this path's content is, when the row recorded one.
-    pub oid: Option<String>,
-    /// How large that object is, when the row recorded it. Narrowed from
-    /// SQLite's signed integer the same way `list_activity` narrows a size: a
-    /// negative byte count is not a byte count, and it means exactly what
-    /// `NULL` means.
-    pub size_bytes: Option<u64>,
-    /// Whether the owner has asked for this path to stay on this machine.
-    /// `false` for every row that has never said otherwise, including every
-    /// row written before the column existed — an unpinned path is the
-    /// default, so absence and `0` are the same answer and an `Option` here
-    /// would be a distinction nobody can act on.
-    pub pinned: bool,
-    /// Which way the content at this path travelled (Story 56.5, AD-131).
-    /// `true` means this clone created or modified it; `false` means it
-    /// arrived from the remote. `false` for every row that has never said
-    /// otherwise, including every row written before the column existed —
-    /// which is honest rather than a default, because the only writers this
-    /// table had before Story 56.5 were arrival paths. It selects which
-    /// release clock applies: `synced_at_ms` for local content, so content
-    /// this machine authored and has not yet pushed is never eligible, and
-    /// `last_used_ms` for content that came from the remote.
-    pub local_origin: bool,
-    /// The absolute epoch-ms instant the owner asked for this one path's
-    /// content to be let go again (Story 56.17), or `None` for a path on the
-    /// folder's own `releaseTtlMs` window — which is every path nobody has
-    /// named a time for, and every row written before the column existed.
-    ///
-    /// [`crate::engine::release_due_at`] reads it **instead of** the folder's
-    /// window, in both directions: an hour chosen inside a day-long window
-    /// goes sooner, and two days chosen inside it stay longer. It does not
-    /// outrank [`Self::pinned`], and it does not reach past FR-341 — a path
-    /// this clone authored that nothing has confirmed the remote holds is
-    /// still on no clock at any age, because a chosen duration must not become
-    /// a way around the barrier that stops keeper deleting bytes which exist
-    /// on one machine.
-    pub release_at_ms: Option<i64>,
-}
+/// One row of the `materialized` ledger: its columns moved to `keeper-folder`
+/// with the release rules that read them (story 119.1).
+pub use keeper_folder::release::MaterializedRow;
 
 /// Every `materialized` row whose content this profile **still holds**, whole.
 ///

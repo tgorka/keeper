@@ -31,7 +31,7 @@ use std::path::{Component, Path};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
-use crate::error::{Result, SyncError};
+use crate::error::{FolderError, Result};
 
 /// The always-on exclusion corpus.
 ///
@@ -256,7 +256,7 @@ pub enum ExcludeVerdict {
 impl ExcludeSet {
     /// Compile the built-in corpus plus `extra` per-profile patterns.
     ///
-    /// A malformed user pattern is [`SyncError::Config`], never a panic: these
+    /// A malformed user pattern is [`FolderError::Config`], never a panic: these
     /// strings arrive from a hand-edited `config.json` and from
     /// `keeper-syncd`'s TOML, so they are untrusted input on the ordinary
     /// startup path.
@@ -293,7 +293,7 @@ impl ExcludeSet {
         }
         let build = |builder: GlobSetBuilder| {
             builder.build().map_err(|err| {
-                SyncError::Config(format!("could not compile the exclude pattern set: {err}"))
+                FolderError::Config(format!("could not compile the exclude pattern set: {err}"))
             })
         };
         Ok(Self {
@@ -403,7 +403,7 @@ pub struct PatternSet {
 
 impl PatternSet {
     /// Compile `patterns` as exclude patterns. A malformed pattern is
-    /// [`SyncError::Config`] naming the string the user typed, never a panic —
+    /// [`FolderError::Config`] naming the string the user typed, never a panic —
     /// these arrive from a hand-edited `config.json` like every other profile
     /// field.
     pub fn new(patterns: &[String]) -> Result<Self> {
@@ -452,14 +452,14 @@ impl PatternSet {
             add_glob(&mut builder, source, effective, original)?;
         }
         let set = builder.build().map_err(|err| {
-            SyncError::Config(format!("could not compile the pattern set: {err}"))
+            FolderError::Config(format!("could not compile the pattern set: {err}"))
         })?;
         Ok(Self { set })
     }
 
     fn finish(source: &str, builder: GlobSetBuilder) -> Result<Self> {
         let set = builder.build().map_err(|err| {
-            SyncError::Config(format!("could not compile the {source} pattern set: {err}"))
+            FolderError::Config(format!("could not compile the {source} pattern set: {err}"))
         })?;
         Ok(Self { set })
     }
@@ -492,7 +492,7 @@ const EXCLUDE_PATTERN_SOURCE: &str = "exclude";
 /// caller that must resolve gitignore's *other* anchoring spellings — a leading
 /// `/`, a trailing `/` — has to reach the same rule without going back through
 /// [`add_pattern`], which would re-anchor a string that is already anchored.
-pub(crate) fn anchor(pattern: &str) -> Cow<'_, str> {
+pub fn anchor(pattern: &str) -> Cow<'_, str> {
     if pattern.contains('/') {
         Cow::Borrowed(pattern)
     } else {
@@ -538,7 +538,7 @@ fn add_glob(
         .literal_separator(true)
         .build()
         .map_err(|err| {
-            SyncError::Config(format!("invalid {source} pattern {original:?}: {err}"))
+            FolderError::Config(format!("invalid {source} pattern {original:?}: {err}"))
         })?;
     builder.add(glob);
     Ok(())
@@ -958,7 +958,7 @@ mod tests {
         let err = ExcludeSet::new(&["[oops".to_owned()])
             .expect_err("an unclosed character class must not compile");
         assert!(
-            matches!(err, SyncError::Config(_)),
+            matches!(err, FolderError::Config(_)),
             "expected Config, got {err:?}"
         );
         assert_eq!(err.code(), "config");
@@ -970,17 +970,17 @@ mod tests {
         // `*`), so the cases that genuinely fail are the unbalanced ones.
         let err = ExcludeSet::new(&["{a,b".to_owned()])
             .expect_err("unclosed alternates must not compile");
-        assert!(matches!(err, SyncError::Config(_)), "got {err:?}");
+        assert!(matches!(err, FolderError::Config(_)), "got {err:?}");
 
         let err = ExcludeSet::new(&["[z-a]".to_owned()])
             .expect_err("a reversed character range must not compile");
-        assert!(matches!(err, SyncError::Config(_)), "got {err:?}");
+        assert!(matches!(err, FolderError::Config(_)), "got {err:?}");
 
         // ...and a valid pattern alongside an invalid one still fails: the
         // whole set is rejected rather than silently applying a subset.
         let err = ExcludeSet::new(&["*.bak".to_owned(), "[oops".to_owned()])
             .expect_err("one bad pattern rejects the whole set");
-        assert!(matches!(err, SyncError::Config(_)), "got {err:?}");
+        assert!(matches!(err, FolderError::Config(_)), "got {err:?}");
     }
 
     #[test]
