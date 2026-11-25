@@ -13,6 +13,7 @@
       "!src-tauri/target",
       "!src-tauri/gen",
       "!src-tauri/crates/*/gen",
+      "!src-tauri/crates/keeper-wire-api/schema/keeper.wire.v1.json",
       "!src/lib/ipc/gen",
       "!syncular/syncular.generated.ts",
       "!syncular/syncular.queries.ts",

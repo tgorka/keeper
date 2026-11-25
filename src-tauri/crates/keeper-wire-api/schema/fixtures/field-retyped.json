@@ -12,10 +12,7 @@
             "description": "Milliseconds; absent or `0` is the kind's ceiling.",
             "format": "uint64",
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": ["integer", "null"]
           },
           "detail": {
             "anyOf": [
@@ -46,10 +43,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "call_id",
-          "operation"
-        ],
+        "required": ["call_id", "operation"],
         "type": "object"
       },
       "Cancel": {
@@ -59,19 +53,14 @@
             "type": "string"
           }
         },
-        "required": [
-          "call_id"
-        ],
+        "required": ["call_id"],
         "type": "object"
       },
       "ClientHello": {
         "description": "The client's first line: the versions it speaks, in its order of\npreference, and its name (for the log; it decides nothing).",
         "properties": {
           "client": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "wire": {
             "items": {
@@ -80,9 +69,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "wire"
-        ],
+        "required": ["wire"],
         "type": "object"
       },
       "Describe": {
@@ -94,10 +81,7 @@
           "deadline_ms": {
             "format": "uint64",
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": ["integer", "null"]
           },
           "detail": {
             "anyOf": [
@@ -121,52 +105,32 @@
           },
           "operation": {
             "description": "One operation, by id.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "page_size": {
             "format": "uint32",
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": ["integer", "null"]
           },
           "page_token": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "query": {
             "description": "Words an operation's id or summary must contain.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           }
         },
-        "required": [
-          "call_id"
-        ],
+        "required": ["call_id"],
         "type": "object"
       },
       "Detail": {
         "description": "How much of an answer: absent reads as `full`.",
-        "enum": [
-          "full",
-          "concise"
-        ],
+        "enum": ["full", "concise"],
         "type": "string"
       },
       "Door": {
         "description": "The door a wire caller comes through. Absent reads as `cli`; a value the\nenvelope does not know is refused, never read as `cli`.",
-        "enum": [
-          "cli",
-          "mcp"
-        ],
+        "enum": ["cli", "mcp"],
         "type": "string"
       },
       "Watch": {
@@ -202,10 +166,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "call_id",
-          "operation"
-        ],
+        "required": ["call_id", "operation"],
         "type": "object"
       }
     },
@@ -220,9 +181,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -233,9 +192,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -246,9 +203,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -259,9 +214,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -272,9 +225,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       }
     ],
@@ -305,18 +256,10 @@
           },
           "write_as": {
             "description": "`proposal`, `change` or `refused`, for a write.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           }
         },
-        "required": [
-          "id",
-          "kind",
-          "effect",
-          "summary"
-        ],
+        "required": ["id", "kind", "effect", "summary"],
         "type": "object"
       }
     },
@@ -333,10 +276,7 @@
         "type": "string"
       },
       "next_page_token": {
-        "type": [
-          "string",
-          "null"
-        ]
+        "type": ["string", "null"]
       },
       "operations": {
         "items": {
@@ -345,12 +285,7 @@
         "type": "array"
       }
     },
-    "required": [
-      "envelope",
-      "app_version",
-      "catalogue_digest",
-      "operations"
-    ],
+    "required": ["envelope", "app_version", "catalogue_digest", "operations"],
     "title": "DescribeOutput",
     "type": "object"
   },
@@ -369,10 +304,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "error",
-          "wire"
-        ],
+        "required": ["error", "wire"],
         "type": "object"
       },
       "Code": {
@@ -407,9 +339,7 @@
             ]
           }
         },
-        "required": [
-          "call_id"
-        ],
+        "required": ["call_id"],
         "type": "object"
       },
       "Event": {
@@ -425,11 +355,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "call_id",
-          "seq",
-          "output"
-        ],
+        "required": ["call_id", "seq", "output"],
         "type": "object"
       },
       "Reply": {
@@ -450,9 +376,7 @@
           },
           "output": true
         },
-        "required": [
-          "call_id"
-        ],
+        "required": ["call_id"],
         "type": "object"
       },
       "ServerHello": {
@@ -476,13 +400,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "wire",
-          "app_version",
-          "catalogue_digest",
-          "max_line_bytes",
-          "max_in_flight"
-        ],
+        "required": ["wire", "app_version", "catalogue_digest", "max_line_bytes", "max_in_flight"],
         "type": "object"
       },
       "WireError": {
@@ -492,29 +410,19 @@
             "$ref": "#/$defs/Code"
           },
           "field": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "message": {
             "type": "string"
           },
           "request_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "retryable": {
             "type": "boolean"
           }
         },
-        "required": [
-          "code",
-          "message",
-          "retryable"
-        ],
+        "required": ["code", "message", "retryable"],
         "type": "object"
       }
     },
@@ -529,9 +437,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -542,9 +448,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -555,9 +459,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -568,9 +470,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       },
       {
@@ -581,9 +481,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "type"
-        ],
+        "required": ["type"],
         "type": "object"
       }
     ],

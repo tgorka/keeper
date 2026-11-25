@@ -410,14 +410,14 @@ fn a_kill_at_any_instant_costs_no_data_and_corrupts_no_index() {
     let delays = [0, 15, 30, 45, 60, 80, 110, 150, 200, 300, 450, 700];
     let mut reached = std::collections::BTreeSet::new();
 
-    for ms in delays {
+    let kill_and_recover = |ms: u64| -> Interrupted {
         let peer = Peer::new(&format!("sweep{ms}"), 40, 0);
         let expected: Vec<(String, Vec<u8>)> = (0..40)
             .map(|i| (format!("file-{i:04}.txt"), payload(i)))
             .collect();
 
         let at = Duration::from_millis(ms);
-        reached.insert(peer.kill_sync_after(at));
+        let interrupted = peer.kill_sync_after(at);
         peer.assert_intact(&expected, at);
 
         // Recovery is the other half of the contract: "did not corrupt" is
@@ -432,6 +432,23 @@ fn a_kill_at_any_instant_costs_no_data_and_corrupts_no_index() {
             published.len(),
             if trouble.is_empty() { "none" } else { &trouble }
         );
+        interrupted
+    };
+
+    for ms in delays {
+        reached.insert(kill_and_recover(ms));
+    }
+
+    // On a starved machine (CI's runner at the end of a full workspace run)
+    // a sync pass can take longer than the whole fixed sweep, so every kill
+    // lands before staging. Keep doubling the delay until a kill lands past
+    // it: a kill after the pass has finished observes `AfterPush`, so this
+    // ends as soon as the machine lets a pass get anywhere, and each extra
+    // kill checks the same invariants.
+    let mut ms = 1_000;
+    while reached.len() < 2 && ms <= 32_000 {
+        reached.insert(kill_and_recover(ms));
+        ms *= 2;
     }
 
     // The sweep is only evidence if it actually landed in the states it claims
