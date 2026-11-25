@@ -5184,6 +5184,7 @@ dependencies = [
  "keeper-files-api",
  "keeper-ports",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "socket2",

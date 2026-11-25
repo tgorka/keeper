@@ -15,6 +15,7 @@ keeper-ports = { path = "../keeper-ports" }
 keeper-files-api = { path = "../keeper-files-api" }
 keeper-accounts-api = { path = "../keeper-accounts-api" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 rusqlite = { workspace = true }
 # Content addresses of the fake's blob bodies (`sha256:<hex>`).

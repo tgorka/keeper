@@ -7,15 +7,13 @@
 //! through an ordinary put (116.3's rule): nothing a person put is lost.
 
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use keeper_files_api::refusal::Code;
-use keeper_files_api::rows::{Kind, Lifecycle};
+use keeper_files_api::rows::{Kind, Lifecycle, Outcome};
 use keeper_ports::transfer::Progress;
-use keeper_ports::ReplicaError;
-use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 
+use crate::command::{refusal, unreachable, Delivered, ReceiptRow};
 use crate::queue::{Pending, PendingOp};
 use crate::{Files, FilesError, Target};
 
@@ -81,26 +79,6 @@ pub struct PutReport {
     pub parts_skipped: u32,
 }
 
-/// Whether `error` means the server or the store was not reached, so the
-/// put waits rather than fails.
-fn unreachable(error: &ReplicaError) -> bool {
-    matches!(
-        error,
-        ReplicaError::Unheard { .. }
-            | ReplicaError::NotSyncing
-            | ReplicaError::Closed
-            | ReplicaError::Remote {
-                retryable: true,
-                ..
-            }
-    )
-}
-
-/// A refusal code of the files contract, read from its wire word.
-fn code_of(word: &str) -> Option<Code> {
-    Code::deserialize(Value::String(word.to_owned())).ok()
-}
-
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -109,22 +87,15 @@ fn now_ms() -> i64 {
         })
 }
 
-fn mtime_ms(file: &Path) -> Option<i64> {
+pub(crate) fn mtime_ms(file: &Path) -> Option<i64> {
     let modified = std::fs::metadata(file).ok()?.modified().ok()?;
     let since = modified.duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(since.as_millis()).ok()
 }
 
-/// A receipt's terminal answer.
-enum Receipt {
-    Accepted,
-    Conflict,
-    Rejected(String, Option<Value>),
-}
-
 /// How a send ended.
 enum Sent {
-    Answer(Receipt),
+    Answer(ReceiptRow),
     Unreached,
     Unseen,
 }
@@ -218,7 +189,7 @@ impl Files {
     }
 
     /// The drive and operation a put to `target` plans, from the replica.
-    fn plan(&self, target: &Target) -> Result<(String, PendingOp), FilesError> {
+    pub(crate) fn plan(&self, target: &Target) -> Result<(String, PendingOp), FilesError> {
         match target {
             Target::Entry(_) => {
                 let entry = self.resolve(target)?;
@@ -333,35 +304,37 @@ impl Files {
                     report.outcome = PutOutcome::Sent;
                     return Ok(report);
                 }
-                Sent::Answer(Receipt::Accepted) => {
-                    self.queue.settle(&pending.request_id, None)?;
-                    report.request_id.clone_from(&pending.request_id);
-                    report.entry_id = pending.entry_id().to_owned();
-                    report.outcome = match &pending.conflict_of {
-                        Some(of) => PutOutcome::ConflictCopy {
-                            of: of.clone(),
-                            entry_id: pending.entry_id().to_owned(),
-                            name: pending.place().1.to_owned(),
-                        },
-                        None => PutOutcome::Accepted,
-                    };
-                    return Ok(report);
-                }
-                Sent::Answer(Receipt::Rejected(reason, detail)) => {
-                    self.queue.settle(&pending.request_id, None)?;
-                    return Err(match code_of(&reason) {
-                        Some(code) => FilesError::Refused { code, detail },
-                        None => FilesError::Replica(ReplicaError::Rejected {
-                            code: reason,
-                            message: detail.map(|d| d.to_string()).unwrap_or_default(),
-                        }),
-                    });
-                }
-                Sent::Answer(Receipt::Conflict) => {
-                    let copy = self.conflict_copy(&pending)?;
-                    self.queue.settle(&pending.request_id, Some(copy.clone()))?;
-                    pending = copy;
-                }
+                Sent::Answer(receipt) => match receipt.outcome {
+                    Outcome::Accepted => {
+                        self.queue.settle(&pending.request_id, None)?;
+                        report.request_id.clone_from(&pending.request_id);
+                        report.entry_id = pending.entry_id().to_owned();
+                        report.outcome = match &pending.conflict_of {
+                            Some(of) => PutOutcome::ConflictCopy {
+                                of: of.clone(),
+                                entry_id: pending.entry_id().to_owned(),
+                                name: pending.place().1.to_owned(),
+                            },
+                            None => PutOutcome::Accepted,
+                        };
+                        return Ok(report);
+                    }
+                    Outcome::Rejected => {
+                        self.queue.settle(&pending.request_id, None)?;
+                        return Err(refusal(receipt.reason.as_deref(), receipt.detail));
+                    }
+                    Outcome::Conflict => {
+                        let copy = self.conflict_copy(&pending)?;
+                        self.queue.settle(&pending.request_id, Some(copy.clone()))?;
+                        pending = copy;
+                    }
+                    Outcome::Proposed => {
+                        return Err(FilesError::Row(format!(
+                            "receipt outcome {:?}",
+                            receipt.outcome
+                        )));
+                    }
+                },
             }
         }
         Err(FilesError::Storage(format!(
@@ -449,81 +422,19 @@ impl Files {
         if let (Some(mtime), Some(fields)) = (pending.mtime_ms, operation.as_object_mut()) {
             fields.insert("mtime_ms".to_owned(), json!(mtime));
         }
-        let params = json!({
-            "version": 1,
-            "request_id": pending.request_id,
-            "context_id": null,
-            "payload": {"operation": operation},
-        });
-        match self
-            .source
-            .replica
-            .remote_command("files.put", &pending.request_id, params)
-        {
-            Ok(_) => {}
-            Err(error) if unreachable(&error) => return Ok(Sent::Unreached),
-            Err(
-                ReplicaError::Rejected { code, message }
-                | ReplicaError::Remote {
-                    code,
-                    message,
-                    retryable: false,
-                },
-            ) if code_of(&code).is_some() => {
-                return Ok(Sent::Answer(if code == "conflict" {
-                    Receipt::Conflict
-                } else {
-                    Receipt::Rejected(code, Some(Value::String(message)))
-                }));
-            }
-            Err(error) => return Err(error.into()),
+        match self.deliver(
+            "files.put",
+            &pending.request_id,
+            json!({"operation": operation}),
+        )? {
+            Delivered::Unreached => Ok(Sent::Unreached),
+            Delivered::Unseen => Ok(Sent::Unseen),
+            Delivered::Receipt(row) => Ok(Sent::Answer(row)),
         }
-        let started = Instant::now();
-        loop {
-            if let Some(receipt) = self.receipt(&pending.request_id)? {
-                return Ok(Sent::Answer(receipt));
-            }
-            if started.elapsed() >= self.receipt_wait {
-                return Ok(Sent::Unseen);
-            }
-            self.source.replica.sync_now();
-            std::thread::sleep(Duration::from_millis(50).min(self.receipt_wait));
-        }
-    }
-
-    /// The receipt of this device's `files.put` `request_id`, once the
-    /// replica holds it.
-    fn receipt(&self, request_id: &str) -> Result<Option<Receipt>, FilesError> {
-        let id = format!("files.put/{request_id}/{}", self.client_scope());
-        let rows = self
-            .source
-            .replica
-            .query("SELECT * FROM files_receipts WHERE id = ?", &[json!(id)])?;
-        rows.first().map(receipt_of).transpose()
     }
 }
 
-fn receipt_of(row: &Map<String, Value>) -> Result<Receipt, FilesError> {
-    let detail = match row.get("detail") {
-        Some(Value::String(text)) => serde_json::from_str(text).ok(),
-        Some(Value::Null) | None => None,
-        Some(value) => Some(value.clone()),
-    };
-    match row.get("outcome").and_then(Value::as_str) {
-        Some("accepted") => Ok(Receipt::Accepted),
-        Some("conflict") => Ok(Receipt::Conflict),
-        Some("rejected") => Ok(Receipt::Rejected(
-            row.get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("rejected")
-                .to_owned(),
-            detail,
-        )),
-        other => Err(FilesError::Row(format!("receipt outcome {other:?}"))),
-    }
-}
-
-fn place(op: &PendingOp) -> (&str, &str) {
+pub(crate) fn place(op: &PendingOp) -> (&str, &str) {
     match op {
         PendingOp::Create {
             parent_id, name, ..
