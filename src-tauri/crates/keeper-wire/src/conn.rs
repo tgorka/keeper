@@ -272,6 +272,39 @@ impl Conn {
         Some(entry)
     }
 
+    /// Decide `call_id`'s terminal frame from its entry, in the one step that
+    /// frees its id: the frame is built under the lock that decides it, so a
+    /// start gate cannot open between reading `started` and answering (H11).
+    /// `generation`: `None` decides whatever call is in flight under the id.
+    fn decide_with(
+        &self,
+        call_id: &str,
+        generation: Option<u64>,
+        frame: impl FnOnce(&Entry) -> ServerFrame,
+    ) -> Option<Entry> {
+        let mut state = self.lock();
+        let entry = state.in_flight.get(call_id)?;
+        if generation.is_some_and(|g| entry.generation != g) {
+            return None;
+        }
+        let frame = frame(entry);
+        let bytes = self.bytes_of(&frame);
+        let mut entry = state.in_flight.remove(call_id)?;
+        if !state.closed {
+            let out = Out {
+                bytes,
+                queued_at: Instant::now(),
+                event_of: None,
+                _place: entry.place.take(),
+                waiting: None,
+                unadmitted: false,
+                last: false,
+            };
+            self.push(&mut state, out);
+        }
+        Some(entry)
+    }
+
     /// Queue one stream event, or end the stream `RESOURCE_EXHAUSTED` when it
     /// finds no room. `false`: the stream is over, drop its handler.
     fn event(&self, call_id: &str, generation: u64, output: Value) -> bool {
@@ -848,15 +881,9 @@ impl Reader {
         let id = call_id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(deadline).await;
-            let started = {
-                let state = conn.lock();
-                match state.in_flight.get(&id) {
-                    Some(entry) if entry.generation == generation => entry.started,
-                    _ => return,
-                }
-            };
-            let error = deadline_error(&id, started);
-            conn.decide(&id, generation, &reply_frame(&id, Err(error)));
+            conn.decide_with(&id, Some(generation), |entry| {
+                reply_frame(&id, Err(deadline_error(&id, entry.started)))
+            });
         });
         let conn = Arc::clone(&self.conn);
         let id = call_id.clone();
@@ -936,27 +963,23 @@ impl Reader {
     /// and its caller is answered with its `request_id`; a command not yet
     /// started never starts. An id not in flight is ignored.
     fn cancel(&self, call_id: &str) {
-        let (generation, kind, started) = {
-            let state = self.conn.lock();
-            let Some(entry) = state.in_flight.get(call_id) else {
-                return;
-            };
-            (entry.generation, entry.kind, entry.started)
-        };
-        let mut error = WireError::fixed(
-            Code::Cancelled,
-            if started { "started" } else { "not_started" },
-        );
-        if kind == Kind::Command && started {
-            error = error.with_request_id(call_id);
-        }
-        let Some(entry) = self
-            .conn
-            .decide(call_id, generation, &terminal(kind, call_id, error))
-        else {
+        let Some(entry) = self.conn.decide_with(call_id, None, |entry| {
+            let mut error = WireError::fixed(
+                Code::Cancelled,
+                if entry.started {
+                    "started"
+                } else {
+                    "not_started"
+                },
+            );
+            if entry.kind == Kind::Command && entry.started {
+                error = error.with_request_id(call_id);
+            }
+            terminal(entry.kind, call_id, error)
+        }) else {
             return;
         };
-        if !(kind == Kind::Command && entry.started) {
+        if !(entry.kind == Kind::Command && entry.started) {
             if let Some(task) = entry.task {
                 task.abort();
             }
