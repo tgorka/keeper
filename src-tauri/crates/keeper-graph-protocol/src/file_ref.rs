@@ -75,23 +75,28 @@ pub fn parse(text: &str) -> Option<Target> {
     })
 }
 
-/// The entry node image `node` names by its own members: a `Resource`'s
+/// The text node image `node` would name an entry by: a `Resource`'s
 /// `internal` `$locator`, a `Collection`'s `okf:directory`.
-#[must_use]
-pub fn named(node: &Map<String, Value>) -> Option<Target> {
+fn entry_text(node: &Map<String, Value>) -> Option<&str> {
     let properties = node.get("properties")?;
-    let text = match node.get("kind")?.as_str()? {
+    match node.get("kind")?.as_str()? {
         "Resource" => {
             let envelope = properties.get(locator::MEMBER)?;
             if envelope.get("kind")?.as_str()? != "internal" {
                 return None;
             }
-            envelope.get("locator")?.as_str()?
+            envelope.get("locator")?.as_str()
         }
-        "Collection" => properties.get(DIRECTORY)?.as_str()?,
-        _ => return None,
-    };
-    parse(text)
+        "Collection" => properties.get(DIRECTORY)?.as_str(),
+        _ => None,
+    }
+}
+
+/// The entry node image `node` names by its own members: a `Resource`'s
+/// `internal` `$locator`, a `Collection`'s `okf:directory`.
+#[must_use]
+pub fn named(node: &Map<String, Value>) -> Option<Target> {
+    entry_text(node).and_then(parse)
 }
 
 fn active(node: &Map<String, Value>) -> bool {
@@ -283,9 +288,11 @@ pub enum EntryKind {
 /// Whether the server admits `node` as written into the graph of `domain`,
 /// `entry` answering the domain's manifest by entry id: a node naming an
 /// entry names one of this domain (another domain's id answers exactly as
-/// one that exists nowhere); a `Collection` binds a `dir` only; the
-/// domain's root `Collection` (carrying [`PROFILE_VERSION`]) is never
-/// bound. Every refusal is `invalid_change`.
+/// one that exists nowhere); a `files:` text that [`parse`] rejects (a
+/// lower-case id, a trailing segment) is refused rather than read as naming
+/// none; a `Collection` binds a `dir` only; the domain's root `Collection`
+/// (carrying [`PROFILE_VERSION`]) is never bound. Every refusal is
+/// `invalid_change`.
 pub fn admit(
     node: &Map<String, Value>,
     domain: &str,
@@ -303,6 +310,11 @@ pub fn admit(
         && properties
             .and_then(|p| p.get(DIRECTORY))
             .is_some_and(|d| d.as_str().and_then(parse).is_none())
+    {
+        return Err(Refusal::InvalidChange);
+    }
+    if !collection
+        && entry_text(node).is_some_and(|t| t.starts_with(PREFIX) && parse(t).is_none())
     {
         return Err(Refusal::InvalidChange);
     }

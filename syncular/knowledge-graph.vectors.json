@@ -46893,6 +46893,60 @@
           ]
         }
       ]
+    },
+    {
+      "id": "directory-set-then-reversed",
+      "about": "Reversing an update_node that set okf:directory unbinds the Collection, so its row is cleared (AC18).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000010",
+                "kind": "Collection",
+                "title": "docs",
+                "description": null,
+                "properties": {}
+              }
+            ]
+          },
+          "file_refs": []
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "update_node",
+                "id": "01JG0000000000000000000010",
+                "expected_revision": "1",
+                "set_properties": {
+                  "okf:directory": "files:tg/01JF0000000000000000000005"
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000005",
+              "node_id": "01JG0000000000000000000010",
+              "node_kind": "Collection"
+            }
+          ]
+        },
+        {
+          "reverse": 1,
+          "file_refs": []
+        }
+      ]
     }
   ],
   "file_ref_admissions": [
@@ -47075,6 +47129,95 @@
         "revision": "1",
         "lifecycle_revision": "1"
       }
+    },
+    {
+      "id": "resource-lower-case-entry",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01jf0000000000000000000009",
+          "kind": "file"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000011",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01jf0000000000000000000009",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "resource-trailing-segment",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01JF0000000000000000000009",
+          "kind": "file"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000012",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01JF0000000000000000000009/x",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "collection-malformed-directory",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01JF0000000000000000000004",
+          "kind": "dir"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000013",
+        "kind": "Collection",
+        "title": "docs",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "okf:directory": "tg/01JF0000000000000000000004"
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
     }
   ]
 }
