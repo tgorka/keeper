@@ -235,9 +235,11 @@ no schema change), pinned in `settings.vectors.json` (`modelKeys`, `modelVersion
   rewritten and no file row is added after the manifest (`config.model_sealed`); only
   `models.active` moves.
 - **Check order.** A set is checked whole before its first upload (`modelSets`): paths and
-  digests well formed with no path twice, then the manifest value within `settingValueMaxBytes`
-  (`config.malformed`), then no key and no `models.toml` naming a domain (`config.names_domain`),
-  then no file above `modelFileMaxBytes` (`config.model_too_large`). Each row write is checked in
+  digests well formed with no path twice, then the manifest value within `settingValueMaxBytes`,
+  then every file row's key (`models/<v>/<path>`) within the 256-byte key bound, for every file
+  before any upload (`config.malformed`), then no key and no `models.toml` naming a domain
+  (`config.names_domain`), then no file above `modelFileMaxBytes` (`config.model_too_large`).
+  Each row write is checked in
   this order, first failure wins: writer and domain (`config.writer_refused`); key grammar
   (`config.malformed`); the key naming a domain (`config.names_domain`); the value and blob shape
   (`config.malformed`; for a file row then `config.model_too_large`; for a manifest then

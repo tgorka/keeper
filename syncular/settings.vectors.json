@@ -2673,6 +2673,44 @@
       "domains": ["anadrive", "makidrive", "teamdrive"],
       "version": null,
       "refusal": "config.malformed"
+    },
+    {
+      "name": "file key at exact key bound accepted",
+      "files": [
+        {
+          "path": "weights/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "version": "c01d4dfae9666266ff6dc9ad137e8f8cdf62f03dc49810f2e4d4db91454501fa",
+      "refusal": null
+    },
+    {
+      "name": "file key one byte over key bound refused",
+      "files": [
+        {
+          "path": "weights/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "version": null,
+      "refusal": "config.malformed"
     }
   ],
   "modelUploads": [

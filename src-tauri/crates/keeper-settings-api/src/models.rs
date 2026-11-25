@@ -312,9 +312,10 @@ fn manifest_too_large(manifest: &Manifest, limits: &Limits) -> bool {
 }
 
 /// Check a set before anything of it is written, in this order: every path
-/// and digest well formed, no path twice, and its manifest value within
-/// `settingValueMaxBytes` (`config.malformed`); no key and no `models.toml`
-/// naming a domain (`config.names_domain`); no file above `modelFileMaxBytes`
+/// and digest well formed, no path twice, its manifest value within
+/// `settingValueMaxBytes`, and every file row's key within the key bound
+/// (`config.malformed`); no key and no `models.toml` naming a domain
+/// (`config.names_domain`); no file above `modelFileMaxBytes`
 /// (`config.model_too_large`). Returns its version id. Every refusal
 /// `check_model_write` can give a well-formed set's own rows comes here
 /// first; `hq-admin models put` runs it before its first upload.
@@ -330,6 +331,12 @@ pub fn check_set(
         file_count: files.len() as u64,
     };
     if manifest_too_large(&manifest, limits) {
+        return Err(Refusal::ConfigMalformed);
+    }
+    if files
+        .iter()
+        .any(|file| file_key(&version, &file.path).len() > MAX_KEY_BYTES)
+    {
         return Err(Refusal::ConfigMalformed);
     }
     let manifest_key = format!("models/{version}");
