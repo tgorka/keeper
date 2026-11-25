@@ -189,7 +189,8 @@ pub(crate) enum Command {
             .args(["approve", "reject"])
     ))]
     Decide {
-        /// Proposal ids to decide.
+        /// Proposal revisions to decide, each `<proposal_id>/<revision>` as
+        /// `proposals` prints it; only that revision's digest is sent.
         ids: Vec<String>,
         /// Decide every open proposal in this change set.
         #[arg(long, value_name = "ID")]

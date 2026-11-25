@@ -221,15 +221,30 @@ pub(crate) fn decide(
     let decisions: Vec<Decision> = match (ids.is_empty(), change_set) {
         (false, None) => {
             let mut out = Vec::with_capacity(ids.len());
-            for id in ids {
+            for named in ids {
+                let (id, revision) = named
+                    .split_once('/')
+                    .filter(|(id, rev)| !id.is_empty() && !rev.is_empty())
+                    .ok_or_else(|| {
+                        failure(
+                            "usage",
+                            &format!(
+                                "name the revision you reviewed as <proposal_id>/<revision>, \
+                                 not {named}"
+                            ),
+                        )
+                    })?;
                 let revisions = files.proposal(id).map_err(|e| files_failure(&e))?;
-                let latest = latest_revision(&revisions).ok_or_else(|| {
-                    failure("not_found", &format!("proposal {id} has no revisions"))
-                })?;
+                let named_revision = revisions
+                    .iter()
+                    .find(|rev| rev.revision == revision)
+                    .ok_or_else(|| {
+                        failure("not_found", &format!("no proposal revision {named}"))
+                    })?;
                 out.push(Decision {
-                    proposal_id: latest.proposal_id.clone(),
-                    proposal_revision: latest.revision.clone(),
-                    proposal_digest: latest.digest.clone(),
+                    proposal_id: named_revision.proposal_id.clone(),
+                    proposal_revision: named_revision.revision.clone(),
+                    proposal_digest: named_revision.digest.clone(),
                     decision: verdict,
                 });
             }

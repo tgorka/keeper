@@ -260,7 +260,11 @@ fn tool_proposes_reviewer_opens_and_approves_and_missing_reviewer_is_usage_error
     let opened_path = opened_files[0]["file"].as_str().expect("opened file path");
     assert_eq!(fs::read(opened_path).expect("read opened bytes"), body);
 
-    let decided = run_ok(&reviewer.files, &["decide", &proposal_id, "--approve"]);
+    let named = format!(
+        "{proposal_id}/{}",
+        proposed["proposal_revision"].as_str().expect("rev")
+    );
+    let decided = run_ok(&reviewer.files, &["decide", &named, "--approve"]);
     assert_eq!(decided["outcome"], "accepted");
     let items = decided["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
@@ -286,6 +290,168 @@ fn tool_proposes_reviewer_opens_and_approves_and_missing_reviewer_is_usage_error
     );
     assert_eq!(err["code"], "usage");
     assert_eq!(exit_code(&err), 2);
+}
+
+/// Sends revision 2 of `proposal_id` on `base` (revision 1) from `device`,
+/// the way a proposer revises a proposal the reviewer already opened.
+fn revise(device: &Device, base: &Value) {
+    let request_id = "01JREV00000000000000000000";
+    let params = json!({
+        "version": 1,
+        "request_id": request_id,
+        "context_id": null,
+        "payload": {
+            "proposal_id": base["proposal_id"],
+            "base_revision": base["revision"],
+            "change": base["change"],
+            "reviewers": base["reviewers"],
+            "expires_at_ms": null,
+        },
+    });
+    device
+        .replica
+        .remote_command("files.propose", request_id, params)
+        .expect("revise proposal");
+}
+
+fn propose_put(device: &Device, name: &str, extra: &[&str]) -> Value {
+    let f = write_local(device.dir.path(), name, name.as_bytes());
+    let path = format!("A/{name}");
+    let mut verb = vec![
+        "put",
+        "--file",
+        f.to_str().expect("utf8"),
+        "--drive",
+        DRIVE,
+        path.as_str(),
+        "--propose",
+        "--reviewer",
+        "r",
+    ];
+    verb.extend_from_slice(extra);
+    let proposed = run_ok(&device.files, &verb);
+    assert_eq!(proposed["outcome"], "proposed");
+    proposed
+}
+
+fn has_entry(world: &World, name: &str) -> bool {
+    world.server.entries().iter().any(|e| e.name == name)
+}
+
+#[test]
+fn decide_approves_only_the_named_revision_and_refuses_a_superseded_one() {
+    let world = World::new();
+    let tool = tool_device(&world, "propose");
+    let reviewer = person(&world, "r", "r.1", Role::Reviewer);
+
+    let proposed = propose_put(&tool, "rev.txt", &[]);
+    let id = proposed["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_owned();
+    let opened = run_ok(&reviewer.files, &["proposal", &id, "--open"]);
+    let reviewed = opened["revisions"][0].clone();
+    assert_eq!(reviewed["revision"], "1");
+
+    // The proposer sends revision 2 after the reviewer opened revision 1.
+    revise(&tool, &reviewed);
+
+    // An id without a revision is a usage error: the CLI never picks one.
+    let bare = run_err(&reviewer.files, &["decide", &id, "--approve"]);
+    assert_eq!(bare["code"], "usage");
+    assert_eq!(exit_code(&bare), 2);
+
+    // Approving the reviewed, now superseded, revision is refused whole.
+    let stale = run_err(
+        &reviewer.files,
+        &["decide", &format!("{id}/1"), "--approve"],
+    );
+    assert_eq!(stale["ok"], false);
+    assert_eq!(stale["code"], "proposal_stale");
+    assert_eq!(exit_code(&stale), 2);
+    assert_eq!(stale["items"][0]["proposal_revision"], "1");
+    assert!(!has_entry(&world, "rev.txt"), "nothing applied");
+
+    // The revision the reviewer names is the one approved.
+    let decided = run_ok(
+        &reviewer.files,
+        &["decide", &format!("{id}/2"), "--approve"],
+    );
+    assert_eq!(decided["outcome"], "accepted");
+    assert_eq!(decided["items"][0]["proposal_revision"], "2");
+    assert!(has_entry(&world, "rev.txt"));
+    let states: Vec<(String, String)> = world
+        .server
+        .proposals()
+        .iter()
+        .filter(|p| p.proposal_id == id)
+        .map(|p| {
+            (
+                p.revision.clone(),
+                json!(p.status).as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert!(states.contains(&("1".to_owned(), "superseded".to_owned())));
+    assert!(states.contains(&("2".to_owned(), "approved".to_owned())));
+}
+
+#[test]
+fn expired_proposal_is_not_listed_and_its_decide_is_refused_stale() {
+    let world = World::new();
+    let tool = tool_device(&world, "propose");
+    let reviewer = person(&world, "r", "r.1", Role::Reviewer);
+
+    // The testkit's clock moves one step per command; learn it from a first proposal.
+    let first = propose_put(&tool, "first.txt", &[]);
+    let created = world
+        .server
+        .proposals()
+        .iter()
+        .find(|p| p.proposal_id == first["proposal_id"].as_str().unwrap_or_default())
+        .map(|p| p.created_at_ms)
+        .expect("first proposal row");
+    // Open when proposed (created + 1 step) and when listed next (created + 2 steps),
+    // expired after one more command.
+    let expires = (created + 2_500).to_string();
+    let expiring = propose_put(&tool, "expiring.txt", &["--expires-at-ms", &expires]);
+    let expiring_id = expiring["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_owned();
+
+    let listed_ids = |answer: &Value| -> Vec<String> {
+        answer["proposals"]
+            .as_array()
+            .expect("proposals")
+            .iter()
+            .map(|p| p["proposal_id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let before = run_ok(&reviewer.files, &["proposals"]);
+    assert!(
+        listed_ids(&before).contains(&expiring_id),
+        "listed while unexpired"
+    );
+
+    let _ = propose_put(&tool, "later.txt", &[]);
+    let after = run_ok(&reviewer.files, &["proposals"]);
+    let after_ids = listed_ids(&after);
+    assert!(
+        !after_ids.contains(&expiring_id),
+        "an expired inbox row is not listed"
+    );
+    assert_eq!(after_ids.len(), 2);
+
+    let stale = run_err(
+        &reviewer.files,
+        &["decide", &format!("{expiring_id}/1"), "--approve"],
+    );
+    assert_eq!(stale["ok"], false);
+    assert_eq!(stale["code"], "proposal_stale");
+    assert_eq!(exit_code(&stale), 2);
+    assert_eq!(stale["items"][0]["status"], "expired");
+    assert!(!has_entry(&world, "expiring.txt"));
 }
 
 #[test]
