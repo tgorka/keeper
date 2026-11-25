@@ -9,6 +9,7 @@
   "keeper-core": "legacy",
   "keeper-graph": "implementation",
   "keeper-graph-api": "contract",
+  "keeper-files": "implementation",
   "keeper-graph-protocol": "contract",
   "keeper-graph-query": "legacy",
   "keeper-jobs-api": "contract",

@@ -4768,6 +4768,8 @@ dependencies = [
  "keeper-accounts",
  "keeper-accounts-api",
  "keeper-app-api",
+ "keeper-files",
+ "keeper-files-api",
  "keeper-graph",
  "keeper-graph-api",
  "keeper-ports",
@@ -4847,6 +4849,25 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip 9.7.0",
+]
+
+[[package]]
+name = "keeper-files"
+version = "0.12.0"
+dependencies = [
+ "hex",
+ "keeper-accounts-api",
+ "keeper-files-api",
+ "keeper-paths",
+ "keeper-ports",
+ "keeper-replica",
+ "keeper-testkit",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "ulid 1.2.1",
 ]
 
 [[package]]
@@ -5120,6 +5141,8 @@ version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
+ "keeper-accounts-api",
+ "keeper-files-api",
  "keeper-ports",
  "rusqlite",
  "serde_json",

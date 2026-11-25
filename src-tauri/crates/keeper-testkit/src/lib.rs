@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+pub mod files;
 pub mod harness;
 pub mod store;
 
