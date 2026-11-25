@@ -418,8 +418,12 @@ fn read_exact_body(stream: &mut TcpStream, initial: &[u8], len: usize) -> Option
     Some(body)
 }
 
+/// How a store upload body read ended. A complete body carries its SHA-256, computed as the bytes
+/// arrived, so the store's answer after the last byte is not a whole-body hash: on a CPU-starved
+/// runner that hash (unoptimised, megabytes) outlasted the client's answer bound and made a
+/// slow-but-steady store look silent.
 enum StoreRead {
-    Complete(Vec<u8>),
+    Complete(Vec<u8>, [u8; 32]),
     Cut,
     Silenced,
     Eof,
@@ -456,8 +460,10 @@ fn read_store_body(
         .or(cut_limit)
         .map_or(expected_len, |n| expected_len.min(n));
     let mut body = Vec::with_capacity((max_read as usize).min(1024 * 1024));
+    let mut hasher = Sha256::new();
     let take = initial.len().min(max_read as usize);
     body.extend_from_slice(&initial[..take]);
+    hasher.update(&initial[..take]);
     if take > 0 {
         counter.fetch_add(take as u64, Ordering::SeqCst);
     }
@@ -474,6 +480,7 @@ fn read_store_body(
             Ok(0) | Err(_) => return StoreRead::Eof,
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
+                hasher.update(&buf[..n]);
                 counter.fetch_add(n as u64, Ordering::SeqCst);
                 keep_pace(pace, started, (body.len() as u64).min(paced_until));
             }
@@ -485,7 +492,7 @@ fn read_store_body(
     } else if cut_limit.is_some() {
         StoreRead::Cut
     } else {
-        StoreRead::Complete(body)
+        StoreRead::Complete(body, hasher.finalize().into())
     }
 }
 
@@ -1001,7 +1008,7 @@ fn handle_store_put_part(
         (expected_size, expected_sha256, cut_limit, silence, pace)
     };
 
-    let body = match read_store_body(
+    let (body, digest) = match read_store_body(
         stream,
         &req.initial_body,
         expected_size,
@@ -1010,7 +1017,7 @@ fn handle_store_put_part(
         pace,
         &shared.bytes_received,
     ) {
-        StoreRead::Complete(body) => body,
+        StoreRead::Complete(body, digest) => (body, digest),
         StoreRead::Cut | StoreRead::Silenced => {
             let _ = stream.shutdown(Shutdown::Both);
             return;
@@ -1018,7 +1025,7 @@ fn handle_store_put_part(
         StoreRead::Eof => return,
     };
 
-    let actual_sha = BASE64.encode(Sha256::digest(&body));
+    let actual_sha = BASE64.encode(digest);
     if actual_sha != expected_sha256 {
         write_xml_error(stream, 400, "BadDigest", "Part SHA-256 mismatch");
         return;
@@ -1069,7 +1076,7 @@ fn handle_store_put_single(
         let pace = UploadPace::of(&state);
         (state.cut_next.take(), state.silence_next.take(), pace)
     };
-    let body = match read_store_body(
+    let (body, digest) = match read_store_body(
         stream,
         &req.initial_body,
         content_len,
@@ -1078,7 +1085,7 @@ fn handle_store_put_single(
         pace,
         &shared.bytes_received,
     ) {
-        StoreRead::Complete(body) => body,
+        StoreRead::Complete(body, digest) => (body, digest),
         StoreRead::Cut | StoreRead::Silenced => {
             let _ = stream.shutdown(Shutdown::Both);
             return;
@@ -1086,7 +1093,6 @@ fn handle_store_put_single(
         StoreRead::Eof => return,
     };
 
-    let digest = Sha256::digest(&body);
     if hex::encode(digest) != hex_digest {
         write_xml_error(stream, 400, "BadDigest", "Object SHA-256 mismatch");
         return;
