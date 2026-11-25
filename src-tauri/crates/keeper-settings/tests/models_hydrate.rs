@@ -1,9 +1,10 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use keeper_ports::{Replica, RowOp, StoreOrigin, StoreSlot};
+use keeper_ports::transfer::{Downloaded, FileTransfer, Progress, Uploaded};
+use keeper_ports::{Replica, ReplicaError, RowOp, StoreOrigin, StoreSlot};
 use keeper_replica::transfer::{BlobRouteGrants, StoreTransfer, TransferConfig};
 use keeper_replica::SyncularOpener;
 use keeper_settings::models::{
@@ -891,4 +892,285 @@ fn folder_symlink_escaping_dest_is_refused() {
         .next()
         .is_none());
     assert!(ready_digest(dest.path(), "turn").is_none());
+}
+
+/// A transfer that calls `on_download` with the content id before passing
+/// each download on: a window into the run between its decisions.
+struct Watching<F: Fn(&str) + Send + Sync> {
+    inner: StoreTransfer,
+    on_download: F,
+}
+
+impl<F: Fn(&str) + Send + Sync> FileTransfer for Watching<F> {
+    fn upload(
+        &self,
+        file: &Path,
+        media_type: Option<&str>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Uploaded, ReplicaError> {
+        self.inner.upload(file, media_type, progress)
+    }
+
+    fn download(
+        &self,
+        content_id: &str,
+        size: u64,
+        dest: &Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Downloaded, ReplicaError> {
+        (self.on_download)(content_id);
+        self.inner.download(content_id, size, dest, progress)
+    }
+}
+
+struct TwoVersions {
+    v1: String,
+    v2: ActiveSet,
+    vad_v1: Vec<u8>,
+    vad_v2: Vec<u8>,
+}
+
+/// The turn group hydrated on v1 into `dest`, then v2 — both files changed —
+/// published and active.
+fn v1_ready_then_v2_active(harness: &Harness, stand_in: &StandIn, dest: &Path) -> TwoVersions {
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let transfer = make_transfer(stand_in, plan_dir.path());
+    let replica = harness.source.replica.as_ref();
+    let vad = ["vad".to_owned()];
+    let group = turn_group(&vad);
+
+    let vad_v1 = pseudo_random(60, 8 * 1024);
+    let lic_v1 = b"v1 license\n".to_vec();
+    stand_in.seed_blob(&vad_v1);
+    stand_in.seed_blob(&lic_v1);
+    let (v1, _) = publish(
+        replica,
+        &[
+            ("vad/model.onnx", vad_v1.as_slice()),
+            ("LICENSE", lic_v1.as_slice()),
+        ],
+        SAMPLE_MODELS_TOML,
+    );
+    let set_v1 = active_set(replica).expect("v1 active_set").expect("v1");
+    hydrate(&set_v1, group, &transfer, dest, &AtomicBool::new(false)).expect("hydrate v1");
+    assert_eq!(ready_version(dest, "turn"), Some(v1.clone()));
+
+    let vad_v2 = pseudo_random(61, 8 * 1024);
+    let lic_v2 = b"v2 license\n".to_vec();
+    stand_in.seed_blob(&vad_v2);
+    stand_in.seed_blob(&lic_v2);
+    publish(
+        replica,
+        &[
+            ("vad/model.onnx", vad_v2.as_slice()),
+            ("LICENSE", lic_v2.as_slice()),
+        ],
+        SAMPLE_MODELS_TOML,
+    );
+    let v2 = active_set(replica).expect("v2 active_set").expect("v2");
+    assert_ne!(v2.version, v1);
+    TwoVersions {
+        v1,
+        v2,
+        vad_v1,
+        vad_v2,
+    }
+}
+
+/// A body of the right size planted (or left by a run) at the staging path
+/// is hashed, not believed: it is never placed or vouched for.
+#[test]
+fn a_wrong_staged_body_of_the_right_size_is_refused() {
+    let harness = local_replica();
+    let stand_in = StandIn::start(DATABASE);
+    let dest = tempfile::tempdir().expect("dest dir");
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let transfer = make_transfer(&stand_in, plan_dir.path());
+
+    let vad_bytes = pseudo_random(70, 16 * 1024);
+    let license = b"MIT\n".to_vec();
+    stand_in.seed_blob(&license);
+    publish(
+        harness.source.replica.as_ref(),
+        &[
+            ("vad/model.onnx", vad_bytes.as_slice()),
+            ("LICENSE", license.as_slice()),
+        ],
+        SAMPLE_MODELS_TOML,
+    );
+    let staging = dest.path().join(".keeper-hydrate-blobs");
+    std::fs::create_dir_all(&staging).expect("staging dir");
+    let wrong = pseudo_random(71, vad_bytes.len());
+    std::fs::write(staging.join(sha256_hex(&vad_bytes)), &wrong).expect("plant staged body");
+
+    let set = active_set(harness.source.replica.as_ref())
+        .expect("active_set")
+        .expect("present");
+    let vad = ["vad".to_owned()];
+    let group = turn_group(&vad);
+    let interrupt = AtomicBool::new(false);
+    // The store does not serve the body, so only the planted one is at hand.
+    let err = hydrate(&set, group, &transfer, dest.path(), &interrupt)
+        .expect_err("a wrong staged body must not be placed");
+    assert!(matches!(
+        err,
+        ModelsError::Transfer { .. } | ModelsError::Integrity { .. }
+    ));
+    assert!(!dest.path().join("vad/model.onnx").exists());
+    assert!(ready_digest(dest.path(), "turn").is_none());
+
+    // Once the store serves the published body, it is what lands.
+    stand_in.seed_blob(&vad_bytes);
+    hydrate(&set, group, &transfer, dest.path(), &interrupt).expect("hydrate");
+    assert_eq!(
+        std::fs::read(dest.path().join("vad/model.onnx")).expect("vad"),
+        vad_bytes
+    );
+    assert_eq!(ready_version(dest.path(), "turn"), Some(set.version));
+}
+
+/// The previous version's marker is gone before the first file of the new
+/// one is fetched, so a run killed mid-way never leaves a group ready on
+/// files of both versions.
+#[test]
+fn the_old_marker_is_gone_while_a_new_version_downloads() {
+    let harness = local_replica();
+    let stand_in = StandIn::start(DATABASE);
+    let dest = tempfile::tempdir().expect("dest dir");
+    let two = v1_ready_then_v2_active(&harness, &stand_in, dest.path());
+
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let seen = Mutex::new(Vec::new());
+    let transfer = Watching {
+        inner: make_transfer(&stand_in, plan_dir.path()),
+        on_download: |_: &str| {
+            seen.lock()
+                .expect("seen")
+                .push(ready_digest(dest.path(), "turn"));
+        },
+    };
+    let vad = ["vad".to_owned()];
+    let group = turn_group(&vad);
+    hydrate(
+        &two.v2,
+        group,
+        &transfer,
+        dest.path(),
+        &AtomicBool::new(false),
+    )
+    .expect("hydrate v2");
+
+    assert_eq!(*seen.lock().expect("seen"), vec![None, None]);
+    assert_eq!(ready_version(dest.path(), "turn"), Some(two.v2.version));
+}
+
+/// An interrupt raised during a run stops it before the next file: the run
+/// is cancelled, nothing is vouched for, and the next run fetches only what
+/// the cancelled one did not place.
+#[test]
+fn an_interrupt_cancels_the_run() {
+    let harness = local_replica();
+    let stand_in = StandIn::start(DATABASE);
+    let dest = tempfile::tempdir().expect("dest dir");
+    let two = v1_ready_then_v2_active(&harness, &stand_in, dest.path());
+
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let interrupt = AtomicBool::new(false);
+    let downloads = Mutex::new(0_u32);
+    let transfer = Watching {
+        inner: make_transfer(&stand_in, plan_dir.path()),
+        on_download: |_: &str| {
+            *downloads.lock().expect("downloads") += 1;
+            interrupt.store(true, Ordering::Relaxed);
+        },
+    };
+    let vad = ["vad".to_owned()];
+    let group = turn_group(&vad);
+    let err = hydrate(&two.v2, group, &transfer, dest.path(), &interrupt)
+        .expect_err("an interrupted run must not finish");
+    assert!(matches!(err, ModelsError::Cancelled));
+    assert_eq!(*downloads.lock().expect("downloads"), 1);
+    assert!(ready_digest(dest.path(), "turn").is_none());
+
+    interrupt.store(false, Ordering::Relaxed);
+    let report = hydrate(&two.v2, group, &transfer, dest.path(), &interrupt).expect("resumed run");
+    assert_eq!(report.downloaded, 1);
+    assert_eq!(ready_version(dest.path(), "turn"), Some(two.v2.version));
+    assert_eq!(
+        std::fs::read(dest.path().join("vad/model.onnx")).expect("v2 vad"),
+        two.vad_v2
+    );
+}
+
+/// A run cancelled before it changed anything still leaves the set
+/// unvouched for: the old version's marker does not outlive a run that
+/// was asked to bring in a new one.
+#[test]
+fn a_cancelled_run_leaves_the_set_unvouched_for() {
+    let harness = local_replica();
+    let stand_in = StandIn::start(DATABASE);
+    let dest = tempfile::tempdir().expect("dest dir");
+    let two = v1_ready_then_v2_active(&harness, &stand_in, dest.path());
+    assert_eq!(ready_version(dest.path(), "turn"), Some(two.v1.clone()));
+
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let transfer = make_transfer(&stand_in, plan_dir.path());
+    let served_before = stand_in.store_bytes_served();
+    let vad = ["vad".to_owned()];
+    let group = turn_group(&vad);
+    let err = hydrate(
+        &two.v2,
+        group,
+        &transfer,
+        dest.path(),
+        &AtomicBool::new(true),
+    )
+    .expect_err("a cancelled run must not finish");
+    assert!(matches!(err, ModelsError::Cancelled));
+    assert!(ready_digest(dest.path(), "turn").is_none());
+    assert!(ready_version(dest.path(), "turn").is_none());
+    assert_eq!(stand_in.store_bytes_served(), served_before);
+    assert_eq!(
+        std::fs::read(dest.path().join("vad/model.onnx")).expect("v1 vad"),
+        two.vad_v1
+    );
+}
+
+/// A group name is the marker's and state's file name: anything but
+/// lowercase ASCII letters is refused before the folder is touched.
+#[test]
+fn a_group_name_that_is_not_letters_is_refused() {
+    let harness = local_replica();
+    let stand_in = StandIn::start(DATABASE);
+    let root = tempfile::tempdir().expect("root dir");
+    let plan_dir = tempfile::tempdir().expect("plan dir");
+    let transfer = make_transfer(&stand_in, plan_dir.path());
+    let sample = SampleFiles::new();
+    sample.seed_all(&stand_in);
+    publish(
+        harness.source.replica.as_ref(),
+        &sample.as_slices(),
+        SAMPLE_MODELS_TOML,
+    );
+    let set = active_set(harness.source.replica.as_ref())
+        .expect("active_set")
+        .expect("present");
+    let vad = ["vad".to_owned()];
+    let dest = root.path().join("models");
+
+    for name in ["", "Turn", "turn-1", "turn.x", "tür", "../turn"] {
+        let group = Group {
+            name,
+            folders: Folders::Only(&vad),
+            fingerprint: None,
+        };
+        let err = hydrate(&set, group, &transfer, &dest, &AtomicBool::new(false))
+            .expect_err("a group name that is not letters must be refused");
+        assert!(
+            matches!(&err, ModelsError::Group(refused) if refused == name),
+            "{name:?}: {err:?}"
+        );
+        assert!(!dest.exists(), "{name:?} touched the folder");
+    }
+    assert_eq!(stand_in.store_bytes_served(), 0);
 }

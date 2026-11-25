@@ -578,7 +578,8 @@ pub fn hydrate(
 
 /// Where `path` lands under `dest`, through `keeper-paths`: its plain
 /// segments joined, and refused when what exists of it lands outside
-/// `dest` (a folder link on the way) or a link points nowhere.
+/// `dest` (a folder link on the way), elsewhere inside it, or a link points
+/// nowhere.
 fn place_of(dest: &Path, path: &str) -> Result<PathBuf, ModelsError> {
     let refused = |detail: String| ModelsError::Path {
         path: path.to_owned(),
@@ -587,11 +588,24 @@ fn place_of(dest: &Path, path: &str) -> Result<PathBuf, ModelsError> {
     let target =
         keeper_paths::lexical_join(dest, path).map_err(|error| refused(error.to_string()))?;
     let landed = keeper_paths::landing(dest, path).map_err(|error| refused(error.to_string()))?;
-    let asked: Vec<&str> = path.split('/').collect();
-    if landed.iter().map(String::as_str).ne(asked.iter().copied()) {
+    if !lands_as_asked(&landed, path) {
         return Err(refused("it lands elsewhere on this disk".to_owned()));
     }
     Ok(target)
+}
+
+/// Whether the names `path` landed on are the names it asked for, compared
+/// as a case-insensitive volume compares them: on APFS the landing of an
+/// existing `Vocab.json` asked for as `vocab.json` reads back in the case
+/// stored on disk, and a version that only changes a path's case must not
+/// be refused there for ever.
+fn lands_as_asked(landed: &[String], path: &str) -> bool {
+    let asked: Vec<&str> = path.split('/').collect();
+    landed.len() == asked.len()
+        && landed
+            .iter()
+            .zip(asked)
+            .all(|(landed, asked)| keeper_paths::names::same_entry_folded(landed, asked))
 }
 
 /// Whether `target` already holds `file`. A remembered digest with the right
@@ -767,6 +781,33 @@ mod tests {
         assert!(matches!(
             check_collisions(["A/b", "a"]),
             Err(ModelsError::Collision { .. })
+        ));
+    }
+
+    /// APFS simulated: `landing` reads an existing entry back in the case
+    /// stored on disk, so a version renaming `Vocab.json` to `vocab.json`
+    /// (or folder `ASR` to `asr`) lands on the old spelling. That is the
+    /// same entry under the contract's caseless rule, never "elsewhere".
+    #[test]
+    fn a_case_only_rename_lands_as_asked_on_a_caseless_volume() {
+        let names = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        assert!(lands_as_asked(&names(&["Vocab.json"]), "vocab.json"));
+        assert!(lands_as_asked(
+            &names(&["ASR", "encoder.bin"]),
+            "asr/encoder.bin"
+        ));
+        assert!(lands_as_asked(
+            &names(&["asr", "encoder.bin"]),
+            "asr/encoder.bin"
+        ));
+        assert!(!lands_as_asked(
+            &names(&["other", "encoder.bin"]),
+            "asr/encoder.bin"
+        ));
+        assert!(!lands_as_asked(&names(&["encoder.bin"]), "asr/encoder.bin"));
+        assert!(!lands_as_asked(
+            &names(&["asr", "x", "encoder.bin"]),
+            "asr/encoder.bin"
         ));
     }
 
