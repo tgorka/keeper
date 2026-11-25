@@ -38,6 +38,13 @@ reason = "keeper's own version and catalogue digest; no person's data"
 sha256 = "f1198e5a737d8d63949f82880cb65e0ea9ed114d55a68ac8b7e7ae6d1d42401c"
 
 [[classified]]
+id = "graph.annotate"
+change = "added"
+reviewer = "116.5 client rung, Opus 5.5 integrator; confirmed by the rung's review"
+reason = "a person's note or tags on a file's one graph node (116.5): one graph.apply change, server-authorised; write, not wire-reachable before 123.4 (app reads only), proposal \"none\""
+sha256 = "70bbf01ca32d194d9aeb476b14457723b25243b7bd95491c63355d09c614c537"
+
+[[classified]]
 id = "graph.apply"
 change = "added"
 reviewer = "123.2 rung review, Opus 5.5, keeper#651 @3586973c"

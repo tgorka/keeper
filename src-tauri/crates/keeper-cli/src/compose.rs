@@ -130,7 +130,7 @@ mod tests {
     }
 
     /// AC1: through the dispatcher, `app.modules` lists `app` and `graph`
-    /// ready; the catalogue holds the 5 `app` and 17 `graph` operations with
+    /// ready; the catalogue holds the 5 `app` and 18 `graph` operations with
     /// every field; the four `decide` operations are `decide`; the snapshot
     /// carries the epic's wire rules.
     #[test]
@@ -173,8 +173,8 @@ mod tests {
                 "app.version"
             ]
         );
-        assert_eq!(graph.len(), 17, "{graph:?}");
-        assert_eq!(ids.len(), 22);
+        assert_eq!(graph.len(), 18, "{graph:?}");
+        assert_eq!(ids.len(), 23);
         for spec in &catalogue {
             assert!(!spec.summary.is_empty(), "{}: summary", spec.id);
             assert!(

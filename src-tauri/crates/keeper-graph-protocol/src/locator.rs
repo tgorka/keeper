@@ -1,7 +1,10 @@
 //! Reference envelopes (contract §3, S06-AC5): the reserved property member
 //! `$locator`, permitted on `Resource` nodes only. It *describes* where a
-//! resource lives and what it is; nothing here resolves, fetches or opens
-//! one, and no resolver is implemented ([`SUPPORTED_RESOLVERS`] is empty).
+//! resource lives and what it is; nothing here fetches or opens one. The
+//! one resolver keeper implements is `internal` ([`SUPPORTED_RESOLVERS`]):
+//! an `internal` locator `files:<domain>/<entry_id>` is resolved by the
+//! server's `files.resolve` (story 116.5, [`crate::file_ref`]); a legacy
+//! `internal` text such as `keeper:drive/notes` stays unresolved.
 //!
 //! ```text
 //! {"kind": "internal"|"git"|"s3"|"relational"|"https"|"ssh_fs"|"local_fs",
@@ -66,9 +69,10 @@ pub const KINDS: [&str; 7] = [
 ];
 /// Who manages the resource.
 pub const MANAGEMENT: [&str; 2] = ["managed", "external"];
-/// The resolvers this build implements: none. A declared capability is an
-/// observation, never an advertised resolver.
-pub const SUPPORTED_RESOLVERS: [&str; 0] = [];
+/// The resolvers this build implements: `internal` first (116.5), through
+/// the server's `files.resolve`. A declared capability is an observation,
+/// never an advertised resolver.
+pub const SUPPORTED_RESOLVERS: [&str; 1] = ["internal"];
 /// Query and fragment parameters that carry credentials (case-insensitive).
 pub const CREDENTIAL_PARAMETERS: [&str; 10] = [
     "token",

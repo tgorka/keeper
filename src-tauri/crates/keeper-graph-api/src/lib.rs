@@ -1,6 +1,7 @@
 //! The graph module's catalogue (story 123.2; A-4): one operation per verb
-//! of `keeper-cli graph`, 113.5's seventeen, each naming the
-//! `(server, domain)` pair it addresses at `/target`.
+//! of `keeper-cli graph` — eighteen (113.5's seventeen and 116.5's
+//! `annotate`) — each naming the `(server, domain)` pair it addresses at
+//! `/target`.
 //!
 //! A crate of its own, not a feature of `keeper-graph-protocol`: cargo
 //! unifies features across one build, so a feature there would change the
@@ -20,8 +21,8 @@ pub mod schemas;
 
 pub use gate::{propose_gate, to_proposal, wire_gate};
 pub use inputs::{
-    Acknowledge, Discard, Entity, EventId, Inspect, Page, ProposalRead, Query, Reverse, Sync,
-    Target, TargetOnly, Targeted,
+    Acknowledge, Annotate, Discard, Entity, EventId, Inspect, Page, ProposalRead, Query, Reverse,
+    Sync, Target, TargetOnly, Targeted,
 };
 
 use keeper_runtime_api::{
@@ -56,6 +57,9 @@ fn entries() -> Schema {
 }
 fn sent() -> Schema {
     schema_of(schemas::sent_answer())
+}
+fn annotated() -> Schema {
+    schema_of(schemas::annotate_answer())
 }
 fn reversed() -> Schema {
     schema_of(schemas::reverse_answer())
@@ -195,6 +199,14 @@ pub static OPERATIONS: &[OperationSpec] = &[
             &[],
         )
     },
+    command(
+        "graph.annotate",
+        Effect::Write,
+        "put a note or tags on a file's graph node, creating it once",
+        (derived::<Annotate>, annotated),
+        &["graph", "annotate"],
+        &["/entry_id"],
+    ),
     read(
         "graph.pending",
         "the queue's entries: ids, state, cause and age only",

@@ -74,7 +74,7 @@ fn run(state: &Path, token: bool, json: bool, verb: &[&str]) -> Run {
     }
 }
 
-/// All seventeen verbs, without a token: 113.5's refusal, byte for byte,
+/// All eighteen verbs, without a token: 113.5's refusal, byte for byte,
 /// exit `2`, one dispatch each.
 #[test]
 fn every_verb_answers_as_before_through_one_dispatch() {
@@ -85,9 +85,10 @@ fn every_verb_answers_as_before_through_one_dispatch() {
         r#"{"ops":[{"op":"create_node","id":"01JE0000000000000000000001","kind":"Concept","title":"N","description":null,"properties":{}}]}"#,
     );
     let event = "01JE0000000000000000000003";
-    let verbs: [Vec<&str>; 17] = [
+    let verbs: [Vec<&str>; 18] = [
         vec!["apply", &change],
         vec!["enqueue", &change],
+        vec!["annotate", "01JE0000000000000000000005", "--note", "n"],
         vec!["pending"],
         vec!["resume"],
         vec!["discard", "01JE0000000000000000000009"],

@@ -171,7 +171,10 @@ fn locator_envelopes_are_admitted_or_refused() {
         });
         assert_eq!(checked.err().map(Refusal::code), refusal(entry), "{id}");
     }
-    assert!(locator::SUPPORTED_RESOLVERS.is_empty());
+    // 116.5: `internal` is the first (and only) resolver; every kind's
+    // grammar above is unchanged.
+    assert_eq!(locator::SUPPORTED_RESOLVERS, ["internal"]);
+    assert_eq!(locator::KINDS[0], locator::SUPPORTED_RESOLVERS[0]);
 }
 
 /// The graph as it is now, held as a vector's images.
