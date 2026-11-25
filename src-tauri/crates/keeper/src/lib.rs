@@ -59,6 +59,9 @@ mod notes_ipc;
 mod notes_vault;
 #[cfg(desktop)]
 mod notes_window;
+// The organisation's model set from the general domain (story 121.3): the
+// fetch's composition, outside the scanned `transcribe*.rs`/`voice*.rs`.
+mod org_models;
 // The model providers notes search asks (Story 108.3a): every target.
 mod providers_ipc;
 mod recorder;

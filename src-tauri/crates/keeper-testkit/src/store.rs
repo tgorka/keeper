@@ -80,6 +80,8 @@ struct Shared {
 
 struct State {
     objects: BTreeMap<String, Arc<Vec<u8>>>,
+    blobs: BTreeMap<String, Arc<Vec<u8>>>,
+    refuse_blobs: bool,
     plans: BTreeMap<String, Plan>,
     mint_seq: u64,
     expired_up_to: u64,
@@ -145,6 +147,8 @@ impl StandIn {
             store_gets: AtomicU64::new(0),
             state: Mutex::new(State {
                 objects: BTreeMap::new(),
+                blobs: BTreeMap::new(),
+                refuse_blobs: false,
                 plans: BTreeMap::new(),
                 mint_seq: 0,
                 expired_up_to: 0,
@@ -217,6 +221,33 @@ impl StandIn {
             .objects
             .insert(id.clone(), Arc::new(bytes.to_vec()));
         id
+    }
+
+    /// Place `bytes` in the blob key space at its `sha256:<hex>` id and return that id.
+    pub fn seed_blob(&self, bytes: &[u8]) -> String {
+        let id = crate::blob_id(bytes);
+        self.shared
+            .state
+            .lock()
+            .expect("state lock")
+            .blobs
+            .insert(id.clone(), Arc::new(bytes.to_vec()));
+        id
+    }
+
+    /// Place `bytes` in the blob key space under `blob_id` even if they do not hash to it.
+    pub fn seed_blob_as(&self, blob_id: &str, bytes: &[u8]) {
+        self.shared
+            .state
+            .lock()
+            .expect("state lock")
+            .blobs
+            .insert(blob_id.to_owned(), Arc::new(bytes.to_vec()));
+    }
+
+    /// While `on`, the blob route answers every id as absent (`404 blob.not_found`).
+    pub fn refuse_blobs(&self, on: bool) {
+        self.shared.state.lock().expect("state lock").refuse_blobs = on;
     }
 
     /// Read back a stored object by content id.
@@ -620,6 +651,14 @@ fn handle_server_conn(mut stream: TcpStream, shared: &Shared) {
         handle_download_grant(&mut stream, shared, &body);
         return;
     }
+    if req.method == "GET" {
+        if let Some(blob_id) = subpath.strip_prefix("/blobs/") {
+            if !blob_id.is_empty() && !blob_id.contains('/') {
+                handle_blob_download_grant(&mut stream, shared, blob_id);
+                return;
+            }
+        }
+    }
     if let Some(rest) = subpath.strip_prefix("/files/plans/") {
         if let Some((plan_id, action)) = rest.split_once('/') {
             match (req.method.as_str(), action) {
@@ -926,6 +965,35 @@ fn handle_download_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
     );
 }
 
+fn handle_blob_download_grant(stream: &mut TcpStream, shared: &Shared, blob_id: &str) {
+    let mut state = shared.state.lock().expect("state lock");
+    if state.refuse_blobs || !state.blobs.contains_key(blob_id) {
+        write_json(
+            stream,
+            404,
+            &json!({"code": "blob.not_found", "message": "blob not found"}),
+        );
+        return;
+    }
+    let Some(hex_digest) = blob_id.strip_prefix("sha256:") else {
+        write_json(
+            stream,
+            404,
+            &json!({"code": "blob.not_found", "message": "blob not found"}),
+        );
+        return;
+    };
+    let origin = state.announced_origin(shared.store_port);
+    let sig = state.mint_sig();
+    let expires_at_ms = now_ms() + URL_TTL_MS;
+    let url = format!("{origin}/blob/{hex_digest}?sig={sig}");
+    write_json(
+        stream,
+        200,
+        &json!({"url": url, "urlExpiresAtMs": expires_at_ms}),
+    );
+}
+
 fn handle_store_conn(mut stream: TcpStream, shared: &Shared) {
     let Some(req) = read_head(&mut stream) else {
         return;
@@ -960,7 +1028,17 @@ fn handle_store_conn(mut stream: TcpStream, shared: &Shared) {
     }
     if req.method == "GET" {
         if let Some(hex_digest) = path.strip_prefix("/get/") {
-            handle_store_get(&mut stream, shared, &req, hex_digest);
+            handle_store_get(
+                &mut stream,
+                shared,
+                &req,
+                hex_digest,
+                StoreKeySpace::Objects,
+            );
+            return;
+        }
+        if let Some(hex_digest) = path.strip_prefix("/blob/") {
+            handle_store_get(&mut stream, shared, &req, hex_digest, StoreKeySpace::Blobs);
             return;
         }
     }
@@ -1123,11 +1201,27 @@ fn keep_pace(pace: Option<(usize, Duration)>, started: std::time::Instant, moved
     }
 }
 
-fn handle_store_get(stream: &mut TcpStream, shared: &Shared, req: &RequestHead, hex_digest: &str) {
+#[derive(Clone, Copy)]
+enum StoreKeySpace {
+    Objects,
+    Blobs,
+}
+
+fn handle_store_get(
+    stream: &mut TcpStream,
+    shared: &Shared,
+    req: &RequestHead,
+    hex_digest: &str,
+    space: StoreKeySpace,
+) {
     let content_id = format!("sha256:{hex_digest}");
     let (object, cut_limit, silence, pace) = {
         let mut state = shared.state.lock().expect("state lock");
-        let Some(object) = state.objects.get(&content_id).cloned() else {
+        let map = match space {
+            StoreKeySpace::Objects => &state.objects,
+            StoreKeySpace::Blobs => &state.blobs,
+        };
+        let Some(object) = map.get(&content_id).cloned() else {
             write_xml_error(stream, 404, "NoSuchKey", "Object not found");
             return;
         };

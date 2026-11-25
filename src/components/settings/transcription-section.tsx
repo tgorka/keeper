@@ -142,10 +142,16 @@ function TranscriptionSettings() {
       {status && (
         <>
           <p role="status">{status.models.sentence}</p>
+          {status.models.version && (
+            <p className="text-muted-foreground">
+              Model set version {status.models.version.slice(0, 12)}
+            </p>
+          )}
           {status.reason && <p>{status.reason}</p>}
           {status.models.state === "noAccount" && (
             <p className="text-muted-foreground">
-              Connect your account in Settings → Account to fetch the models.
+              Pair this device with your agents server in Settings → Agents &amp; voice to fetch the
+              models.
             </p>
           )}
           {(status.models.state === "missing" || status.models.state === "failed") && (

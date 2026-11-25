@@ -115,6 +115,82 @@ impl TransferGrants for HttpGrants {
     }
 }
 
+/// Download-only [`TransferGrants`] against the generic Syncular blob route
+/// (`GET <base>/blobs/<blobId>`).
+pub struct BlobRouteGrants {
+    base: String,
+    token: String,
+    agent: ureq::Agent,
+}
+
+impl BlobRouteGrants {
+    /// Build a blob-route grants client for `base_url` (database mount, with or without
+    /// trailing slash) using bearer `token` and per-request `timeout`.
+    pub fn new(
+        base_url: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<BlobRouteGrants, ReplicaError> {
+        let base = normalize_http_base(base_url, "grant base url")?;
+        Ok(BlobRouteGrants {
+            base,
+            token: token.to_owned(),
+            agent: build_agent(timeout),
+        })
+    }
+
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+}
+
+impl fmt::Debug for BlobRouteGrants {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlobRouteGrants")
+            .field("base", &self.base)
+            .field("token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransferGrants for BlobRouteGrants {
+    fn grant_upload(&self, _ask: &UploadAsk) -> Result<UploadGrant, ReplicaError> {
+        Err(ReplicaError::Client(
+            "model blobs are only downloaded".to_owned(),
+        ))
+    }
+
+    fn part_urls(&self, _plan_id: &str, _numbers: &[u32]) -> Result<Vec<PartUrl>, ReplicaError> {
+        Err(ReplicaError::Client(
+            "model blobs are only downloaded".to_owned(),
+        ))
+    }
+
+    fn held_parts(&self, _plan_id: &str) -> Result<Vec<HeldPart>, ReplicaError> {
+        Err(ReplicaError::Client(
+            "model blobs are only downloaded".to_owned(),
+        ))
+    }
+
+    fn complete(&self, _plan_id: &str) -> Result<Completion, ReplicaError> {
+        Err(ReplicaError::Client(
+            "model blobs are only downloaded".to_owned(),
+        ))
+    }
+
+    fn grant_download(&self, content_id: &str) -> Result<SignedUrl, ReplicaError> {
+        validate_blob_id(content_id)?;
+        let url = format!("{}/blobs/{content_id}", self.base);
+        let response = self
+            .agent
+            .get(&url)
+            .header("authorization", &self.auth_header())
+            .call();
+        let value = decode_json_response(response)?;
+        parse_blob_signed_url(value)
+    }
+}
+
 /// Ask `GET <server_url>/databases` for the object store origin announced for
 /// `database`. Returns `Ok(None)` when the database is absent or its `store`
 /// field is absent or unparsable.
@@ -167,6 +243,20 @@ fn validate_plan_id(plan_id: &str) -> Result<(), ReplicaError> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         return Err(ReplicaError::Client("invalid upload plan id".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_blob_id(content_id: &str) -> Result<(), ReplicaError> {
+    let Some(hex) = content_id.strip_prefix("sha256:") else {
+        return Err(ReplicaError::Client("invalid blob id".to_owned()));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(ReplicaError::Client("invalid blob id".to_owned()));
     }
     Ok(())
 }
@@ -271,6 +361,14 @@ struct SignedUrlWire {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BlobSignedUrlWire {
+    url: String,
+    #[serde(alias = "expiresAtMs")]
+    url_expires_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PartUrlWire {
     number: u32,
     url: String,
@@ -336,6 +434,18 @@ fn parse_signed_url(value: Value) -> Result<SignedUrl, ReplicaError> {
     Ok(SignedUrl {
         url: wire.url,
         expires_at_ms: wire.expires_at_ms,
+    })
+}
+
+fn parse_blob_signed_url(value: Value) -> Result<SignedUrl, ReplicaError> {
+    let wire: BlobSignedUrlWire = serde_json::from_value(value)
+        .map_err(|err| ReplicaError::Client(format!("invalid signed url response: {err}")))?;
+    if wire.url.is_empty() {
+        return Err(ReplicaError::Client("signed url is empty".to_owned()));
+    }
+    Ok(SignedUrl {
+        url: wire.url,
+        expires_at_ms: wire.url_expires_at_ms,
     })
 }
 

@@ -108,6 +108,7 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
     // This device's names, read at each pairing, sign-in and restart
     // (R-HQ-94 and amendment 2 (4)).
     let host_platform = Arc::clone(&platform);
+    let models_platform = Arc::clone(&platform);
     let hq = Hq::new(
         platform,
         Arc::new(SyncularOpener),
@@ -133,7 +134,11 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
         }
         if let Err(error) = started.start().await {
             tracing::warn!(%error, "the agents server could not be started");
+            return;
         }
+        // The models come from this server's general domain (story 121.3):
+        // bring them up to date once its replicas are open.
+        crate::transcribe_ipc::spawn_models_fetch(models_platform);
     });
     hq
 }
@@ -319,6 +324,8 @@ pub async fn hq_server_set(url: String) -> Result<HqStatusVm, IpcError> {
 /// Forget the server: this device's copies of it, then its pairing.
 #[tauri::command]
 pub async fn hq_server_forget() -> Result<HqStatusVm, IpcError> {
+    // The models come through this server's general domain (story 121.3).
+    crate::org_models::interrupt();
     hq()?.forget().await.map_err(error)
 }
 

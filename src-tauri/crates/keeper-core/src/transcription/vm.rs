@@ -68,6 +68,11 @@ pub struct ModelsStateVm {
     pub state: ModelsState,
     pub sentence: String,
     pub missing: Vec<String>,
+    /// The published model set version the ready group came from (story
+    /// 121.3), for Settings to show; absent while none is complete here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -241,9 +241,7 @@ fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, S
     if !missing.is_empty() {
         return Err(EngineUnavailable::ModelsMissing { missing }.sentence());
     }
-    if keeper_sync::config_repo::completion_digest(&root, model_files::TRANSCRIPTION_GROUP)
-        .is_none()
-    {
+    if keeper_settings::models::ready_digest(&root, model_files::TRANSCRIPTION_GROUP).is_none() {
         return Err(MODELS_UPDATING.to_owned());
     }
     engine
@@ -253,19 +251,28 @@ fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, S
 }
 
 /// S2's readiness: every file of the set is here and it is what the
-/// account's clone names now.
+/// organisation's active model set names now.
 fn models_ready(data_dir: &Path) -> bool {
     let root = models_root(data_dir);
+    let active = crate::org_models::active();
     model_set(data_dir).is_ok_and(|set| model_files::missing(&root, &set).is_empty())
-        && crate::account_ipc::models_current(data_dir, &root, &transcription_group(data_dir))
+        && crate::org_models::models_current(
+            active.as_ref(),
+            &root,
+            &transcription_group(data_dir, active.as_ref()),
+        )
 }
 
-/// Transcription's hydration group as the account's clone and the turn
+/// Transcription's hydration group as the active model set and the turn
 /// model picks name it now: every folder but the turn models'.
-fn transcription_group(data_dir: &Path) -> model_files::FetchGroup {
-    let (clone, repo) = crate::account_ipc::clone_models(data_dir);
+fn transcription_group(
+    data_dir: &Path,
+    active: Option<&keeper_settings::models::ActiveSet>,
+) -> model_files::FetchGroup {
+    let paths = crate::org_models::set_paths(active);
+    let repo = crate::org_models::repo_set(active);
     let (vad, smart_turn) = registry::get_turn_models(data_dir).unwrap_or_default();
-    model_files::transcription_group(&clone, &repo, &vad, &smart_turn)
+    model_files::transcription_group(&paths, &repo, &vad, &smart_turn)
 }
 
 /// A fresh staging name beside a target: the house shape keeper-sync never
@@ -470,11 +477,11 @@ enum Fetch {
 
 static FETCH: Mutex<Fetch> = Mutex::new(Fetch::Idle);
 
-const NO_ACCOUNT: &str = "The transcription models come from your account's settings \
-     repository. Set up an account in Settings \u{2192} Account to fetch them.";
+const NO_ACCOUNT: &str = "The transcription models come from your organisation's agents \
+     server. Pair this device with it in Settings \u{2192} Agents & voice to fetch them.";
 
 const MODELS_UPDATING: &str = "The transcription models on this Mac are not the ones your \
-     account holds now; keeper brings them up to date after the next sync.";
+     organisation publishes now; keeper brings them up to date at the next fetch.";
 
 fn models_vm(data_dir: &Path) -> ModelsStateVm {
     let root = models_root(data_dir);
@@ -485,17 +492,28 @@ fn models_vm(data_dir: &Path) -> ModelsStateVm {
                 state: ModelsState::Failed,
                 sentence,
                 missing: Vec::new(),
+                version: None,
             }
         }
     };
+    let active = crate::org_models::active();
     let current = missing.is_empty()
-        && crate::account_ipc::models_current(data_dir, &root, &transcription_group(data_dir));
-    models_state(
+        && crate::org_models::models_current(
+            active.as_ref(),
+            &root,
+            &transcription_group(data_dir, active.as_ref()),
+        );
+    let mut vm = models_state(
         missing,
         current,
         lock(&FETCH).clone(),
-        crate::account_ipc::descriptor().is_some(),
-    )
+        crate::org_models::has_server(),
+    );
+    if vm.state == ModelsState::Ready {
+        vm.version =
+            keeper_settings::models::ready_version(&root, model_files::TRANSCRIPTION_GROUP);
+    }
+    vm
 }
 
 /// Readiness first: a set that is all here and current is Ready even while
@@ -526,6 +544,7 @@ fn models_state(missing: Vec<String>, current: bool, fetch: Fetch, account: bool
         state,
         sentence,
         missing,
+        version: None,
     }
 }
 
@@ -561,7 +580,9 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
             announce_turn_models().await;
         }
         let dest = models_root(&data_dir);
-        let (clone, repo) = crate::account_ipc::clone_models(&data_dir);
+        let active = crate::org_models::active();
+        let paths = crate::org_models::set_paths(active.as_ref());
+        let repo = crate::org_models::repo_set(active.as_ref());
         let (vad, smart_turn) = registry::get_turn_models(&data_dir).unwrap_or_else(|error| {
             tracing::warn!(%error, "models: the turn model picks could not be read");
             Default::default()
@@ -571,11 +592,9 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
         // written only once every group is done.
         let mut transcription = None;
         let groups =
-            model_files::fetch_groups(transcribes, takes_turns, &clone, &repo, &vad, &smart_turn);
+            model_files::fetch_groups(transcribes, takes_turns, &paths, &repo, &vad, &smart_turn);
         for group in groups {
-            let outcome =
-                crate::account_ipc::hydrate_models(Arc::clone(&platform), dest.clone(), &group)
-                    .await;
+            let outcome = crate::org_models::hydrate_models(dest.clone(), &group).await;
             let next = match outcome {
                 Ok(report) => {
                     tracing::info!(
@@ -588,8 +607,8 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
                     );
                     Fetch::Idle
                 }
-                Err(crate::account_ipc::ModelsFetchError::NoAccount) => Fetch::NoAccount,
-                Err(crate::account_ipc::ModelsFetchError::Failed(sentence)) => {
+                Err(crate::org_models::ModelsFetchError::NoServer) => Fetch::NoAccount,
+                Err(crate::org_models::ModelsFetchError::Failed(sentence)) => {
                     tracing::warn!(group = group.name, %sentence, "models: could not be fetched");
                     Fetch::Failed(sentence)
                 }
@@ -1376,7 +1395,7 @@ pub async fn transcription_models_fetch(
     if let Err(reason) = availability() {
         return Err(unsupported(reason));
     }
-    if crate::account_ipc::descriptor().is_none() {
+    if !crate::org_models::has_server() {
         *lock(&FETCH) = Fetch::NoAccount;
     } else {
         spawn_models_fetch(Arc::clone(&state.platform));
