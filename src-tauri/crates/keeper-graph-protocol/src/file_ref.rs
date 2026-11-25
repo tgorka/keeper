@@ -313,8 +313,7 @@ pub fn admit(
     {
         return Err(Refusal::InvalidChange);
     }
-    if !collection
-        && entry_text(node).is_some_and(|t| t.starts_with(PREFIX) && parse(t).is_none())
+    if !collection && entry_text(node).is_some_and(|t| t.starts_with(PREFIX) && parse(t).is_none())
     {
         return Err(Refusal::InvalidChange);
     }
