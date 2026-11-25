@@ -7,13 +7,16 @@
 //! the same order with the same calls.
 //!
 //! The order at start:
-//! 1. [`take_lock`] before anything opens the data directory: the lock is
-//!    the data directory's, held for the whole run whether the socket is on
-//!    or off. While another process holds it, ask again for up to ten
-//!    seconds; then open no data, name the holder, and offer to try again.
-//!    When the lock cannot be asked for here, open the data, leave the
-//!    socket off and log one WARN.
-//! 2. The rest of `setup` opens the data.
+//! 1. [`take_lock`] in `run()`, before the app state, the plugins and the
+//!    config windows exist: the lock is the data directory's, held for the
+//!    whole run whether the socket is on or off. While another process holds
+//!    it, ask again for up to ten seconds; then [`run_refused`] runs a keeper
+//!    with no window, no webview and no app state (Tauri starts the config
+//!    windows' webviews before `setup`, so a refusal inside `setup` would
+//!    already have served their IPC), which names the holder and offers to
+//!    try again. When the lock cannot be asked for here, open the data,
+//!    leave the socket off and log one WARN ([`announce`]).
+//! 2. The app is built and its `setup` opens the data.
 //! 3. [`start`]: serve `<data dir>/wire/wire.sock` while `wire.enabled` is on
 //!    (a debug build also with `KEEPER_WIRE_DEBUG_ON=1`), and stop within a
 //!    second of it going off. At each switch-on the runtime is composed with
@@ -27,13 +30,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use keeper_app_api::DomainVm;
+use keeper_core::platform::Platform as _;
 use keeper_graph::module::{DomainBinding, GraphConfig, GraphModule};
 use keeper_runtime::{AppInfo, Runtime};
 use keeper_runtime_api::Module;
 use keeper_wire::{Dispatch, Limits};
-use keeper_wire_api::{DataLock, LockError};
+use keeper_wire_api::{Admission, DataLock};
 use sha2::{Digest as _, Sha256};
-use tauri::Manager as _;
 use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons};
 
 /// How long the app asks again while another process holds the lock.
@@ -45,81 +48,77 @@ const SNAPSHOT: &[u8] = include_bytes!("../../../../catalogue/snapshot.json");
 /// The lock, kept for the whole run.
 static LOCK: OnceLock<Arc<DataLock>> = OnceLock::new();
 
-/// What [`take_lock`] found.
-pub(crate) enum Taken {
-    /// The lock is this process's; the socket may serve.
-    Held,
-    /// The lock cannot be asked for here: the data opens, the socket stays
-    /// off. Logged by [`Taken::announce`] once logging is up.
-    Unsupported(String),
-    /// Another process holds it, or the directory is unsafe: open no data.
-    Refused(String),
-}
+/// Why the lock could not be asked for, logged once logging is up.
+static UNSUPPORTED: OnceLock<String> = OnceLock::new();
 
-impl Taken {
-    /// Log what the lock answered, after `debug_log::init`.
-    pub(crate) fn announce(&self) {
-        if let Self::Unsupported(sentence) = self {
-            tracing::warn!(code = "lock_unsupported", "{sentence}");
-        }
-    }
-}
-
-/// Take the data directory's lock before any data is opened. A first launch
-/// creates the directory (0700). A lock file that cannot be opened is
-/// treated as a lock that cannot be asked for: the data opens and the socket
-/// stays off, so a broken lock file never keeps a person out of keeper.
-pub(crate) fn take_lock(data_dir: &Path) -> Taken {
-    use std::os::unix::fs::DirBuilderExt as _;
-    if !data_dir.exists() {
-        let _ = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(data_dir);
-    }
+/// Take the data directory's lock before anything opens the data or builds a
+/// window. `Some(sentence)`: another process holds it (or the directory is
+/// unsafe), so open nothing and show the sentence. A data directory the
+/// platform cannot name, or a lock that cannot be asked for, opens the data
+/// with the socket off, so a broken lock file never keeps a person out of
+/// keeper.
+pub(crate) fn take_lock() -> Option<String> {
+    let Ok(data_dir) = crate::ipc::DesktopPlatform.data_dir() else {
+        return None;
+    };
     let holder = format!("keeper (the app), pid {}", std::process::id());
-    match DataLock::acquire_waiting(data_dir, &holder, LOCK_WAIT) {
-        Ok(lock) => {
+    match keeper_wire_api::admit(&data_dir, &holder, LOCK_WAIT) {
+        Admission::Held(lock) => {
             let _ = LOCK.set(Arc::new(lock));
-            Taken::Held
+            None
         }
-        Err(error @ (LockError::Unsupported { .. } | LockError::Io { .. })) => {
-            Taken::Unsupported(error.to_string())
+        Admission::Unsupported(sentence) => {
+            let _ = UNSUPPORTED.set(sentence);
+            None
         }
-        Err(error @ (LockError::Held { .. } | LockError::Unsafe(_))) => {
-            Taken::Refused(error.to_string())
-        }
+        Admission::Refused(sentence) => Some(sentence),
     }
 }
 
-/// The lock is held elsewhere (or the directory is unsafe): hide the
-/// windows, say so, and offer to try again (a restart asks for the lock
-/// afresh) or to quit. Nothing under the data directory was opened.
-pub(crate) fn refuse(app: &tauri::App, sentence: String) {
-    for window in app.webview_windows().values() {
-        let _ = window.hide();
+/// Log what the lock answered, after `debug_log::init`.
+pub(crate) fn announce() {
+    if let Some(sentence) = UNSUPPORTED.get() {
+        tracing::warn!(code = "lock_unsupported", "{sentence}");
     }
-    tracing::error!(%sentence, "keeper did not open its data");
-    let handle = app.handle().clone();
-    // Off the main thread: the dialog's answer arrives once the event loop runs.
-    std::thread::spawn(move || {
-        let again = handle
-            .dialog()
-            .message(format!(
-                "{sentence}\n\nQuit the other keeper, then try again."
-            ))
-            .title("keeper is already open")
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Try again".to_owned(),
-                "Quit".to_owned(),
-            ))
-            .blocking_show();
-        if again {
-            handle.restart();
-        } else {
-            handle.exit(0);
-        }
-    });
+}
+
+/// The lock is held elsewhere (or the directory is unsafe): run a keeper
+/// that opens nothing — no config window, so no webview and no IPC, no app
+/// state, none of the data's plugins — says so, and offers to try again (a
+/// restart asks for the lock afresh) or to quit.
+pub(crate) fn run_refused(mut context: tauri::Context<tauri::Wry>, sentence: String) {
+    context.config_mut().app.windows.clear();
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            // Off the main thread: the dialog's answer arrives once the event
+            // loop runs.
+            std::thread::spawn(move || {
+                let again = handle
+                    .dialog()
+                    .message(format!(
+                        "{sentence}\n\nQuit the other keeper, then try again."
+                    ))
+                    .title("keeper is already open")
+                    .buttons(MessageDialogButtons::OkCancelCustom(
+                        "Try again".to_owned(),
+                        "Quit".to_owned(),
+                    ))
+                    .blocking_show();
+                if again {
+                    handle.restart();
+                } else {
+                    handle.exit(0);
+                }
+            });
+            Ok(())
+        })
+        .build(context);
+    match app {
+        Ok(app) => app.run(|_, _| {}),
+        Err(error) => tracing::error!(%error, "keeper could not show why it did not open"),
+    }
 }
 
 /// Whether the switch is on: `wire.enabled` from this device's settings

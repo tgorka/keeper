@@ -328,6 +328,19 @@ pub fn run() {
     if served_as_lfs_filter() {
         return;
     }
+    let context = tauri::generate_context!();
+    // The data directory's lock, before anything opens the data (story 123.3,
+    // A-2, SR-4): before `ipc::AppState::new` opens `archive.db` and the
+    // settings, and before Tauri builds the config windows, whose webviews
+    // start (and may call IPC) ahead of `setup`. Held for the whole run,
+    // whether the local socket is on or off. Held elsewhere: run a keeper with
+    // no window, no webview and no app state that only names the holder and
+    // offers to try again.
+    #[cfg(target_os = "macos")]
+    if let Some(sentence) = wire::take_lock() {
+        wire::run_refused(context, sentence);
+        return;
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -437,21 +450,6 @@ pub fn run() {
     );
     let builder = builder
         .setup(|app| {
-            // The data directory's lock, before anything opens the data
-            // (story 123.3, A-2, SR-4): held for the whole run, whether the
-            // local socket is on or off. Held elsewhere: open nothing, name
-            // the holder and offer to try again.
-            #[cfg(target_os = "macos")]
-            let wire_lock = match app.state::<ipc::AppState>().platform.data_dir() {
-                Ok(data_dir) => match wire::take_lock(&data_dir) {
-                    wire::Taken::Refused(sentence) => {
-                        wire::refuse(app, sentence);
-                        return Ok(());
-                    }
-                    taken => Some(taken),
-                },
-                Err(_) => None,
-            };
             telemetry_ipc::init(app);
             // The one account-layer transition (consent, then the default
             // agent; R488 × R496), before any layer is installed.
@@ -511,9 +509,7 @@ pub fn run() {
                 build_identity::announce();
                 // The lock's answer, once logging can carry its one WARN.
                 #[cfg(target_os = "macos")]
-                if let Some(taken) = &wire_lock {
-                    taken.announce();
-                }
+                wire::announce();
                 for fault in keeper_core::config::faults() {
                     // `Display`, not `summary()`: the log form keeps `toml`'s
                     // own caret diagram over the offending line, which is the
@@ -1811,7 +1807,7 @@ pub fn run() {
         }
     });
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
     // The notification delegate and the token's hooks, before UIKit starts:
     // an action that launches keeper in the background runs no `setup()`

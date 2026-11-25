@@ -167,5 +167,45 @@ impl DataLock {
     }
 }
 
+/// What a process that opens the data directory may do, answered before it
+/// opens anything there (the app's start; story 123.3, A-2, SR-4).
+#[derive(Debug)]
+pub enum Admission {
+    /// The lock is this process's: open the data; the socket may serve.
+    Held(DataLock),
+    /// The lock cannot be asked for here: open the data, keep the socket
+    /// off, and log the sentence once.
+    Unsupported(String),
+    /// Another process holds the lock, or the directory is unsafe: open no
+    /// data, and show the sentence (it names the holder).
+    Refused(String),
+}
+
+/// Ask for the data directory's lock as the app does at its start: create a
+/// missing directory (0700), ask again for up to `wait` while another process
+/// holds the lock, then answer. A lock file that cannot be opened counts as
+/// a lock that cannot be asked for, so a broken lock file never keeps a
+/// person out of their data.
+#[must_use]
+pub fn admit(data_dir: &Path, holder: &str, wait: std::time::Duration) -> Admission {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    if !data_dir.exists() {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data_dir);
+    }
+    match DataLock::acquire_waiting(data_dir, holder, wait) {
+        Ok(lock) => Admission::Held(lock),
+        Err(error @ (LockError::Unsupported { .. } | LockError::Io { .. })) => {
+            Admission::Unsupported(error.to_string())
+        }
+        Err(error @ (LockError::Held { .. } | LockError::Unsafe(_))) => {
+            Admission::Refused(error.to_string())
+        }
+    }
+}
+
 /// How often [`DataLock::acquire_waiting`] asks again.
 pub const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(200);

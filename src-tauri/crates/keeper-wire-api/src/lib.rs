@@ -23,7 +23,7 @@ pub mod schema;
 
 pub use error::sentence;
 pub use frame::*;
-pub use lock::{DataLock, LockError};
+pub use lock::{admit, Admission, DataLock, LockError};
 pub use place::{socket_path, PlaceError};
 
 /// Whether `id` is a ULID in its canonical spelling: 26 characters of
