@@ -5,6 +5,7 @@
   "keeper-app-api": "contract",
   "keeper-agent": "legacy",
   "keeper-cli": "composition-root",
+  "keeper-files-api": "contract",
   "keeper-core": "legacy",
   "keeper-graph": "implementation",
   "keeper-graph-api": "contract",

@@ -4838,6 +4838,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-files-api"
+version = "0.12.0"
+dependencies = [
+ "keeper-accounts-api",
+ "keeper-paths",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "keeper-graph"
 version = "0.12.0"
 dependencies = [
@@ -4936,6 +4947,7 @@ name = "keeper-paths"
 version = "0.12.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tempfile",
  "unicase",
  "unicode-normalization",

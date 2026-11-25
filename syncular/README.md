@@ -24,6 +24,8 @@ keeper ships no server URL).
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
 | `object-layout.vectors.json` | the file object-store contract's shared vectors (*Objects in parts*): file and staging prefixes, content and staging keys, refused content ids, encoded user metadata, and part-size limits; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-ports`) |
 | `graph-capacity.vectors.json` | the knowledge graph's domain-capacity vectors (*Domain capacity*): event frames with their line lengths and SHA-256 digests, and histories with each step's cumulative creates, review creates, removals and export bytes and the worker's and the consumer's entity counts; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and `keeper-graph` tests, the latter through the real exporter and worker) |
+| `files.vectors.json` | the drive contract's shared vectors (*The drive*): names, folds, media types, git modes, content ids, page keys, locators, default modes, roots, narrower-or-equal, event-row checks, reserved facts and end-to-end command cases, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-files-api`) |
+| `files.media-types.json` | the closed extension-to-media-type table (*The drive*, decision 9) both sides read, with `default` (`application/octet-stream`) and `extensions`; hand-written, never generated |
 
 Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -117,6 +119,16 @@ acknowledged, after it pruned that commit's result. The client journals the comm
 drops it from the outbox; keeper shows it as a refusal with that code — the commit may well have
 been applied — and does not reset the client id, although the server's error recommends
 `resetClientId`.
+
+### Schema 10 release prerequisite
+
+Schema 10 (`0010_files`, story 116.1) adds the six drive tables (`files_entries`,
+`files_entry_sources`, `files_events`, `files_event_ops`, `files_head`, `files_receipts`) and five
+scope variables (`files_drive`, `files_domain`, `files_page`, `files_client`, `files_sources`). It
+changes no existing table, column, index or scope variable; migrations `0001` through `0009` and
+their hashes are byte-identical to schema 9. A server must serve schema 10 before a keeper build
+carrying it is published; older clients keep their schema window and continue to sync against a
+server serving schema 10 alongside schema 9.
 
 ## Domains and the map
 
@@ -242,6 +254,11 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `kg_history` | the name of the database (its graph's domain) | as `kg_graph` | as `kg_graph` | `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` (the ledger; schema 9; through schema 8 these were under `kg_graph`) |
 | `kg_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `kg_receipts` |
 | `kg_proposal` | a proposer's actor id | itself | itself | `kg_proposals` |
+| `files_drive` | `<domain>/<drive>` (`drive_key`) | every live drive of a domain where the person holds `reader` or above (never `'*'`, never from membership alone; a device holds a whole drive or none) | the drives of a domain covering the instance's file capability roots (and tools with a file class) | `files_entries` (schema 10) |
+| `files_domain` | the name of the database (its drive's domain) | when the person holds `reader` or above in the domain | when the instance or tool holds a file class in the domain | `files_head` (schema 10) |
+| `files_page` | `<domain>/<yyyy-mm>` (UTC month of `recorded_at_ms`) or `<domain>/import` | as `files_domain` | as `files_domain` | `files_events`, `files_event_ops` (schema 10; and `files_reviews` from 116.6) |
+| `files_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `files_receipts` (schema 10) |
+| `files_sources` | the name of the database (its drive's domain) | never, whatever the role | agent instances and tools with a file class in the domain | `files_entry_sources` (schema 10; reserved, holds no row until 120.2) |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
@@ -1071,6 +1088,275 @@ newline, the manifest line excluded; a line is
 `118 + digits(ordinal) + len(entity_type) + len(operation) + R + V`, where `R` is 4 for a null
 `after_revision` or its length plus 2, and `V` is 4 for a null `after_value` or the length of its
 canonical text. `graph-capacity.vectors.json` pins the frame lines and each history's counts.
+
+## The drive
+
+Each database holds one domain's drives as synced manifest rows (schema 10, `0010_files`). Rows are
+written only through registered `files.*` commands, never by a raw sync write, and nothing is ever
+physically deleted. The contract names no server, database or bucket; a server serving schema 9
+keeps serving older clients through the schema window (116.2 proves it). `files.vectors.json` and
+`files.media-types.json` pin every shared rule, and `keeper-files-api` is keeper's implementation.
+
+**Tables.** Every files table uses `id` as its single primary-key column. Entry, event, request and
+change-set ids are ULIDs (`^[0-7][0-9A-HJKMNP-TV-Z]{25}$`); entry `revision` and event `seq` are
+server-assigned decimal strings starting at `"1"` on create and incremented by 1 on each accepted
+change that touches the row. No table has a `path` column: an entry sits in its parent `dir` by
+`parent_id`, `name` and stored `name_fold`, and a drive's root is a `dir` row whose `parent_id` is
+its own `id`.
+
+- `files_entries` (`files_drive` on `drive_key` = `<domain>/<drive>`): `id`, `domain`, `drive_key`,
+  `parent_id`, `name`, `name_fold`, `kind` (`file` | `dir`), `content_id` (plain text
+  `sha256:<64 lowercase hex>`, null for `dir`), `size` (null for `dir`), `media_type` (null for
+  `dir`), `mtime_ms` (null for `dir`), `mode` (`normal` | `executable`), `revision`, `lifecycle`
+  (`live` | `deleted`), `created_event_id`, `updated_event_id`, `updated_seq`, `author_actor`,
+  `author_client`.
+- `files_entry_sources` (`files_sources` on `domain`; reserved, holds no row until 120.2): `id`,
+  `domain`, `revision`, `sources` (JSON), `author_actor`, `author_client`.
+- `files_events` (`files_page` on `page_key` = `<domain>/<yyyy-mm>` or `<domain>/import`): `id`,
+  `domain`, `seq`, `page_key`, `descriptor`, `request_id`, `request_digest`, `actor_id`,
+  `client_id`, `origin_class`, `origin_actor`, `origin_chain`, `context_id`, `approval_id`,
+  `approval_basis`, `proposal_id`, `change_set_id`, `job_id`, `job_ordinal`, `job_attempt_id`,
+  `reverses_event_id`, `event_time_ms`, `recorded_at_ms`, `op_count`, `delta_digest`,
+  `author_actor`, `author_client`.
+- `files_event_ops` (`files_page` on `page_key`): `id` (`<event_id>/<ordinal>`), `domain`,
+  `event_id` (references `files_events(id)`), `ordinal`, `page_key`, `entity_type` (`entry` |
+  `review`), `entity_id`, `operation` (`create` | `replace` | `move` | `delete` | `restore` for
+  entries; `create` for reviews), `before_revision`, `after_revision`, `before_value`,
+  `after_value`, `before_content_id`, `after_content_id`, `author_actor`, `author_client`.
+- `files_head` (`files_domain` on `domain`): one row per domain, `id` = `domain`, `seq`, `event_id`
+  (no declared reference, since events sit under `files_page`), `digest` (newest event's
+  `delta_digest`), `drives` (`[{"name","root_id"}]` sorted by `name`), `author_actor`,
+  `author_client`.
+- `files_receipts` (`files_client` on `client_scope`): `id`
+  (`<descriptor>/<request_id>/<client_scope>`), `client_scope`, `descriptor`, `request_id`,
+  `request_digest`, `outcome`, `reason`, `event_id`, `seq`, `detail`, `recorded_at_ms`,
+  `author_actor`, `author_client`.
+
+**Scopes and grants.** A person is granted `files_drive`, `files_domain` and `files_page` only when
+holding `reader` or above in the domain — never `'*'`, never from domain membership alone. A
+credential with no role or file class in the domain is granted none of these rows. `files_sources`
+is never allowed to a person, whatever the role; only agent instances and tools holding a file class
+in the domain may be granted it. `drive_key` is the finest scope key, so a device holds a whole
+drive or none; deeper folder roots are enforced on commands, never by scopes. `files_client` is each
+caller's own `(actor, client)`.
+
+**Requests.** Every `files.*` command's `params` is the closed envelope
+`{"version": 1, "request_id": <ULID>, "context_id": <ULID> | null, "approval_id"?: <ULID> | null, "job"?: {"job_id", "ordinal", "attempt_id"} | null, "payload": {…}}`.
+`request_digest` is the lowercase hex SHA-256 of RFC 8785 canonical JSON of
+`{"version", "descriptor", "context_id", "approval_id", "job", "payload"}`. `delta_digest` is the
+lowercase hex SHA-256 of canonical JSON of the event's ordered operations array. Every `files.*`
+command runs with lock mode `shared`.
+
+- `files.change`: `{"operations": [op…], "change_set_id"?: <ULID> | null, "event_time_ms"?: <int> | null}`
+  (at least one operation; mixed kinds `create`, `replace`, `move`, `delete`, `restore`; one entity
+  at most once per change).
+- `files.put` (file `create` or `replace`), `files.move`, `files.delete`, `files.restore`:
+  `{"operation": op, "change_set_id"?: <ULID> | null}` — one-operation shorthands of `files.change`.
+- `files.import`: `{"operations": [op…], "change_set_id": <ULID>, "event_time_ms": <int>}` (both
+  required), each operation carrying `provenance: {"drive", "commit", "path"}` and `git_mode`
+  instead of `mode` on file creates/replaces, with no `mtime_ms`.
+- `files.reverse`: `{"event_id": <ULID>}` (implemented in 116.3; rules and inverse shape fixed here).
+- Story 116.6 adds `files.propose`, `files.decide` and `files.acknowledge`.
+
+**Outcomes.** `files_receipts.outcome` is `accepted`, `proposed` (from 116.6, `detail` carrying
+proposal id, revision and digest), `conflict` or `rejected`. Receipts work as KG1's: a `request_id`
+once bound to a `request_digest` returns its earlier outcome on replay and refuses a different
+digest with `idempotency_mismatch`. Every accepted command writes its entry mutations, one
+`files_events` row, its `files_event_ops` rows, the updated `files_head` and its `files_receipts`
+row in one commit; a refused command mutates no manifest row and writes only a receipt.
+
+**Evaluation order.** The first failing step decides:
+
+1. `version` ≠ 1 → `unsupported_version`.
+2. `request_id` bound to another digest → `idempotency_mismatch`; same digest → earlier outcome.
+3. Reserved envelope fields: non-null `approval_id` or `job` → `reserved_field`; non-null
+   `context_id` from person, tool or import → `reserved_field`; null `context_id` from agent →
+   `forbidden`.
+4. Command dispatch: `files.import` from anyone but the import identity, or import sending anything
+   else → `forbidden`; unknown descriptor → `invalid_change`.
+5. Grant read (rooted callers): unknown mode → `unknown_mode`; unknown class → `invalid_change`.
+6. Payload parse and shape → `invalid_change`; any `sources` member → `reserved_field`; invalid
+   entry or drive name → `invalid_name`.
+7. Authority: person `reader` → `forbidden`; drive create by non-owner or rooted caller →
+   `forbidden` (import may create a drive only as operation 0 of `files.import`); drive name folding
+   to `.keeper-logs` → `reserved_name` for every sender; rooted caller touching any location outside
+   its covering `write` (or `reverse_own` for own-event reversal) roots → `outside_roots`; strictest
+   mode `propose` → `propose_required`.
+8. Per-operation preconditions in order: create of an existing id → `conflict` (`absent`); missing
+   entry or wrong revision → `conflict` (`revision`); wrong lifecycle → `conflict` (`lifecycle`);
+   replace of a `dir` or move of a drive root → `invalid_change`; absent, deleted or non-`dir`
+   parent → `parent_invalid`.
+9. Final state: moving a `dir` into itself or a descendant → `move_into_self`; live touched entry
+   without a live `dir` parent → `parent_invalid`; duplicate `name_fold` among live siblings or live
+   drives → `conflict` (`name`); deleted `dir` (root included) with a live child → `not_empty`;
+   named `content_id` absent from the domain's key space (or unreadable to a rooted caller) →
+   `content_absent`; charged operations > 128 → `change_limit`.
+10. Accept: assign `seq = head + 1`, write event, ops, row revisions, updated head and receipt.
+
+**Refusal codes (closed).**
+
+- `unsupported_version`: envelope `version` is not `1`.
+- `idempotency_mismatch`: `request_id` was already bound to a different `request_digest`.
+- `invalid_change`: malformed payload/operation, unknown descriptor/class, duplicate entity, or
+  illegal op (such as replacing a `dir`, moving a drive root, `executable` dir, or bad `git_mode`).
+- `invalid_name`: name is not a single `keeper-paths` segment, contains NUL, or exceeds 255 UTF-8
+  bytes.
+- `reserved_name`: drive name folds to `.keeper-logs`.
+- `reserved_field`: a reserved field (`approval_id`, `job`, `context_id` from non-agent, any
+  `sources` member, or non-null `approval_id`/`origin_chain`/`context_id` on a `release` event).
+- `forbidden`: caller lacks role/identity authority (reader write, non-owner drive create, non-import
+  `files.import`, or agent with null `context_id`).
+- `outside_roots`: rooted caller touches an entry or parent outside its covering `write` (or
+  `reverse_own`) roots, or tries to reverse another actor's event.
+- `propose_required`: strictest covering mode for a rooted caller's write or reversal is `propose`.
+- `unknown_mode`: caller's grant carries a mode outside `ask`, `propose`, `apply`.
+- `conflict`: precondition failure (`absent`, `revision`, `lifecycle` or sibling/drive `name`).
+- `parent_invalid`: named parent does not exist, is `deleted`, or is not a `dir`.
+- `move_into_self`: a `dir` is moved into itself or one of its descendants.
+- `not_empty`: a `delete` targets a `dir` (including a drive root) that still has a live child.
+- `content_absent`: a create or replace names a `content_id` not present in the domain's file key
+  space (or not readable/uploaded by a rooted caller).
+- `change_limit`: charged operations exceed 128.
+
+**Operation bound and arithmetic.** One change may carry at most 128 charged operations. Every
+ordinary operation charges 1; a cross-drive `move` charges 2 per row it carries (the entry and every
+descendant row, any lifecycle) and is refused whole with `change_limit` above 128. The `review`
+operation on a reversal or acknowledgement counts outside the bound, so a 128-operation change can
+be reversed whole. At this bound, a first import of 157,516 entries requires at least
+⌈157,516 / 128⌉ = 1,231 changes/events and 157,516 operation rows, all under page key
+`<domain>/import`; a within-drive move of a folder holding 38,178 entries is 1 operation (one row
+updated; descendants are not rewritten).
+
+**`files.freshness` and server-only tables.** `files.freshness` is a read-only query with params
+`{"version": 1, "domain": <domain>}` returning
+`{"last_commit_time_ms": <int> | null, "last_run": {"started_at_ms": <int>, "ended_at_ms": <int> | null, "result": "running" | "ok" | "failed"} | null}`,
+answered from 118.4's server-only record. The server keeps `files_request_bindings`,
+`files_event_sources`, `files_upload_grants`, `files_objects` and `files_unreviewed` server-only
+(never synced); 120.2 adds server-only `files_releases` and `files_release_origins`, read only
+through `files.releases` per caller.
+
+**Decisions 1–18.** Each design choice fixed by story 116.1 is pinned in `files.vectors.json`:
+
+1. **Entry id and locator.** An entry's `id` is a ULID stable across renames and moves. Its
+   `internal` locator text (named by a graph `Resource`, 116.5) is `files:<domain>/<entry_id>`.
+   Vectors: `locators: locator-tg-entry`, `cases: move-dir-38178-within-drive`.
+2. **Content id.** Plain text `sha256:<64 lowercase hex>` of the whole content, equal to the git
+   LFS oid and Syncular blob id form, including the empty file
+   (`sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`) and files of any
+   size, never a store's multipart checksum. It is a plain-text column, never a `blob_ref`, so
+   writes never enter Syncular's conversation blob space. Vectors: `content_ids: content-id-empty-valid`, `content_ids: content-id-uppercase-invalid`, `cases: code-content-absent`.
+3. **Capability classes, roots and modes.** Rooted callers hold classes `read`, `write` and
+   `reverse_own` in a closed list of `{roots, classes, mode}` items (114.6's `FileItem`); there is
+   no domain-wide flag — reach over a drive is its root entry id in `roots`. A root is a live `dir`
+   id matched by walking `parent_id` (so it follows renames and moves); an empty `roots` list covers
+   nothing. Modes are `ask` > `propose` > `apply` (strictest wins over touched locations); defaults
+   are `apply` for tools and jobs, `ask` for agent instances; the mode comes from the grant, never
+   the request (unknown mode → `unknown_mode`). `propose` refuses direct writes and reversals with
+   `propose_required`; reversal lands by the `write` class's mode while `reverse_own` gates whose
+   effects may be reversed. `narrower_or_equal` requires the same domain and, for every given item,
+   a held item whose roots contain all given roots, classes ⊆, and mode no less strict. No grant
+   hand-over is built here (120.2 adds delegated contexts). Vectors: `default_modes: default-mode-agent`, `modes: mode-auto-unknown`, `inside: inside-xf-in-x-after-rename`, `inside: inside-nxf-in-x-after-recreate`, `narrower: narrower-looser-mode-apply`, `cases: roots-agent-apply-sh`, `cases: roots-agent-mixed-apply-and-propose`, `cases: roots-agent-empty-roots`, `cases: roots-agent-reverse-own`.
+4. **Retained versions (option (c)).** `before_content_id` and `after_content_id` on
+   `files_event_ops`, together with `content_id` on every `files_entries` row whatever its lifecycle
+   (and 116.6's `open` proposals), form the files sweep's keep-set. A version stays reversible for
+   as long as its event exists — forever, with no history purge (as KG1). The bucket therefore holds
+   every distinct content ever named, at the cost of the sum of their sizes, deleting only
+   unreferenced uploads after grace. Vectors: `cases: replace-then-reverse-earlier-bytes`, `cases: move-dir-38178-reversed`.
+5. **Tree and directory moves.** Entries store `parent_id`, `name` and `name_fold` under scope
+   `drive_key` (`<domain>/<drive>`), with no `path` column. A within-drive move updates one row
+   without touching descendants' revisions; a cross-drive move charges 2 per carried row (any
+   lifecycle) and is refused whole above 128 with `change_limit`. A drive is created by one `create`
+   (`kind: "dir"`, `parent_id: null`, stored `parent_id = id`, `drive_key = <domain>/<name>`) by an
+   owner, the admin path, or import op 0; `.keeper-logs` is refused `reserved_name`. A root is
+   excluded from its own listing and children's fold lookup; deleting a non-empty root is refused
+   `not_empty`, and deleting an empty root removes it from `files_head.drives` while keeping the
+   deleted row. Vectors: `cases: move-dir-38178-within-drive`, `cases: move-dir-38178-across-drives`, `cases: move-small-across-drives`, `cases: drive-create-owner`, `cases: drive-delete-empty`, `cases: drive-import-op0-accepted`.
+6. **Deleting a non-empty directory.** Refused with `not_empty` — there is no silent cascade. The
+   caller deletes the children in the same change (or an earlier one). Vectors: `cases: drive-delete-non-empty`.
+7. **Imported file `mtime_ms`.** An imported file's `mtime_ms` is its import event's `event_time_ms`
+   (the git commit time); a person's `create`/`replace` may carry its local `mtime_ms` or null; a
+   `dir` always has null `mtime_ms`. Vectors: `cases: import-mixed-ops`.
+8. **Event replication and paging.** Which event pages a device holds is deferred by name to 119.5.
+   Decided now: every `files.import` event and its operations sit under page key `<domain>/import`
+   (never a calendar month), read on demand through `files.history`, and `files_reviews` (116.6) is
+   scoped by its event's `page_key` rather than with `files_head`. Vectors: `page_keys: page-key-import`, `cases: import-mixed-ops`.
+9. **Media type (option (b)).** Derived by the server from the entry name's extension alone via
+   `files.media-types.json` (`default: "application/octet-stream"`), using the ASCII-lowercased text
+   after the last `.` when that `.` is not the first character (`dir` is null), and recomputed on
+   every rename. Stored types are labels: served responses remain clamped as `served_mime` clamps
+   attachments, so no stored type makes a file run as a page. Vectors: `media_types: media-img-heic-upper`, `renames: rename-md-to-pdf`, `cases: media-types-and-rename-recompute`.
+10. **File `mode`.** Takes `normal` or `executable`. `create` defaults to `normal`; `replace`
+    keeps the existing mode unless given; `move` keeps it; a `dir` is always `normal` (`executable`
+    → `invalid_change`). `files.import` maps git `100644` → `normal` and `100755` → `executable`
+    (anything else → `invalid_change`). Story 118.3 compares `mode`; it never makes a webview run a
+    file. Vectors: `git_modes: git-mode-executable`, `git_modes: git-mode-symlink-refused`, `cases: mode-create-and-rename-preserve`.
+11. **`files.import` shape.** Accepts `operations` (`create` dir/file, `replace`, `move`, `delete`),
+    each carrying `provenance: {"drive", "commit", "path"}` (kept in server-only records; refused
+    on other commands) and `git_mode` on file creates/replaces (no `mtime_ms`). Writes `descriptor:
+    "files.import"`, `origin_class: "import"`, `approval_basis: {"basis": "import"}`, page key
+    `<domain>/import`, required `event_time_ms` and `change_set_id` (shared across a run), under the
+    same 128-op bound. Sent only by the import identity; its operation 0 may create its drive.
+    Vectors: `cases: import-mixed-ops`, `cases: import-from-person-forbidden`, `cases: drive-import-op1-forbidden`.
+12. **Reserved fields, sources and Syncular 0.97.0 confirmation.** Envelope `approval_id` and `job`
+    are reserved and refused `reserved_field` when set; `context_id` is refused `reserved_field`
+    from person, tool or import and required from an agent instance (null → `forbidden`).
+    `files_entry_sources` and server-only `files_event_sources` are reserved and empty, and any
+    `sources` member is refused `reserved_field`. A release (120.2) covers drive sources only and
+    keeps its record server-side (`files_releases`, `files_release_origins` via `files.releases`).
+    Re-read at `@syncular/server` 0.97.0 (115.6's release): rows reach a client only through
+    `requested ∩ allowed` per unit and the host's `resolveScopes` (`dist/scopes.d.ts:2,23`;
+    `dist/admin.d.ts:223-260` `scope-denied`), scope columns change only via `rescope`
+    (`dist/push.js:215-231`), there are no trusted prefix or range scans (`README.md:418`), and
+    `schemaWindow` (`dist/context.d.ts:121`) serves older schemas — so a person is never allowed
+    `files_sources` and its rows never reach a person's device (116.2 acceptance 16 proves it).
+    Vectors: `cases: reserved-person-context-id`, `cases: reserved-approval-id`, `cases: reserved-job-ref`, `cases: reserved-op-sources`, `cases: roots-agent-null-context`.
+13. **Acceptance metadata and list receipts.** `approval_basis.basis` is `direct`, `approval`,
+    `proposal`, `grant`, `release` (whose synced event row carries null `approval_id`,
+    `origin_chain` and `context_id`; any set is `reserved_field`) or `import`. `origin_class` is
+    `human`, `agent`, `tool`, `import` or `job`. Frozen columns include `origin_actor`,
+    `origin_chain`, `context_id`, `approval_id`, `proposal_id`, `job_id`, `job_ordinal` and
+    `job_attempt_id` (job columns all null unless `origin_class` is `job`). `files_event_ops` uses
+    `entity_type` `entry` | `review`, with the review op outside the 128-op bound. For 116.6's
+    multi-item `files.decide` and `files.acknowledge` (list receipt, H-13), the server writes one
+    `accepted` receipt with null `event_id`/`seq` and an ordered per-item result array in `detail`,
+    atomic as a commit and per-item in effect. Vectors: `event_rows: event-basis-direct` … `event-basis-import`, `event_rows: event-origin-job`, `event_rows: event-acknowledge-review`, `event_rows: event-release-with-origin-chain`, `cases: change-at-bound-reversed`.
+14. **Names.** English ASCII lower snake case; `id` primary key on every files table; KG twins share
+    column names (`descriptor`, `actor_id`, `client_id`, `origin_class`, `recorded_at_ms`,
+    `entity_type`, `entity_id`, `operation`, `before_value`, `after_value`, `author_actor`,
+    `author_client`), keeping `domain` and `seq` for this module. Renames from earlier drafts:
+    `root`/`tree_key`/`files_tree` → `drive_key`/`files_drive`; `path` → `parent_id` + `name` +
+    `name_fold`; `last_event_id` → `updated_event_id`; `last_seq` → `updated_seq`;
+    `actor`/`client`/`origin`/`command`/`created_at_ms` →
+    `actor_id`/`client_id`/`origin_class`/`descriptor`/`recorded_at_ms`; `job_effect` →
+    `job_id`/`job_ordinal`/`job_attempt_id`; `entry_id`/`before`/`after` →
+    `entity_id`/`before_value`/`after_value`. Vectors: `event_rows: event-unknown-origin-class`, `cases: code-unsupported-version`, `cases: code-idempotency-mismatch` (every refusal code has a vector: `keeper-files-api` test `every_refusal_code_has_a_vector`).
+15. **Changed fields in `files_event_ops`.** `before_value` and `after_value` record changed fields
+    only: `create` sets before `null` and after the full row (`kind`, `drive_key`, `parent_id`,
+    `name`, `name_fold`, `content_id`, `size`, `media_type`, `mtime_ms`, `mode`, `lifecycle`);
+    `replace` records `content_id`, `size`, `mtime_ms` always and `mode` if changed; `move` records
+    `parent_id`, `name`, `name_fold` always, `media_type` if changed, and `drive_key` if changed
+    (carried cross-drive descendant ops record `drive_key` only); `delete` and `restore` record
+    `lifecycle`. `before_content_id` and `after_content_id` hold the file's content id before and
+    after (both set on move/delete/restore of a file; null for dirs). Vectors: `cases: tree-rename-same-media`, `cases: mixed-change-and-reverse`.
+16. **Parent row, directory nulls and re-creating a deleted name.** A child change never writes its
+    parent's row. A `dir` has null `content_id`, `size`, `media_type` and `mtime_ms` and no derived
+    totals. The fold lookup filters by `lifecycle = 'live'`, so a deleted entry does not hold its
+    name. Re-creating a deleted name creates a **new** entry beside the deleted row, which stays
+    `deleted`; restoring that deleted row later while the name is taken is refused `conflict` with
+    precondition `name`. Vectors: `cases: tree-two-creates-parent-unchanged`, `cases: tree-create-beside-deleted`, `cases: tree-list-path-and-dir-fields`.
+17. **One change command and change sets.** `files.change {operations: […]}` carries mixed operation
+    kinds in one atomic event; `files.put`, `files.move`, `files.delete` and `files.restore` are
+    one-operation shorthands. Callers may attach a ULID `change_set_id` to group related changes and
+    proposals while each change remains atomic on its own. Vectors: `cases: mixed-change-and-reverse`, `cases: mixed-change-stale-revision-atomic`, `cases: mixed-change-set-id-grouping`.
+18. **Reserved `files_facts` table.** Reserved here, not created until 122.6's contract rung: keyed
+    by `(content_id, extractor, extractor_version)` with primary key `id` =
+    `<content_id>/<extractor>/<extractor_version>`, columns `domain`, `media_type`, `facts` (bounded
+    JSON), `extracted_at_ms` and `job_id`. Its scope variable `files_facts` is granted to people at
+    `reader` or above and to the extraction kind's own tool identity only (no agent instance or
+    other tool), and rows are written only by a command, never a raw sync write. The row carries no
+    trust mark (untrusted-path labelling is applied on read, never stored — one row serves both
+    trusted and untrusted paths). Extraction is modular (J-4): adding an extractor, media type or
+    key is a new version of the extractors' data file, never a migration. Vectors: `facts_reserved: facts-reserved-shared-content-two-paths`.
 
 ## Objects in parts
 

@@ -254,8 +254,8 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = keeper_replica::schema().expect("schema");
-    // The contract's head is 9; the graph tables' own DDL is still 8's.
-    assert_eq!(ir["schemaVersion"], 9);
+    // The contract's head is 10 (116.1's files tables); the graph tables' own DDL is still 8's.
+    assert_eq!(ir["schemaVersion"], 10);
     assert_eq!(SCHEMA_VERSION, 8);
     let tables = ir["tables"].as_array().expect("tables");
     let scopes = |name: &str| -> Vec<(String, String)> {

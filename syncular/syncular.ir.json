@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 9,
+  "schemaVersion": 10,
   "schemaVersions": [
     {
       "version": 1,
@@ -54,6 +54,12 @@
       "version": 9,
       "migrations": [
         "0009_knowledge_graph_history"
+      ]
+    },
+    {
+      "version": 10,
+      "migrations": [
+        "0010_files"
       ]
     }
   ],
@@ -2722,6 +2728,670 @@
         }
       ],
       "extensions": {}
+    },
+    {
+      "name": "files_entries",
+      "generation": "8f31be3cccc877a5f9c3b417091c7ecd",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "drive_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "parent_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name_fold",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "content_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "size",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "media_type",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "mtime_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "lifecycle",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_seq",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_drive:{files_drive}",
+          "variable": "files_drive",
+          "column": "drive_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_entries_parent",
+          "columns": [
+            "parent_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_entries_fold",
+          "columns": [
+            "parent_id",
+            "name_fold",
+            "lifecycle"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_entries_content",
+          "columns": [
+            "content_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_entry_sources",
+      "generation": "27dd748c46167e50f24452c5355c0463",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "sources",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_sources:{files_sources}",
+          "variable": "files_sources",
+          "column": "domain"
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_events",
+      "generation": "0f3abee45a533342f63022abb74aa6d3",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "descriptor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "origin_class",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "origin_actor",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "origin_chain",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "context_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "approval_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "approval_basis",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "proposal_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "change_set_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "job_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "job_ordinal",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "job_attempt_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "reverses_event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "event_time_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "recorded_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "op_count",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "delta_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_page:{files_page}",
+          "variable": "files_page",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_events_domain_seq",
+          "columns": [
+            "domain",
+            "seq"
+          ],
+          "unique": true
+        },
+        {
+          "name": "files_events_request",
+          "columns": [
+            "request_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_reverses",
+          "columns": [
+            "reverses_event_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_change_set",
+          "columns": [
+            "change_set_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_proposal",
+          "columns": [
+            "proposal_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_job",
+          "columns": [
+            "job_id",
+            "job_ordinal"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_actor",
+          "columns": [
+            "domain",
+            "actor_id",
+            "seq"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_events_origin",
+          "columns": [
+            "domain",
+            "origin_class",
+            "seq"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_event_ops",
+      "generation": "3c4f80784851ac53d02907208168cdf6",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "entity_type",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "entity_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "operation",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "before_revision",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "after_revision",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "before_value",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "after_value",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "before_content_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "after_content_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_page:{files_page}",
+          "variable": "files_page",
+          "column": "page_key"
+        }
+      ],
+      "references": [
+        {
+          "column": "event_id",
+          "parentTable": "files_events",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_files_event_ops_event_id_ref",
+          "columns": [
+            "event_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_event_ops_event_ordinal",
+          "columns": [
+            "event_id",
+            "ordinal"
+          ],
+          "unique": true
+        },
+        {
+          "name": "files_event_ops_entity",
+          "columns": [
+            "entity_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_head",
+      "generation": "af10ced2bf1d91073c88c2a3d3d7929b",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "drives",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_domain:{files_domain}",
+          "variable": "files_domain",
+          "column": "domain"
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_receipts",
+      "generation": "83850da3294f5cc8d3df5aa541e59acc",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_scope",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "descriptor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "outcome",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "seq",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "detail",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "recorded_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_client:{files_client}",
+          "variable": "files_client",
+          "column": "client_scope"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_receipts_request_id",
+          "columns": [
+            "request_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
     }
   ],
   "subscriptions": [
@@ -2877,6 +3547,66 @@
           "value": {
             "kind": "parameter",
             "name": "actorId"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesDrive",
+      "scopes": [
+        {
+          "variable": "files_drive",
+          "value": {
+            "kind": "parameter",
+            "name": "driveKey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesDomain",
+      "scopes": [
+        {
+          "variable": "files_domain",
+          "value": {
+            "kind": "parameter",
+            "name": "database"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesPage",
+      "scopes": [
+        {
+          "variable": "files_page",
+          "value": {
+            "kind": "parameter",
+            "name": "pageKey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesReceipts",
+      "scopes": [
+        {
+          "variable": "files_client",
+          "value": {
+            "kind": "parameter",
+            "name": "clientScope"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesSources",
+      "scopes": [
+        {
+          "variable": "files_sources",
+          "value": {
+            "kind": "parameter",
+            "name": "database"
           }
         }
       ]
