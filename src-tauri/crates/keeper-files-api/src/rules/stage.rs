@@ -22,6 +22,7 @@ pub(crate) fn stage(
     ops: &[WireOp],
     import: bool,
     event_time_ms: Option<i64>,
+    reversal: bool,
 ) -> Result<Staged, Refusal> {
     let mut work: BTreeMap<String, Entry> = BTreeMap::new();
     let mut steps: Vec<StagedOp> = Vec::with_capacity(ops.len());
@@ -29,8 +30,15 @@ pub(crate) fn stage(
     let mut m_children: Option<HashMap<&str, Vec<&str>>> = None;
 
     for op in ops {
-        let (before, carried, op_charge) =
-            apply_op(m, &mut work, &mut m_children, op, import, event_time_ms)?;
+        let (before, carried, op_charge) = apply_op(
+            m,
+            &mut work,
+            &mut m_children,
+            op,
+            import,
+            event_time_ms,
+            reversal,
+        )?;
         charged = charged.saturating_add(op_charge);
         steps.push(StagedOp {
             op: op.clone(),
@@ -40,15 +48,29 @@ pub(crate) fn stage(
     }
 
     check_move_into_self(m, &work, &steps)?;
-    check_live_parents(m, &work, &steps)?;
+    check_live_parents(m, &work, &steps, reversal)?;
     check_name_uniqueness(m, &work, &steps)?;
-    check_not_empty(m, &work, &steps)?;
+    check_not_empty(m, &work, &steps, reversal)?;
     check_contents(m, caller, ops)?;
     if charged > CHANGE_LIMIT {
         return Err(Refusal::new(Code::ChangeLimit));
     }
 
     Ok(Staged { rows: work, steps })
+}
+
+fn parent_invalid(reversal: bool, parent_id: &str) -> Refusal {
+    if reversal {
+        Refusal::with_detail(
+            Code::Conflict,
+            json!({
+                "entity_id": parent_id,
+                "precondition": "dependency",
+            }),
+        )
+    } else {
+        Refusal::new(Code::ParentInvalid)
+    }
 }
 
 fn lookup<'a>(m: &'a Manifest, work: &'a BTreeMap<String, Entry>, id: &str) -> Option<&'a Entry> {
@@ -102,6 +124,7 @@ fn apply_op<'a>(
     op: &WireOp,
     import: bool,
     event_time_ms: Option<i64>,
+    reversal: bool,
 ) -> Result<(Option<Entry>, Vec<String>, usize), Refusal> {
     match op {
         WireOp::Create {
@@ -135,10 +158,10 @@ fn apply_op<'a>(
                 }
                 Some(pid) => {
                     let Some(parent) = lookup(m, work, pid) else {
-                        return Err(Refusal::new(Code::ParentInvalid));
+                        return Err(parent_invalid(reversal, pid));
                     };
                     if parent.lifecycle != Lifecycle::Live || parent.kind != Kind::Dir {
-                        return Err(Refusal::new(Code::ParentInvalid));
+                        return Err(parent_invalid(reversal, pid));
                     }
                     (pid.clone(), parent.drive_key.clone())
                 }
@@ -233,10 +256,10 @@ fn apply_op<'a>(
                 return Err(Refusal::new(Code::InvalidChange));
             }
             let Some(parent) = lookup(m, work, parent_id) else {
-                return Err(Refusal::new(Code::ParentInvalid));
+                return Err(parent_invalid(reversal, parent_id));
             };
             if parent.lifecycle != Lifecycle::Live || parent.kind != Kind::Dir {
-                return Err(Refusal::new(Code::ParentInvalid));
+                return Err(parent_invalid(reversal, parent_id));
             }
             let new_drive_key = parent.drive_key.clone();
             let drive_changed = new_drive_key != before.drive_key;
@@ -393,6 +416,7 @@ fn check_live_parents(
     m: &Manifest,
     work: &BTreeMap<String, Entry>,
     steps: &[StagedOp],
+    reversal: bool,
 ) -> Result<(), Refusal> {
     for step in steps {
         let Some(entry) = work.get(step.op.id()) else {
@@ -402,10 +426,10 @@ fn check_live_parents(
             continue;
         }
         let Some(parent) = lookup(m, work, &entry.parent_id) else {
-            return Err(Refusal::new(Code::ParentInvalid));
+            return Err(parent_invalid(reversal, &entry.parent_id));
         };
         if parent.lifecycle != Lifecycle::Live || parent.kind != Kind::Dir {
-            return Err(Refusal::new(Code::ParentInvalid));
+            return Err(parent_invalid(reversal, &entry.parent_id));
         }
     }
     Ok(())
@@ -497,6 +521,7 @@ fn check_not_empty(
     m: &Manifest,
     work: &BTreeMap<String, Entry>,
     steps: &[StagedOp],
+    reversal: bool,
 ) -> Result<(), Refusal> {
     let mut deleted_dirs: HashSet<&str> = HashSet::new();
     for step in steps {
@@ -515,13 +540,30 @@ fn check_not_empty(
             .filter(|(id, _)| !work.contains_key(*id))
             .map(|(_, entry)| entry),
     );
+    let mut blocking_child: Option<&str> = None;
     for entry in all_entries {
         if entry.lifecycle == Lifecycle::Live
             && !entry.is_root()
             && deleted_dirs.contains(entry.parent_id.as_str())
         {
-            return Err(Refusal::new(Code::NotEmpty));
+            if !reversal {
+                return Err(Refusal::new(Code::NotEmpty));
+            }
+            let id = entry.id.as_str();
+            blocking_child = Some(match blocking_child {
+                Some(current) => current.min(id),
+                None => id,
+            });
         }
+    }
+    if let Some(child_id) = blocking_child {
+        return Err(Refusal::with_detail(
+            Code::Conflict,
+            json!({
+                "entity_id": child_id,
+                "precondition": "dependency",
+            }),
+        ));
     }
     Ok(())
 }

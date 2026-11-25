@@ -9396,6 +9396,249 @@
           }
         }
       ]
+    },
+    {
+      "id": "conflict-copy-two-clients",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000G001",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 7
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000G002",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "4",
+              "page_key": "tg/2026-11",
+              "origin_class": "human",
+              "approval_basis": {
+                "basis": "direct"
+              }
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 7,
+                "lifecycle": "live"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000G003",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 9
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000G004",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c2"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000A014",
+              "precondition": "revision"
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000G005",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000G010",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "a.sync-conflict-20261124-101500-mac-b.md",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 9
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000G006",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c2"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "5",
+              "page_key": "tg/2026-11",
+              "origin_class": "human",
+              "approval_basis": {
+                "basis": "direct"
+              }
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 7,
+                "lifecycle": "live"
+              },
+              "01K0000000000000000000G010": {
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "a.sync-conflict-20261124-101500-mac-b.md",
+                "name_fold": "a.sync-conflict-20261124-101500-mac-b.md",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 9,
+                "media_type": "text/markdown",
+                "revision": "1",
+                "lifecycle": "live"
+              }
+            },
+            "listing": {
+              "01K0000000000000000000A012": [
+                "a.md",
+                "a.sync-conflict-20261124-101500-mac-b.md",
+                "b.md",
+                "run.sh",
+                "sub"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "conflict-stale-delete-refused",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000G011",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A017",
+                "expected_revision": "1",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 15
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000G012",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "4",
+              "page_key": "tg/2026-11",
+              "origin_class": "human",
+              "approval_basis": {
+                "basis": "direct"
+              }
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 15,
+                "lifecycle": "live"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.delete",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000G013",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "delete",
+                "id": "01K0000000000000000000A017",
+                "expected_revision": "1"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000G014",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c2"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000A017",
+              "precondition": "revision"
+            }
+          }
+        }
+      ]
     }
   ],
   "inside": [
@@ -9773,6 +10016,3149 @@
         }
       ],
       "code": "unknown_mode"
+    }
+  ],
+  "inverses": [
+    {
+      "id": "inverse-create-file",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D001",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000D051",
+                  "kind": "file",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "note.md",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 50
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D101",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000D051": {
+                "revision": "1",
+                "lifecycle": "live"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D101",
+      "expect": {
+        "plan": [
+          {
+            "op": "delete",
+            "id": "01K0000000000000000000D051",
+            "expected_revision": "1"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-create-dir",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D002",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000D052",
+                  "kind": "dir",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "archive"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D102",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000D052": {
+                "revision": "1",
+                "lifecycle": "live"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D102",
+      "expect": {
+        "plan": [
+          {
+            "op": "delete",
+            "id": "01K0000000000000000000D052",
+            "expected_revision": "1"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-replace",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D003",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "2",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 120,
+                  "mtime_ms": 1795470000000
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D103",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 120
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D103",
+      "expect": {
+        "plan": [
+          {
+            "op": "replace",
+            "id": "01K0000000000000000000A014",
+            "expected_revision": "3",
+            "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "size": 100,
+            "mtime_ms": 1795400000000
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-replace-mode",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D004",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A015",
+                  "expected_revision": "1",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 64,
+                  "mode": "normal"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D104",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A015": {
+                "revision": "2",
+                "mode": "normal"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D104",
+      "expect": {
+        "plan": [
+          {
+            "op": "replace",
+            "id": "01K0000000000000000000A015",
+            "expected_revision": "2",
+            "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "size": 42,
+            "mode": "executable"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-move-rename",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D005",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "move",
+                  "id": "01K0000000000000000000A017",
+                  "expected_revision": "1",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "b-renamed.md"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D105",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "name": "b-renamed.md"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D105",
+      "expect": {
+        "plan": [
+          {
+            "op": "move",
+            "id": "01K0000000000000000000A017",
+            "expected_revision": "2",
+            "parent_id": "01K0000000000000000000A012",
+            "name": "b.md"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-move-dir-38178",
+      "fixture": "m-inbox",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D006",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "move",
+                  "id": "01K0000000000000000000B012",
+                  "expected_revision": "1",
+                  "parent_id": "01K0000000000000000000B013",
+                  "name": "00-inbox"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D106",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000B012": {
+                "parent_id": "01K0000000000000000000B013",
+                "revision": "2"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D106",
+      "expect": {
+        "plan": [
+          {
+            "op": "move",
+            "id": "01K0000000000000000000B012",
+            "expected_revision": "2",
+            "parent_id": "01K0000000000000000000B010",
+            "name": "00-inbox"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-move-across-drives",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D007",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "move",
+                  "id": "01K0000000000000000000A013",
+                  "expected_revision": "1",
+                  "parent_id": "01K0000000000000000000A011",
+                  "name": "sub"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D107",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A013": {
+                "parent_id": "01K0000000000000000000A011",
+                "drive_key": "tg/empty",
+                "revision": "2"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D107",
+      "expect": {
+        "plan": [
+          {
+            "op": "move",
+            "id": "01K0000000000000000000A013",
+            "expected_revision": "2",
+            "parent_id": "01K0000000000000000000A012",
+            "name": "sub"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-delete",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D008",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "delete",
+                  "id": "01K0000000000000000000A017",
+                  "expected_revision": "1"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D108",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "lifecycle": "deleted"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D108",
+      "expect": {
+        "plan": [
+          {
+            "op": "restore",
+            "id": "01K0000000000000000000A017",
+            "expected_revision": "2"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-restore",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D009",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "restore",
+                  "id": "01K0000000000000000000A016",
+                  "expected_revision": "2"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D109",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A016": {
+                "revision": "3",
+                "lifecycle": "live"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D109",
+      "expect": {
+        "plan": [
+          {
+            "op": "delete",
+            "id": "01K0000000000000000000A016",
+            "expected_revision": "3"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-mixed-order",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D010",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000D053",
+                  "kind": "file",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "extra.md",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 50
+                },
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "2",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 120,
+                  "mtime_ms": 1795470000000
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D110",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000D053": {
+                "revision": "1",
+                "lifecycle": "live"
+              },
+              "01K0000000000000000000A014": {
+                "revision": "3"
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D110",
+      "expect": {
+        "plan": [
+          {
+            "op": "replace",
+            "id": "01K0000000000000000000A014",
+            "expected_revision": "3",
+            "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "size": 100,
+            "mtime_ms": 1795400000000
+          },
+          {
+            "op": "delete",
+            "id": "01K0000000000000000000D053",
+            "expected_revision": "1"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-of-a-reversal",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D011",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "2",
+                  "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                  "size": 120,
+                  "mtime_ms": 1795470000000
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D111",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 120
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000D012",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000D111"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000D112",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000D054"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 100
+              }
+            }
+          }
+        }
+      ],
+      "target_event_id": "01K0000000000000000000D112",
+      "expect": {
+        "plan": [
+          {
+            "op": "replace",
+            "id": "01K0000000000000000000A014",
+            "expected_revision": "4",
+            "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+            "size": 120,
+            "mtime_ms": 1795470000000
+          }
+        ]
+      }
+    },
+    {
+      "id": "inverse-unknown-event",
+      "fixture": "t-base",
+      "steps": [],
+      "target_event_id": "01K0000000000000000000D199",
+      "expect": {
+        "code": "conflict",
+        "detail": {
+          "entity_id": "01K0000000000000000000D199",
+          "precondition": "absent"
+        }
+      }
+    }
+  ],
+  "reversals": [
+    {
+      "id": "reverse-create-deletes",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E001",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000E201",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "new.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 15
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E101",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E201": {
+                "revision": "1",
+                "lifecycle": "live",
+                "name": "new.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E002",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E101"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E102",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E211"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E101",
+              "seq": "5"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000E201": {
+                "revision": "2",
+                "lifecycle": "deleted",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-move-puts-back",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E003",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000A017",
+                "expected_revision": "1",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "renamed.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E103",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.move",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "renamed.md",
+                "content_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E004",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E103"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E104",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E212"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E103",
+              "seq": "5"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "3",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "b.md",
+                "content_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-move-back-name-conflict",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E005",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000A017",
+                "expected_revision": "1",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "c.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E105",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.move",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "lifecycle": "live",
+                "name": "c.md"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E006",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000E202",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "B.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 12
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E106",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "5"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E202": {
+                "revision": "1",
+                "lifecycle": "live",
+                "name": "B.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E007",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E105"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E107",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E213"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000E202",
+              "precondition": "name"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-delete-restores-content",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.delete",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E008",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "delete",
+                "id": "01K0000000000000000000A017",
+                "expected_revision": "1"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E108",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.delete",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "2",
+                "lifecycle": "deleted",
+                "content_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E009",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E108"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E109",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E214"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E108",
+              "seq": "5"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A017": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                "size": 20
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-dependency-child",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E010",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000E203",
+                  "kind": "dir",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "x"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E110",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.change",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E203": {
+                "revision": "1",
+                "lifecycle": "live",
+                "kind": "dir",
+                "name": "x"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E011",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000E204",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000E203",
+                "name": "child.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 8
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E111",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "5"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E204": {
+                "revision": "1",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000E203",
+                "name": "child.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E012",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E110"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E112",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E215"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000E204",
+              "precondition": "dependency"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-dependency-parent",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E013",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000E205",
+                  "kind": "dir",
+                  "parent_id": "01K0000000000000000000A012",
+                  "name": "y"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E113",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.change",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E205": {
+                "revision": "1",
+                "lifecycle": "live",
+                "kind": "dir",
+                "name": "y"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E014",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000E206",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000E205",
+                "name": "f.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 9
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E114",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "5"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E206": {
+                "revision": "1",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000E205",
+                "name": "f.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.delete",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E015",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "delete",
+                "id": "01K0000000000000000000E206",
+                "expected_revision": "1"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E115",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.delete",
+              "seq": "6"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E206": {
+                "revision": "2",
+                "lifecycle": "deleted"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.delete",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E016",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "delete",
+                "id": "01K0000000000000000000E205",
+                "expected_revision": "1"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E116",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.delete",
+              "seq": "7"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000E205": {
+                "revision": "2",
+                "lifecycle": "deleted"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E017",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E115"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E117",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E216"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000E205",
+              "precondition": "dependency"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-later-edit-conflict",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E018",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E118",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E019",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "3",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 60
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E119",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "5"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "lifecycle": "live",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E020",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E118"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E120",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E217"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "conflict",
+            "detail": {
+              "entity_id": "01K0000000000000000000A014",
+              "precondition": "revision",
+              "current_revision": "4"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-a-reversal",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E021",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E121",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E022",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E121"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E122",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E218"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E121",
+              "seq": "5"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "lifecycle": "live",
+                "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 100,
+                "mtime_ms": 1795400000000
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E023",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E122"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E123",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E219"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E122",
+              "seq": "6"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "5",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50,
+                "mtime_ms": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-partial-refused",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E024",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E124",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E025",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E124",
+              "entity_ids": ["01K0000000000000000000A014"]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E125",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E220"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "invalid_change"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-editor-other-forbidden",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E026",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E126",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E027",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E126"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E127",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E221"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "forbidden"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-reviewer-any",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E028",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E128",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-c",
+            "role": "reviewer"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E029",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E128"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E129",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E222"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E128",
+              "seq": "5",
+              "actor_id": "p-c"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "lifecycle": "live",
+                "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 100,
+                "mtime_ms": 1795400000000
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-reader-forbidden",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E030",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E130",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-r",
+            "role": "reader"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E031",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E130"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E131",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E223"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "forbidden"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-agent-other-forbidden",
+      "fixture": "m-roots",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E032",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000C017",
+                "expected_revision": "1",
+                "content_id": "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+                "size": 5
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E132",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "3"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000C017": {
+                "revision": "2",
+                "lifecycle": "live",
+                "content_id": "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "agent",
+            "actor_id": "agent-1",
+            "grant": {
+              "grant_id": "g1",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000C014"],
+                "classes": ["write", "reverse_own"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+              "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+            ]
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E033",
+            "context_id": "01K0000000000000000000E251",
+            "payload": {
+              "event_id": "01K0000000000000000000E132"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E133",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E224"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "forbidden"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-agent-moved-on-outside-roots",
+      "fixture": "m-roots",
+      "steps": [
+        {
+          "caller": {
+            "kind": "agent",
+            "actor_id": "agent-1",
+            "grant": {
+              "grant_id": "g1",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000C014"],
+                "classes": ["write", "reverse_own"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+              "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+            ]
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E034",
+            "context_id": "01K0000000000000000000E250",
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000C017",
+                "expected_revision": "1",
+                "parent_id": "01K0000000000000000000C014",
+                "name": "h2.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E134",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.move",
+              "seq": "3"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000C017": {
+                "revision": "2",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000C014",
+                "name": "h2.md"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E035",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000C017",
+                "expected_revision": "2",
+                "parent_id": "01K0000000000000000000C012",
+                "name": "h2.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E135",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.move",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000C017": {
+                "revision": "3",
+                "lifecycle": "live",
+                "parent_id": "01K0000000000000000000C012",
+                "name": "h2.md"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "agent",
+            "actor_id": "agent-1",
+            "grant": {
+              "grant_id": "g1",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000C014"],
+                "classes": ["write", "reverse_own"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+              "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+            ]
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E036",
+            "context_id": "01K0000000000000000000E250",
+            "payload": {
+              "event_id": "01K0000000000000000000E134"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E136",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E225"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "outside_roots"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reverse-agent-propose-required",
+      "fixture": "m-roots",
+      "steps": [
+        {
+          "caller": {
+            "kind": "agent",
+            "actor_id": "agent-1",
+            "grant": {
+              "grant_id": "g1",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000C014"],
+                "classes": ["write", "reverse_own"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+              "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+            ]
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E037",
+            "context_id": "01K0000000000000000000E252",
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000C017",
+                "expected_revision": "1",
+                "content_id": "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+                "size": 5
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E137",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "3"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000C017": {
+                "revision": "2",
+                "lifecycle": "live",
+                "content_id": "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "agent",
+            "actor_id": "agent-1",
+            "grant": {
+              "grant_id": "g1",
+              "grant_revision": "2"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000C014"],
+                "classes": ["write", "reverse_own"],
+                "mode": "propose"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+              "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+            ]
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E038",
+            "context_id": "01K0000000000000000000E252",
+            "payload": {
+              "event_id": "01K0000000000000000000E137"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E138",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E226"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "propose_required"
+          }
+        }
+      ]
+    },
+    {
+      "id": "preview-ready-then-reverse",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E039",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E139",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.preview_reversal",
+          "params": {
+            "version": 1,
+            "event_id": "01K0000000000000000000E139"
+          },
+          "expect": {
+            "preview": {
+              "target_event_id": "01K0000000000000000000E139",
+              "status": "ready",
+              "plan": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "3",
+                  "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                  "size": 100,
+                  "mtime_ms": 1795400000000
+                }
+              ],
+              "code": null,
+              "detail": null
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.reverse",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E040",
+            "context_id": null,
+            "payload": {
+              "event_id": "01K0000000000000000000E139"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E140",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000E227"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.reverse",
+              "reverses_event_id": "01K0000000000000000000E139",
+              "seq": "5"
+            },
+            "op_count": 2,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "lifecycle": "live",
+                "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 100,
+                "mtime_ms": 1795400000000
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "preview-conflict",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E041",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E141",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E042",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "3",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 60
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E142",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "5"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "4",
+                "lifecycle": "live",
+                "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-ed",
+            "role": "editor"
+          },
+          "descriptor": "files.preview_reversal",
+          "params": {
+            "version": 1,
+            "event_id": "01K0000000000000000000E141"
+          },
+          "expect": {
+            "preview": {
+              "target_event_id": "01K0000000000000000000E141",
+              "status": "conflict",
+              "plan": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "3",
+                  "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                  "size": 100,
+                  "mtime_ms": 1795400000000
+                }
+              ],
+              "code": "conflict",
+              "detail": {
+                "entity_id": "01K0000000000000000000A014",
+                "precondition": "revision",
+                "current_revision": "4"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "preview-rejected-editor-other",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000E043",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 50
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000E143",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "descriptor": "files.put",
+              "seq": "4"
+            },
+            "op_count": 1,
+            "entries": {
+              "01K0000000000000000000A014": {
+                "revision": "3",
+                "lifecycle": "live",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.preview_reversal",
+          "params": {
+            "version": 1,
+            "event_id": "01K0000000000000000000E143"
+          },
+          "expect": {
+            "preview": {
+              "target_event_id": "01K0000000000000000000E143",
+              "status": "rejected",
+              "plan": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "3",
+                  "content_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                  "size": 100,
+                  "mtime_ms": 1795400000000
+                }
+              ],
+              "code": "forbidden",
+              "detail": null
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "history": [
+    {
+      "id": "history-entry-actor-origin",
+      "fixture": "t-base",
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000F001",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "replace",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "2",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 110
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000F101",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "4"
+            },
+            "op_count": 1
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000F002",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "3",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "c.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000F102",
+            "recorded_at_ms": 1795478401000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "5"
+            },
+            "op_count": 1
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.move",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000F003",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "move",
+                "id": "01K0000000000000000000A014",
+                "expected_revision": "4",
+                "parent_id": "01K0000000000000000000A013",
+                "name": "c.md"
+              }
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000F103",
+            "recorded_at_ms": 1795478402000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "6"
+            },
+            "op_count": 1
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-b",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000F004",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "create",
+                  "id": "01K0000000000000000000F050",
+                  "kind": "file",
+                  "parent_id": "01K0000000000000000000A010",
+                  "name": "note.md",
+                  "content_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                  "size": 15
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000F104",
+            "recorded_at_ms": 1795478403000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "7"
+            },
+            "op_count": 1
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-a",
+            "role": "editor"
+          },
+          "descriptor": "files.change",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000F005",
+            "context_id": null,
+            "payload": {
+              "operations": [
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A017",
+                  "expected_revision": "1",
+                  "content_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                  "size": 25
+                },
+                {
+                  "op": "replace",
+                  "id": "01K0000000000000000000A014",
+                  "expected_revision": "5",
+                  "content_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                  "size": 120
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000F105",
+            "recorded_at_ms": 1795478404000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted",
+            "event": {
+              "seq": "8"
+            },
+            "op_count": 2
+          }
+        }
+      ],
+      "queries": [
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100
+          },
+          "expect": {
+            "event_ids": [
+              "01K0000000000000000000F101",
+              "01K0000000000000000000F102",
+              "01K0000000000000000000F103",
+              "01K0000000000000000000F104",
+              "01K0000000000000000000F105"
+            ],
+            "scanned_through": "8",
+            "ops": {
+              "01K0000000000000000000F101": [0],
+              "01K0000000000000000000F102": [0],
+              "01K0000000000000000000F103": [0],
+              "01K0000000000000000000F104": [0],
+              "01K0000000000000000000F105": [0, 1]
+            }
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 2
+          },
+          "expect": {
+            "event_ids": ["01K0000000000000000000F101", "01K0000000000000000000F102"],
+            "scanned_through": "5"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "5",
+            "limit": 2
+          },
+          "expect": {
+            "event_ids": ["01K0000000000000000000F103", "01K0000000000000000000F104"],
+            "scanned_through": "7"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "7",
+            "limit": 2
+          },
+          "expect": {
+            "event_ids": ["01K0000000000000000000F105"],
+            "scanned_through": "8"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100,
+            "filter": {
+              "entity_id": "01K0000000000000000000A014"
+            }
+          },
+          "expect": {
+            "event_ids": [
+              "01K0000000000000000000F101",
+              "01K0000000000000000000F102",
+              "01K0000000000000000000F103",
+              "01K0000000000000000000F105"
+            ],
+            "scanned_through": "8",
+            "ops": {
+              "01K0000000000000000000F101": [0],
+              "01K0000000000000000000F102": [0],
+              "01K0000000000000000000F103": [0],
+              "01K0000000000000000000F105": [1]
+            }
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100,
+            "filter": {
+              "actor_id": "p-b"
+            }
+          },
+          "expect": {
+            "event_ids": ["01K0000000000000000000F102", "01K0000000000000000000F104"],
+            "scanned_through": "8"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100,
+            "filter": {
+              "entity_id": "01K0000000000000000000A014",
+              "actor_id": "p-b"
+            }
+          },
+          "expect": {
+            "event_ids": ["01K0000000000000000000F102"],
+            "scanned_through": "8",
+            "ops": {
+              "01K0000000000000000000F102": [0]
+            }
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100,
+            "filter": {
+              "origin_class": "human"
+            }
+          },
+          "expect": {
+            "event_ids": [
+              "01K0000000000000000000F101",
+              "01K0000000000000000000F102",
+              "01K0000000000000000000F103",
+              "01K0000000000000000000F104",
+              "01K0000000000000000000F105"
+            ],
+            "scanned_through": "8"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 100,
+            "filter": {
+              "origin_class": "agent"
+            }
+          },
+          "expect": {
+            "event_ids": [],
+            "scanned_through": "8"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "99",
+            "limit": 100
+          },
+          "expect": {
+            "event_ids": [],
+            "scanned_through": "99"
+          }
+        }
+      ]
+    },
+    {
+      "id": "history-refusals",
+      "fixture": "t-base",
+      "steps": [],
+      "queries": [
+        {
+          "params": {
+            "version": 2,
+            "after": "0",
+            "limit": 10
+          },
+          "expect": {
+            "code": "unsupported_version"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 0
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 101
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "01",
+            "limit": 10
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "x",
+            "limit": 10
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10,
+            "filter": {
+              "unknown": "x"
+            }
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10,
+            "filter": {
+              "entity_id": ""
+            }
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10,
+            "filter": {
+              "actor_id": ""
+            }
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        },
+        {
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10,
+            "extra": true
+          },
+          "expect": {
+            "code": "invalid_change"
+          }
+        }
+      ]
+    }
+  ],
+  "conflict_copies": [
+    {
+      "id": "copy-plain",
+      "name": "notes.md",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": [],
+      "expect": "notes.sync-conflict-20261124-101500-mac-1.md"
+    },
+    {
+      "id": "copy-multi-dot",
+      "name": "a.tar.gz",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": [],
+      "expect": "a.tar.sync-conflict-20261124-101500-mac-1.gz"
+    },
+    {
+      "id": "copy-dotfile",
+      "name": ".bashrc",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": [],
+      "expect": ".bashrc.sync-conflict-20261124-101500-mac-1"
+    },
+    {
+      "id": "copy-no-ext",
+      "name": "Makefile",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": [],
+      "expect": "Makefile.sync-conflict-20261124-101500-mac-1"
+    },
+    {
+      "id": "copy-taken-ordinal-2",
+      "name": "notes.md",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": ["notes.sync-conflict-20261124-101500-mac-1.md"],
+      "expect": "notes.sync-conflict-20261124-101500-mac-1-2.md"
+    },
+    {
+      "id": "copy-taken-ordinal-3",
+      "name": "notes.md",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": [
+        "notes.sync-conflict-20261124-101500-mac-1.md",
+        "notes.sync-conflict-20261124-101500-mac-1-2.md"
+      ],
+      "expect": "notes.sync-conflict-20261124-101500-mac-1-3.md"
+    },
+    {
+      "id": "copy-taken-case-fold",
+      "name": "Notes.md",
+      "now_utc": "20261124-101500",
+      "device": "mac-1",
+      "taken": ["notes.sync-conflict-20261124-101500-mac-1.md"],
+      "expect": "Notes.sync-conflict-20261124-101500-mac-1-2.md"
     }
   ]
 }

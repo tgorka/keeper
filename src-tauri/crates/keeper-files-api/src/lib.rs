@@ -5,6 +5,8 @@
 //! - [`names`]: what a name may be, its stored fold, its media type, its mode.
 //! - [`wire`]: the request envelope and the commands' payloads.
 //! - [`rows`]: the synced rows — entries, events, operations, the head.
+//! - [`reversal`]: `files.preview_reversal`'s answer (story 116.3).
+//! - [`history`]: `files.history`'s params and pages (story 116.3).
 //! - [`caller`]: who sends a command, and an agent's or a tool's file part.
 //! - [`refusal`]: the closed set of refusal codes.
 //! - [`view`]: what a client shows, each naming its data by `(server, domain)`.
@@ -15,9 +17,11 @@
 //! The server enforces; this crate stores and sends nothing.
 
 pub mod caller;
+pub mod history;
 pub mod ids;
 pub mod names;
 pub mod refusal;
+pub mod reversal;
 pub mod rows;
 pub mod rules;
 pub mod view;
