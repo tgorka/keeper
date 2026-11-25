@@ -14,13 +14,14 @@
 
 use std::collections::BTreeSet;
 
+use keeper_files_api::drive_file::DEFAULT_UNTRUSTED;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ts_rs::TS;
 use ulid::Ulid;
 
 use super::agentd::DrivePin;
-use super::drive::{self, DriveDecl, DEFAULT_UNTRUSTED};
+use super::drive::{self, DriveDecl};
 use super::home::{not_local_bot, serves_local_models, BotRef};
 use super::mount::pin_matches;
 use crate::bots::chat::{effort_refusal, Effort};

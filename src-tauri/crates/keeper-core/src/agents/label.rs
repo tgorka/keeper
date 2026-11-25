@@ -876,7 +876,7 @@ mod tests {
             owner: user("@tgorka:h"),
             readers: readers.iter().map(|id| user(id)).collect(),
             local_only,
-            untrusted: crate::agents::drive::DEFAULT_UNTRUSTED
+            untrusted: keeper_files_api::drive_file::DEFAULT_UNTRUSTED
                 .iter()
                 .map(|glob| (*glob).to_owned())
                 .collect(),

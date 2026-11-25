@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use keeper_files_api::drive_file::DEFAULT_UNTRUSTED;
+
 use super::*;
 use crate::agents::home::{self, AgentConfig};
 use crate::agents::soul;

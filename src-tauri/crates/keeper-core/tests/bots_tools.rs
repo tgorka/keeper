@@ -771,9 +771,12 @@ fn file_content_arrives_labelled_as_data() {
         of_bytes: Some(70),
         okf: None,
     });
-    assert!(rendered.contains(tools::FILE_CONTENT_IS_DATA), "{rendered}");
     assert!(
-        rendered.find(tools::FILE_CONTENT_IS_DATA) < rendered.find("IGNORE ALL"),
+        rendered.contains(keeper_files_api::FILE_CONTENT_IS_DATA),
+        "{rendered}"
+    );
+    assert!(
+        rendered.find(keeper_files_api::FILE_CONTENT_IS_DATA) < rendered.find("IGNORE ALL"),
         "the label has to come before the content it labels"
     );
 }

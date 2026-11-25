@@ -4,33 +4,18 @@
 //! precedent), a newer `version` is refused rather than half-read, and every
 //! refusal is one sentence a person can act on. Parsing is pure — the host
 //! reads the file through `keeper_paths::resolve` and hands the text here.
+//!
+//! The grammar, `local_only`, and `[integrity]` are read by
+//! `keeper_files_api::drive_file`; `parse` keeps the Matrix-typed owner and readers.
 
 use std::collections::BTreeSet;
 
+use keeper_files_api::drive_file::{self, DriveFileRefusal};
 use matrix_sdk::ruma::OwnedUserId;
-
-/// The grammar this build reads.
-pub const GRAMMAR_VERSION: i64 = 1;
 
 /// The file's name inside an agents zone.
 pub const FILE_NAME: &str = "_drive.toml";
 
-/// Drive-relative globs whose files are `untrusted` whoever wrote them, when
-/// the file has no `[integrity]` table: what arrives from outside the drive's
-/// readers (an inbox, messages, recordings of other people).
-pub const DEFAULT_UNTRUSTED: [&str; 3] = ["00-inbox/**", "70-comms/**", "recordings/**"];
-
-const ROOT_KEYS: [&str; 8] = [
-    "version",
-    "id",
-    "title",
-    "principal",
-    "owner",
-    "readers",
-    "local_only",
-    "integrity",
-];
-const INTEGRITY_KEYS: [&str; 1] = ["untrusted"];
 const TITLE_MAX: usize = 64;
 
 /// A drive's declaration, read.
@@ -49,33 +34,16 @@ pub struct DriveDecl {
     /// Every agent homed here must pin a local model (AD-377).
     pub local_only: bool,
     /// Drive-relative glob patterns whose files are `untrusted`, in the
-    /// file's order; [`DEFAULT_UNTRUSTED`] when there is no `[integrity]`.
+    /// file's order; [`keeper_files_api::drive_file::DEFAULT_UNTRUSTED`] when
+    /// there is no `[integrity]`.
     pub untrusted: Vec<String>,
 }
 
 /// Why a `_drive.toml` cannot be read. Each is the sentence the zone shows.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DriveDeclRefusal {
-    #[error("_drive.toml is not valid TOML: {0}")]
-    Syntax(String),
-    #[error("_drive.toml has `{key}`, which is not one of its keys.")]
-    UnknownKey { key: String },
-    #[error("_drive.toml's [integrity] has `{key}`, which is not one of its keys.")]
-    UnknownIntegrityKey { key: String },
-    #[error("_drive.toml needs `{key}`.")]
-    Missing { key: &'static str },
-    #[error("`{key}` in _drive.toml must be {expected}, not {found}.")]
-    WrongType {
-        key: &'static str,
-        expected: &'static str,
-        found: &'static str,
-    },
-    #[error(
-        "This _drive.toml was written by a newer keeper (version {version}); this keeper reads version {GRAMMAR_VERSION}."
-    )]
-    NewerVersion { version: i64 },
-    #[error("`version` in _drive.toml is {version}; the first version is 1.")]
-    BadVersion { version: i64 },
+    #[error(transparent)]
+    File(#[from] DriveFileRefusal),
     #[error(
         "`id` \"{id}\" does not fit [a-z0-9][a-z0-9-]{{0,31}}: lowercase letters, digits and dashes, starting with a letter or digit, at most 32."
     )]
@@ -94,8 +62,6 @@ pub enum DriveDeclRefusal {
     DuplicateReader { reader: String },
     #[error("The owner {owner} is not among `readers`; the owner must be a reader.")]
     OwnerNotReader { owner: String },
-    #[error("`untrusted` holds \"{pattern}\", which is not a glob pattern: {reason}")]
-    BadGlob { pattern: String, reason: String },
 }
 
 impl DriveDeclRefusal {
@@ -107,22 +73,8 @@ impl DriveDeclRefusal {
 
 /// Read a `_drive.toml`.
 pub fn parse(text: &str) -> Result<DriveDecl, DriveDeclRefusal> {
-    let table: toml::Table = crate::toml_order::from_str(text)
-        .map_err(|error| DriveDeclRefusal::Syntax(first_line(error.message())))?;
-    if let Some(key) = table.keys().find(|key| !ROOT_KEYS.contains(&key.as_str())) {
-        return Err(DriveDeclRefusal::UnknownKey { key: key.clone() });
-    }
-
-    match required(&table, "version")? {
-        toml::Value::Integer(version) if *version > GRAMMAR_VERSION => {
-            return Err(DriveDeclRefusal::NewerVersion { version: *version })
-        }
-        toml::Value::Integer(version) if *version < 1 => {
-            return Err(DriveDeclRefusal::BadVersion { version: *version })
-        }
-        toml::Value::Integer(_) => {}
-        other => return Err(wrong("version", "a whole number", other)),
-    }
+    let table = drive_file::table(text)?;
+    drive_file::version(&table)?;
 
     let id = text_of(&table, "id")?;
     if !fits_id(&id) {
@@ -144,11 +96,7 @@ pub fn parse(text: &str) -> Result<DriveDecl, DriveDeclRefusal> {
     let owner = user_id("owner", &text_of(&table, "owner")?)?;
     let readers = audience(&owner, &reader_texts(&table)?)?;
 
-    let local_only = match table.get("local_only") {
-        None => false,
-        Some(toml::Value::Boolean(on)) => *on,
-        Some(other) => return Err(wrong("local_only", "true or false", other)),
-    };
+    let local_only = drive_file::local_only(&table)?;
 
     Ok(DriveDecl {
         id,
@@ -157,34 +105,29 @@ pub fn parse(text: &str) -> Result<DriveDecl, DriveDeclRefusal> {
         owner,
         readers,
         local_only,
-        untrusted: untrusted(&table)?,
+        untrusted: drive_file::untrusted(&table)?,
     })
 }
 
-fn required<'t>(
-    table: &'t toml::Table,
-    key: &'static str,
-) -> Result<&'t toml::Value, DriveDeclRefusal> {
-    table.get(key).ok_or(DriveDeclRefusal::Missing { key })
-}
-
 fn text_of(table: &toml::Table, key: &'static str) -> Result<String, DriveDeclRefusal> {
-    match required(table, key)? {
+    match drive_file::required(table, key)? {
         toml::Value::String(value) => Ok(value.clone()),
-        other => Err(wrong(key, "text in quotes", other)),
+        other => Err(drive_file::wrong(key, "text in quotes", other).into()),
     }
 }
 
 fn reader_texts(table: &toml::Table) -> Result<Vec<String>, DriveDeclRefusal> {
-    let items = match required(table, "readers")? {
+    let items = match drive_file::required(table, "readers")? {
         toml::Value::Array(items) => items,
-        other => return Err(wrong("readers", "a list of Matrix user ids", other)),
+        other => {
+            return Err(drive_file::wrong("readers", "a list of Matrix user ids", other).into());
+        }
     };
     items
         .iter()
         .map(|item| match item {
             toml::Value::String(raw) => Ok(raw.clone()),
-            other => Err(wrong("readers", "a list of Matrix user ids", other)),
+            other => Err(drive_file::wrong("readers", "a list of Matrix user ids", other).into()),
         })
         .collect()
 }
@@ -216,68 +159,11 @@ pub fn audience(
     Ok(set)
 }
 
-fn untrusted(table: &toml::Table) -> Result<Vec<String>, DriveDeclRefusal> {
-    let integrity = match table.get("integrity") {
-        None => {
-            return Ok(DEFAULT_UNTRUSTED
-                .iter()
-                .map(|glob| (*glob).to_owned())
-                .collect())
-        }
-        Some(toml::Value::Table(integrity)) => integrity,
-        Some(other) => return Err(wrong("integrity", "a table, [integrity]", other)),
-    };
-    if let Some(key) = integrity
-        .keys()
-        .find(|key| !INTEGRITY_KEYS.contains(&key.as_str()))
-    {
-        return Err(DriveDeclRefusal::UnknownIntegrityKey { key: key.clone() });
-    }
-    let items = match integrity.get("untrusted") {
-        None => return Ok(Vec::new()),
-        Some(toml::Value::Array(items)) => items,
-        Some(other) => return Err(wrong("untrusted", "a list of glob patterns", other)),
-    };
-    items
-        .iter()
-        .map(|item| {
-            let toml::Value::String(pattern) = item else {
-                return Err(wrong("untrusted", "a list of glob patterns", item));
-            };
-            globset::Glob::new(pattern).map_err(|error| DriveDeclRefusal::BadGlob {
-                pattern: pattern.clone(),
-                reason: error.kind().to_string(),
-            })?;
-            Ok(pattern.clone())
-        })
-        .collect()
-}
-
 fn user_id(key: &'static str, raw: &str) -> Result<OwnedUserId, DriveDeclRefusal> {
     OwnedUserId::try_from(raw).map_err(|_| DriveDeclRefusal::NotAMatrixId {
         key,
         value: raw.to_owned(),
     })
-}
-
-fn wrong(key: &'static str, expected: &'static str, found: &toml::Value) -> DriveDeclRefusal {
-    DriveDeclRefusal::WrongType {
-        key,
-        expected,
-        found: describe(found),
-    }
-}
-
-fn describe(value: &toml::Value) -> &'static str {
-    match value {
-        toml::Value::String(_) => "text",
-        toml::Value::Integer(_) => "a whole number",
-        toml::Value::Float(_) => "a decimal number",
-        toml::Value::Boolean(_) => "a boolean",
-        toml::Value::Datetime(_) => "a date",
-        toml::Value::Array(_) => "a list",
-        toml::Value::Table(_) => "a table",
-    }
 }
 
 fn lower_digit_or_dash(c: char) -> bool {
@@ -299,18 +185,10 @@ fn fits_principal(principal: &str) -> bool {
     (1..=32).contains(&principal.len()) && principal.chars().all(lower_digit_or_dash)
 }
 
-fn first_line(message: &str) -> String {
-    message
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(message)
-        .trim()
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keeper_files_api::drive_file::DEFAULT_UNTRUSTED;
 
     /// The architecture's example, its `<homeserver>` filled in.
     const NEURADRIVE: &str = r#"
@@ -396,11 +274,11 @@ readers   = ["@marta:example.org", "@tgorka:example.org"]
         assert!(sentence.contains("written by a newer keeper"), "{sentence}");
         assert_eq!(
             refusal(&replacing("version   = 1", "version = 0")),
-            DriveDeclRefusal::BadVersion { version: 0 }
+            DriveDeclRefusal::File(DriveFileRefusal::BadVersion { version: 0 })
         );
         assert_eq!(
             refusal(&replacing("version   = 1\n", "")),
-            DriveDeclRefusal::Missing { key: "version" }
+            DriveDeclRefusal::File(DriveFileRefusal::Missing { key: "version" })
         );
     }
 
@@ -548,7 +426,7 @@ readers   = ["@marta:example.org", "@tgorka:example.org"]
         );
         assert!(matches!(
             refusal(&with("[integrity]\nuntrusted = [\"a/[b\"]")),
-            DriveDeclRefusal::BadGlob { pattern, .. } if pattern == "a/[b"
+            DriveDeclRefusal::File(DriveFileRefusal::BadGlob { pattern, .. }) if pattern == "a/[b"
         ));
         assert_eq!(
             refusal(&with("[integrity]\nuntrusted = \"00-inbox/**\"")).sentence(),
@@ -562,10 +440,13 @@ readers   = ["@marta:example.org", "@tgorka:example.org"]
 
     #[test]
     fn text_that_is_not_toml_is_refused_with_the_parsers_line() {
-        assert!(matches!(refusal("id = "), DriveDeclRefusal::Syntax(_)));
+        assert!(matches!(
+            refusal("id = "),
+            DriveDeclRefusal::File(DriveFileRefusal::Syntax(_))
+        ));
         assert_eq!(
             refusal(&replacing("id        = \"neuradrive\"\n", "")),
-            DriveDeclRefusal::Missing { key: "id" }
+            DriveDeclRefusal::File(DriveFileRefusal::Missing { key: "id" })
         );
     }
 }
