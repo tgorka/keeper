@@ -2,7 +2,7 @@
 //!
 //! | tables | scope variable | value |
 //! | --- | --- | --- |
-//! | `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` (the state) | `kg_graph` | the database's (domain's) name |
+//! | `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_file_refs` (the state) | `kg_graph` | the database's (domain's) name |
 //! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_reviews` (the ledger) | `kg_history` | the database's (domain's) name |
 //! | `kg_receipts` | `kg_client` | [`client_scope`] of the requesting actor and client |
 //! | `kg_proposals` | `kg_proposal` | the proposer's actor id: a replica subscribes to its own actor's only |
@@ -29,7 +29,7 @@ pub const PROPOSAL_VARIABLE: &str = "kg_proposal";
 
 /// Every table whose scope value is the domain's name, in bootstrap order:
 /// [`HISTORY_TABLES`] and [`STATE_TABLES`] together.
-pub const GRAPH_TABLES: [&str; 9] = [
+pub const GRAPH_TABLES: [&str; 10] = [
     "kg_events",
     "kg_event_ops",
     "kg_head",
@@ -38,17 +38,19 @@ pub const GRAPH_TABLES: [&str; 9] = [
     "kg_tags",
     "kg_node_tags",
     "kg_contents",
+    "kg_file_refs",
     "kg_reviews",
 ];
 /// The ledger: the tables scoped by `kg_history`.
 pub const HISTORY_TABLES: [&str; 4] = ["kg_events", "kg_event_ops", "kg_head", "kg_reviews"];
 /// The state: the tables scoped by `kg_graph`.
-pub const STATE_TABLES: [&str; 5] = [
+pub const STATE_TABLES: [&str; 6] = [
     "kg_nodes",
     "kg_edges",
     "kg_tags",
     "kg_node_tags",
     "kg_contents",
+    "kg_file_refs",
 ];
 /// The table scoped by `kg_client`.
 pub const RECEIPT_TABLE: &str = "kg_receipts";

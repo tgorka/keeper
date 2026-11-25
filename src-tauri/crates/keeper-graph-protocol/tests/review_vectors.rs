@@ -110,6 +110,9 @@ impl State for Images {
             node_ids.iter().any(|i| r["merged_into_id"] == i.as_str())
         })
     }
+    fn file_ref(&self, entry_id: &str) -> Option<Map<String, Value>> {
+        self.find("file_refs", "entry_id", entry_id)
+    }
 }
 
 impl Retained for Images {

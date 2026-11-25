@@ -87,6 +87,9 @@ impl State for Nodes {
     fn merged_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
         Vec::new()
     }
+    fn file_ref(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 /// The operations the shared algebra gives `ops` over `state`.
@@ -712,8 +715,8 @@ fn every_graph_table_is_covered_by_one_unit_through_a_mapped_column() {
     let tables = super::client::subscribed_tables();
     assert_eq!(
         tables.len(),
-        11,
-        "nine graph tables, the receipts, the proposals"
+        12,
+        "ten graph tables (116.5's kg_file_refs among them), the receipts, the proposals"
     );
     for name in tables {
         let table = schema

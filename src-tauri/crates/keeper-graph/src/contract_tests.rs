@@ -131,6 +131,9 @@ impl State for Images {
                 .any(|id| row["merged_into_id"] == id.as_str())
         })
     }
+    fn file_ref(&self, entry_id: &str) -> Option<Map<String, Value>> {
+        self.find("file_refs", "entry_id", entry_id)
+    }
 }
 
 #[test]
@@ -254,8 +257,8 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = keeper_replica::schema().expect("schema");
-    // The contract's head is 12 (122.1's jobs tables); the graph tables' own DDL is still 8's.
-    assert_eq!(ir["schemaVersion"], 12);
+    // The contract's head is 13 (116.5's `kg_file_refs`); the graph tables' own DDL is still 8's.
+    assert_eq!(ir["schemaVersion"], 13);
     assert_eq!(SCHEMA_VERSION, 8);
     let tables = ir["tables"].as_array().expect("tables");
     let scopes = |name: &str| -> Vec<(String, String)> {
@@ -323,6 +326,42 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             .collect();
         if variables.iter().any(|variable| variable.starts_with("kg_")) {
             assert_eq!(variables.len(), 1, "{template}");
+        }
+    }
+}
+
+/// README *The knowledge graph* reserves `kg_vectors` by name only (story 116.5, G-6).
+#[test]
+fn no_vectors_table_or_scope_is_granted() {
+    const MANIFEST: &str = include_str!("../../../../syncular/syncular.json");
+    let manifest: Value = serde_json::from_str(MANIFEST).expect("manifest");
+    for table in manifest["tables"].as_array().expect("tables") {
+        assert_ne!(table["name"], "kg_vectors", "{table}");
+        for scope in table["scopes"].as_array().expect("table scopes") {
+            let pattern = scope
+                .as_str()
+                .or_else(|| scope.get("pattern").and_then(Value::as_str))
+                .expect("scope pattern");
+            assert!(!pattern.contains("kg_vectors"), "{table}");
+        }
+    }
+    for subscription in manifest["subscriptions"].as_array().expect("subscriptions") {
+        for (key, value) in subscription["scopes"]
+            .as_object()
+            .expect("subscription scopes")
+        {
+            assert!(!key.contains("kg_vectors"), "{subscription}");
+            assert!(
+                !value.as_str().expect("scope value").contains("kg_vectors"),
+                "{subscription}"
+            );
+        }
+    }
+    let ir = keeper_replica::schema().expect("schema");
+    for table in ir["tables"].as_array().expect("ir tables") {
+        assert_ne!(table["name"], "kg_vectors", "{table}");
+        for scope in table["scopes"].as_array().expect("ir table scopes") {
+            assert_ne!(scope["variable"], "kg_vectors", "{table}");
         }
     }
 }

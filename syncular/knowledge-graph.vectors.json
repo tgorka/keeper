@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times. queries[]: a KG-Cypher/1 source with its parameters (json text) and optional profile (default KG-Cypher/1); fill replaces the one \"{FILL}\" in its source, else in its parameters. Admitted entries give the engine text, the normalised parameters (when listed), the aliases and the limit; refused ones the code. prefix_chains[]: the chained prefix digest of events [graph_seq, delta_digest] from prefix_genesis. manifests[]: a generation manifest a worker reads, or the code it refuses with. worker: the engine, projection version, Linux worker allocator tunables and prefix genesis every consumer and worker share. An algebra entry state may hold contents (content images; absent is none) and a stamp {time_ms, actor_id}: the acceptance a verify_assertion is stamped with (absent: time 1, actor \"vector-actor\"). node_properties[]: a node kind and its properties (json text), admitted with its reserved members or refused with a code. locators[]: a $locator envelope (json text) as a Resource holds it, admitted or refused. assertion_currency[]: a graph now (nodes, edges, contents) and a node; whether its verification is current, read with no write. reviews[]: an acknowledgement (review id, target event and digest, reviewer) and its one-operation event; a review image valid or not; an acknowledge payload admitted or refused. proposals[]: a graph.propose payload in a graph, refused or its revision, proposal digest and proposed detail; a graph.decide payload refused or its approval_basis (proposer agent-1/runtime-1/context) and a rejection's detail. inverses[]: a graph now (images plus written: {id: graph position last written}; referrers are the rows whose properties or body hold a typed reference), a retained event and the reverser actor; the event refused by the inverse planner, or its plan, expected list and the verdict of apply_inverse with the ids minted in order (ops, delta_digest, affected; a conflict; or a refusal), and the preview's outcome/reason/detail. An entry without event judges its forged plan directly. reversals[]: a graph.reverse payload refused, or its verdict against a graph and event. outcomes[]: a receipt outcome of a descriptor and the stable code a native client reports for it (null: none). approval_bases: modes is the accounts contract's grant_modes; accepted[] are event approval_basis forms that parse and serialise back exactly, refused[] do not parse; events[] are graph.history headers with a {basis: grant} form that a client which keeps approval_basis as JSON reads unchanged, origin_class agent for a tool's event as for an agent instance's. Every events[] entry names a listed agent grant (accounts vectors' map_views) by grant_id and grant_revision, holding content for a graph.apply and reverse_own for a graph.reverse: an entry with root is an agent instance's, whose rootModes gives that root the event's mode; one without root is a tool's, whose grant has no rootModes and whose mode is apply (story 114.6).",
+  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times. queries[]: a KG-Cypher/1 source with its parameters (json text) and optional profile (default KG-Cypher/1); fill replaces the one \"{FILL}\" in its source, else in its parameters. Admitted entries give the engine text, the normalised parameters (when listed), the aliases and the limit; refused ones the code. prefix_chains[]: the chained prefix digest of events [graph_seq, delta_digest] from prefix_genesis. manifests[]: a generation manifest a worker reads, or the code it refuses with. worker: the engine, projection version, Linux worker allocator tunables and prefix genesis every consumer and worker share. An algebra entry state may hold contents (content images; absent is none) and a stamp {time_ms, actor_id}: the acceptance a verify_assertion is stamped with (absent: time 1, actor \"vector-actor\"). node_properties[]: a node kind and its properties (json text), admitted with its reserved members or refused with a code. locators[]: a $locator envelope (json text) as a Resource holds it, admitted or refused. assertion_currency[]: a graph now (nodes, edges, contents) and a node; whether its verification is current, read with no write. reviews[]: an acknowledgement (review id, target event and digest, reviewer) and its one-operation event; a review image valid or not; an acknowledge payload admitted or refused. proposals[]: a graph.propose payload in a graph, refused or its revision, proposal digest and proposed detail; a graph.decide payload refused or its approval_basis (proposer agent-1/runtime-1/context) and a rejection's detail. inverses[]: a graph now (images plus written: {id: graph position last written}; referrers are the rows whose properties or body hold a typed reference), a retained event and the reverser actor; the event refused by the inverse planner, or its plan, expected list and the verdict of apply_inverse with the ids minted in order (ops, delta_digest, affected; a conflict; or a refusal), and the preview's outcome/reason/detail. An entry without event judges its forged plan directly. reversals[]: a graph.reverse payload refused, or its verdict against a graph and event. outcomes[]: a receipt outcome of a descriptor and the stable code a native client reports for it (null: none). approval_bases: modes is the accounts contract's grant_modes; accepted[] are event approval_basis forms that parse and serialise back exactly, refused[] do not parse; events[] are graph.history headers with a {basis: grant} form that a client which keeps approval_basis as JSON reads unchanged, origin_class agent for a tool's event as for an agent instance's. Every events[] entry names a listed agent grant (accounts vectors' map_views) by grant_id and grant_revision, holding content for a graph.apply and reverse_own for a graph.reverse: an entry with root is an agent instance's, whose rootModes gives that root the event's mode; one without root is a tool's, whose grant has no rootModes and whose mode is apply (story 114.6). file_refs[]: multi-step graph.apply and reversal scenarios ({id, about, state, steps}) pinning the one-node rule and kg_file_refs rows after each accepted step, or the conflict/refusal leaving state unchanged. file_ref_admissions[]: server admission cases ({id, domain, entries, node, refusal?}) checking entry existence, domain match, Collection-to-dir binding and unbound root Collections.",
   "contract_version": 1,
   "schema_version": 8,
   "profile": "KG-Cypher/1",
@@ -63,6 +63,7 @@
       "kg_tags",
       "kg_node_tags",
       "kg_contents",
+      "kg_file_refs",
       "kg_reviews"
     ],
     "receipt_table": "kg_receipts",
@@ -26469,6 +26470,15 @@
       "id": "credential-ref-userinfo",
       "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\",\"credential_ref\":\"https://u:synthetic@vault.example.com/x\"}",
       "refusal": "invalid_change"
+    },
+    {
+      "id": "internal-file-entry",
+      "json": "{\"kind\":\"internal\",\"management\":\"managed\",\"locator\":\"files:tg/01JF0000000000000000000001\",\"selector\":null,\"version\":null,\"format\":null}"
+    },
+    {
+      "id": "internal-path-space",
+      "json": "{\"kind\":\"internal\",\"management\":\"managed\",\"locator\":\"keeper:drive/My Notes/a.md\",\"selector\":null,\"version\":null,\"format\":null}",
+      "refusal": "invalid_change"
     }
   ],
   "assertion_currency": [
@@ -45961,5 +45971,1253 @@
         }
       }
     ]
-  }
+  },
+  "file_refs": [
+    {
+      "id": "note-creates-node",
+      "about": "Creating a Resource bound to an entry with an owned note writes the file_ref row; tagging keeps it unchanged (AC7, AC11).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              },
+              {
+                "op": "create_content",
+                "id": "01JH0000000000000000000001",
+                "owner_node_id": "01JG0000000000000000000001",
+                "body": { "inline_text": "my note" }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "add_tag",
+                "node_id": "01JG0000000000000000000001",
+                "tag": "t",
+                "expected_revision": "1"
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "race-second-create",
+      "about": "A second active Resource naming the same entry conflicts on file_ref naming the existing active node without altering state (AC9).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000003",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000001" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "add_tag",
+                "node_id": "01JG0000000000000000000001",
+                "tag": "t",
+                "expected_revision": "1"
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retarget",
+      "about": "Retargeting a Resource to an entry already bound to an active node conflicts; retargeting to a free entry moves the row and deletes the old one (AC12).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000002",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000002",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            },
+            {
+              "entry_id": "01JF0000000000000000000002",
+              "node_id": "01JG0000000000000000000002",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "update_node",
+                "id": "01JG0000000000000000000002",
+                "expected_revision": "1",
+                "set_properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000001" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "update_node",
+                "id": "01JG0000000000000000000002",
+                "expected_revision": "1",
+                "set_properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000003",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            },
+            {
+              "entry_id": "01JF0000000000000000000003",
+              "node_id": "01JG0000000000000000000002",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "archive-create-unarchive",
+      "about": "Archiving keeps the row for the last archived node, allows a new active node, blocks unarchiving or reversing the archive while the new node is active, and allows unarchiving once the new node is reversed (AC13).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              { "op": "archive_node", "id": "01JG0000000000000000000001", "expected_revision": "1" }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000003",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000003",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "unarchive_node",
+                "id": "01JG0000000000000000000001",
+                "expected_revision": "2"
+              }
+            ]
+          },
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000003" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        },
+        {
+          "reverse": 1,
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000003" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        },
+        {
+          "reverse": 2,
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000003",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "unarchive_node",
+                "id": "01JG0000000000000000000001",
+                "expected_revision": "2"
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reannotate-unarchives",
+      "about": "Unarchiving and tagging an archived bound node in one change restores it as the active file_ref holder (AC14).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              },
+              {
+                "op": "create_content",
+                "id": "01JH0000000000000000000001",
+                "owner_node_id": "01JG0000000000000000000001",
+                "body": { "inline_text": "my note" }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              { "op": "archive_node", "id": "01JG0000000000000000000001", "expected_revision": "1" }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "unarchive_node",
+                "id": "01JG0000000000000000000001",
+                "expected_revision": "2"
+              },
+              {
+                "op": "add_tag",
+                "node_id": "01JG0000000000000000000001",
+                "tag": "t",
+                "expected_revision": "2"
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "merge-then-new-node",
+      "about": "Merging a bound node into a survivor naming another entry deletes the absorbed entry row, allows a new node to bind it, and blocks reversing the merge while the new node is active (AC15).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000002",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000002",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            },
+            {
+              "entry_id": "01JF0000000000000000000002",
+              "node_id": "01JG0000000000000000000002",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "merge_nodes",
+                "target_id": "01JG0000000000000000000002",
+                "target_revision": "1",
+                "absorbed": [{ "id": "01JG0000000000000000000001", "expected_revision": "1" }],
+                "edges": []
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000002",
+              "node_id": "01JG0000000000000000000002",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000004",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000004",
+              "node_kind": "Resource"
+            },
+            {
+              "entry_id": "01JF0000000000000000000002",
+              "node_id": "01JG0000000000000000000002",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "reverse": 2,
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000004" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "legacy-internal",
+      "about": "A legacy internal locator (keeper:drive/notes) names no entry and writes no kg_file_refs row across create, archive and reversal (AC16).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000005",
+                "kind": "Resource",
+                "title": "notes",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "external",
+                    "locator": "keeper:drive/notes",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": []
+        },
+        {
+          "payload": {
+            "ops": [
+              { "op": "archive_node", "id": "01JG0000000000000000000005", "expected_revision": "1" }
+            ]
+          },
+          "file_refs": []
+        },
+        { "reverse": 1, "file_refs": [] }
+      ]
+    },
+    {
+      "id": "collection-binds-dir",
+      "about": "A Collection binds a dir entry via okf:directory and shares the one-node rule with Resource nodes naming the same entry (AC18).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000006",
+                "kind": "Collection",
+                "title": "docs",
+                "description": null,
+                "properties": { "okf:directory": "files:tg/01JF0000000000000000000004" }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000004",
+              "node_id": "01JG0000000000000000000006",
+              "node_kind": "Collection"
+            }
+          ]
+        },
+        {
+          "reverse": 0,
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000004",
+              "node_id": "01JG0000000000000000000006",
+              "node_kind": "Collection"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000007",
+                "kind": "Collection",
+                "title": "docs",
+                "description": null,
+                "properties": { "okf:directory": "files:tg/01JF0000000000000000000004" }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000004",
+              "node_id": "01JG0000000000000000000007",
+              "node_kind": "Collection"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000009",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000004",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "conflict": {
+            "entity": { "entity_type": "node", "id": "01JG0000000000000000000007" },
+            "precondition": "file_ref",
+            "current_revision": "1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "archived-last-wins",
+      "about": "H-10: with no active node the row names the node archived last, even when the same change also writes an older archived node naming the entry.",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000001",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              { "op": "archive_node", "id": "01JG0000000000000000000001", "expected_revision": "1" }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000001",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000003",
+                "kind": "Resource",
+                "title": "a.md",
+                "description": null,
+                "properties": {
+                  "$locator": {
+                    "kind": "internal",
+                    "management": "managed",
+                    "locator": "files:tg/01JF0000000000000000000001",
+                    "selector": null,
+                    "version": null,
+                    "format": null
+                  }
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000003",
+              "node_kind": "Resource"
+            }
+          ]
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "archive_node",
+                "id": "01JG0000000000000000000003",
+                "expected_revision": "1"
+              },
+              {
+                "op": "update_node",
+                "id": "01JG0000000000000000000001",
+                "expected_revision": "2",
+                "set": { "title": "b.md" }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000001",
+              "node_id": "01JG0000000000000000000003",
+              "node_kind": "Resource"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "directory-set-then-reversed",
+      "about": "Reversing an update_node that set okf:directory unbinds the Collection, so its row is cleared (AC18).",
+      "state": {
+        "nodes": [],
+        "edges": [],
+        "tags": [],
+        "node_tags": [],
+        "contents": [],
+        "file_refs": []
+      },
+      "steps": [
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "create_node",
+                "id": "01JG0000000000000000000010",
+                "kind": "Collection",
+                "title": "docs",
+                "description": null,
+                "properties": {}
+              }
+            ]
+          },
+          "file_refs": []
+        },
+        {
+          "payload": {
+            "ops": [
+              {
+                "op": "update_node",
+                "id": "01JG0000000000000000000010",
+                "expected_revision": "1",
+                "set_properties": {
+                  "okf:directory": "files:tg/01JF0000000000000000000005"
+                }
+              }
+            ]
+          },
+          "file_refs": [
+            {
+              "entry_id": "01JF0000000000000000000005",
+              "node_id": "01JG0000000000000000000010",
+              "node_kind": "Collection"
+            }
+          ]
+        },
+        {
+          "reverse": 1,
+          "file_refs": []
+        }
+      ]
+    }
+  ],
+  "file_ref_admissions": [
+    {
+      "id": "resource-names-entry",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000001", "kind": "file" }],
+      "node": {
+        "id": "01JG0000000000000000000001",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01JF0000000000000000000001",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      }
+    },
+    {
+      "id": "resource-other-domain",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000001", "kind": "file" }],
+      "node": {
+        "id": "01JG0000000000000000000001",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:other/01JF0000000000000000000001",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "resource-nowhere",
+      "domain": "tg",
+      "entries": [],
+      "node": {
+        "id": "01JG0000000000000000000001",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01JF0000000000000000000001",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "drive-collection-root-dir",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000005", "kind": "dir" }],
+      "node": {
+        "id": "01JG0000000000000000000006",
+        "kind": "Collection",
+        "title": "drive",
+        "description": null,
+        "description_source_id": null,
+        "properties": { "okf:directory": "files:tg/01JF0000000000000000000005" },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      }
+    },
+    {
+      "id": "collection-names-file",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000001", "kind": "file" }],
+      "node": {
+        "id": "01JG0000000000000000000006",
+        "kind": "Collection",
+        "title": "docs",
+        "description": null,
+        "description_source_id": null,
+        "properties": { "okf:directory": "files:tg/01JF0000000000000000000001" },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "collection-other-domain",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000004", "kind": "dir" }],
+      "node": {
+        "id": "01JG0000000000000000000006",
+        "kind": "Collection",
+        "title": "docs",
+        "description": null,
+        "description_source_id": null,
+        "properties": { "okf:directory": "files:other/01JF0000000000000000000004" },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "root-collection-never-bound",
+      "domain": "tg",
+      "entries": [{ "id": "01JF0000000000000000000004", "kind": "dir" }],
+      "node": {
+        "id": "01JG0000000000000000000006",
+        "kind": "Collection",
+        "title": "root",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "okf:profile_version": "1",
+          "okf:directory": "files:tg/01JF0000000000000000000004"
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "legacy-names-none",
+      "domain": "tg",
+      "entries": [],
+      "node": {
+        "id": "01JG0000000000000000000005",
+        "kind": "Resource",
+        "title": "notes",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "external",
+            "locator": "keeper:drive/notes",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      }
+    },
+    {
+      "id": "resource-lower-case-entry",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01jf0000000000000000000009",
+          "kind": "file"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000011",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01jf0000000000000000000009",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "resource-trailing-segment",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01JF0000000000000000000009",
+          "kind": "file"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000012",
+        "kind": "Resource",
+        "title": "a.md",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "$locator": {
+            "kind": "internal",
+            "management": "managed",
+            "locator": "files:tg/01JF0000000000000000000009/x",
+            "selector": null,
+            "version": null,
+            "format": null
+          }
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "collection-malformed-directory",
+      "domain": "tg",
+      "entries": [
+        {
+          "id": "01JF0000000000000000000004",
+          "kind": "dir"
+        }
+      ],
+      "node": {
+        "id": "01JG0000000000000000000013",
+        "kind": "Collection",
+        "title": "docs",
+        "description": null,
+        "description_source_id": null,
+        "properties": {
+          "okf:directory": "tg/01JF0000000000000000000004"
+        },
+        "lifecycle": "active",
+        "merged_into_id": null,
+        "revision": "1",
+        "lifecycle_revision": "1"
+      },
+      "refusal": "invalid_change"
+    }
+  ]
 }

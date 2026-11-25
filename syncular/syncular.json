@@ -21,7 +21,8 @@
     { "version": 9, "through": "0009_knowledge_graph_history" },
     { "version": 10, "through": "0010_files" },
     { "version": 11, "through": "0011_settings" },
-    { "version": 12, "through": "0012_jobs" }
+    { "version": 12, "through": "0012_jobs" },
+    { "version": 13, "through": "0013_knowledge_graph_file_refs" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -92,6 +93,7 @@
     { "name": "kg_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_node_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_contents", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_file_refs", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     {
       "name": "kg_reviews",
       "scopes": [{ "pattern": "kg_history:{kg_history}", "column": "graph" }]

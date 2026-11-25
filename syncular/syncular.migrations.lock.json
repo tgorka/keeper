@@ -60,6 +60,11 @@
       "name": "0012_jobs",
       "sha256": "f9e7d3bac1a3f06ec3d2f10454b9549052d1428fd9a759f5f8d22a57610969a0",
       "schemaVersion": 12
+    },
+    {
+      "name": "0013_knowledge_graph_file_refs",
+      "sha256": "ff49bd8a30492547747080c688607e8844f2c4783e1a48dfdc85223fc24d7fc9",
+      "schemaVersion": 13
     }
   ],
   "head": {
@@ -1651,6 +1656,32 @@
           },
           {
             "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "kg_file_refs",
+        "primaryKey": "entry_id",
+        "columns": [
+          {
+            "name": "entry_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "graph",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "node_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "node_kind",
             "type": "string",
             "nullable": false
           }
