@@ -1,6 +1,7 @@
 //! The graph as a module of keeper's runtime (story 123.2; feature
-//! `module`): the seventeen verbs of 113.5's `keeper-cli graph`, moved here
-//! from the command line, bound by id to `keeper-graph-api`'s operations.
+//! `module`): the eighteen verbs of `keeper-cli graph` (113.5's seventeen
+//! and 116.5's `annotate`), moved here from the command line, bound by id
+//! to `keeper-graph-api`'s operations.
 //!
 //! **A module opens nothing it is not given** (SR-5): the composition root
 //! opens one replica per domain and hands it in as a [`DomainBinding`]
@@ -37,6 +38,7 @@ use serde_json::{json, Value};
 
 #[cfg(feature = "human-reads")]
 use crate::admission::{Admission, Process};
+use crate::annotation::{annotate, AnnotateError};
 use crate::client::{subscribed_tables, Applied, GraphClient, GraphClientError, Prepared};
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::outcome::{GraphOutcome, PendingCause};
@@ -209,6 +211,7 @@ impl Module for GraphModule {
         let f = &self.facade;
         bind!(b, f, write, "graph.apply", apply);
         bind!(b, f, write, "graph.enqueue", enqueue);
+        bind!(b, f, write, "graph.annotate", annotate);
         bind!(b, f, read, "graph.pending", pending);
         bind!(b, f, write, "graph.resume", resume);
         bind!(b, f, decide, "graph.discard", discard);
@@ -336,6 +339,40 @@ impl GraphFacade {
                                  "state": State::Queued.as_str()}),
             Err(e) => lifecycle_error(&e),
         }
+    }
+
+    pub async fn annotate(&self, _: &Write, input: api::Annotate) -> Reply {
+        let Opened {
+            source, lifecycle, ..
+        } = match self.open(&input.target) {
+            Ok(opened) => opened,
+            Err(error) => return reply(error),
+        };
+        let api::Annotate {
+            entry_id,
+            note,
+            tags,
+            ..
+        } = input;
+        reply(
+            blocking(
+                &source,
+                &lifecycle,
+                move |client, lifecycle| match annotate(&client, &entry_id, note, tags) {
+                    Ok(a) => {
+                        let mut v = applied(lifecycle, Ok(a.applied));
+                        v["node_id"] = json!(a.node_id);
+                        v["created"] = json!(a.created);
+                        v["retried"] = json!(a.retried);
+                        v
+                    }
+                    Err(AnnotateError::Refused(r)) => fail(r.code(), "annotation"),
+                    Err(AnnotateError::Missing(id)) => fail("not_found", &format!("entry {id}")),
+                    Err(AnnotateError::Client(e)) => applied(lifecycle, Err(e)),
+                },
+            )
+            .await,
+        )
     }
 
     pub async fn pending(&self, _: &Read, input: api::TargetOnly) -> Reply {

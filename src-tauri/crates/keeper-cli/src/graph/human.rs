@@ -27,7 +27,7 @@ pub fn sentence(verb: &str, answer: &Value) -> String {
         return failure(answer);
     }
     match verb {
-        "apply" | "propose" | "decide" | "acknowledge" | "reverse" => applied(answer),
+        "apply" | "annotate" | "propose" | "decide" | "acknowledge" | "reverse" => applied(answer),
         "enqueue" => format!(
             "Queued request {} ({}); nothing was sent.",
             text(&answer["request_id"]),

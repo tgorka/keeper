@@ -8,6 +8,8 @@
 //!   contract writes it) and its outcome, online only;
 //! - `enqueue <payload.json>` — persist the change in the device's intent
 //!   queue (offline too) and print its request id; nothing is sent;
+//! - `annotate <entry_id> [--note <text>] [--tag <t>]…` — a note or tags on
+//!   a file's graph node, created once (116.5), online only;
 //! - `pending` — the queue's entries: ids, state, cause and age only;
 //! - `resume` — restore every open entry from its stored bytes, resolve it
 //!   from its receipt (here or `graph.outcome`) and send the identical
@@ -124,6 +126,14 @@ enum Command {
     Apply { payload: PathBuf },
     /// Persist a change in the intent queue, offline too; nothing is sent.
     Enqueue { payload: PathBuf },
+    /// Put a note or tags on a file's graph node, creating it once (online only).
+    Annotate {
+        entry_id: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
     /// The queue's entries: ids, state, cause and age only.
     Pending,
     /// Resolve every open entry from its receipt; send it only when none exists.
@@ -198,6 +208,7 @@ impl Command {
         match self {
             Self::Apply { .. } => "apply",
             Self::Enqueue { .. } => "enqueue",
+            Self::Annotate { .. } => "annotate",
             Self::Pending => "pending",
             Self::Resume => "resume",
             Self::Discard { .. } => "discard",
@@ -248,6 +259,14 @@ impl Command {
         Ok(match self {
             Self::Apply { payload } => ("graph.apply", payload_input(payload, target, opened)?),
             Self::Enqueue { payload } => ("graph.enqueue", payload_input(payload, target, opened)?),
+            Self::Annotate {
+                entry_id,
+                note,
+                tags,
+            } => (
+                "graph.annotate",
+                json!({"target": t, "entry_id": entry_id, "note": note, "tags": tags}),
+            ),
             Self::Propose { payload } => ("graph.propose", payload_input(payload, target, opened)?),
             Self::Decide { payload } => ("graph.decide", payload_input(payload, target, opened)?),
             Self::Pending => ("graph.pending", json!({"target": t})),

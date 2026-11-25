@@ -373,6 +373,19 @@ pub fn sent_answer() -> Value {
     answer(&sent_members())
 }
 
+/// `graph.annotate`'s output: a sent command's plus the node it landed on
+/// and whether it created or retried it.
+#[must_use]
+pub fn annotate_answer() -> Value {
+    let mut members = sent_members();
+    members.extend([
+        ("node_id", text()),
+        ("created", json!({"type": "boolean"})),
+        ("retried", json!({"type": "boolean"})),
+    ]);
+    answer(&members)
+}
+
 /// `graph.reverse`'s output: a sent command's, or (not sent) the preview
 /// and why.
 #[must_use]

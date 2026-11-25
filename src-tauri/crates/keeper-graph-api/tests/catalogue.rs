@@ -165,7 +165,7 @@ fn the_propose_schema_accepts_what_the_parser_accepts() {
 /// four decide operations of class decide.
 #[test]
 fn every_operation_is_well_formed() {
-    assert_eq!(OPERATIONS.len(), 17);
+    assert_eq!(OPERATIONS.len(), 18);
     for spec in OPERATIONS {
         assert!(spec.id.starts_with("graph."), "{}", spec.id);
         let input = (spec.input)();

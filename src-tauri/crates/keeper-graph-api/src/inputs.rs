@@ -44,6 +44,18 @@ impl<'de> Deserialize<'de> for Targeted {
     }
 }
 
+/// `graph.annotate` (116.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Annotate {
+    pub target: Target,
+    pub entry_id: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 /// `graph.pending`, `graph.resume`, `graph.status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

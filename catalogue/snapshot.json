@@ -423,6 +423,123 @@
     },
     {
       "cli": {
+        "positional": [
+          "/entry_id"
+        ],
+        "words": [
+          "graph",
+          "annotate"
+        ]
+      },
+      "concise": [
+        "/ok"
+      ],
+      "effect": "write",
+      "id": "graph.annotate",
+      "input": {
+        "$defs": {
+          "Target": {
+            "additionalProperties": false,
+            "description": "The domain an operation addresses: the agents server's address and the\ndatabase.",
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "domain"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "`graph.annotate` (116.5).",
+        "properties": {
+          "entry_id": {
+            "type": "string"
+          },
+          "note": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "target": {
+            "$ref": "#/$defs/Target"
+          }
+        },
+        "required": [
+          "target",
+          "entry_id"
+        ],
+        "title": "Annotate",
+        "type": "object"
+      },
+      "input_enums": {},
+      "kind": "command",
+      "output": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "descriptor": {
+            "type": "string"
+          },
+          "fenced": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "outcome": {
+            "type": "object"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "retried": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "page": null,
+      "proposal": "none",
+      "scope": {
+        "domain": "/target"
+      },
+      "summary": "put a note or tags on a file's graph node, creating it once",
+      "to_proposal": false,
+      "vectors": {},
+      "wire_fix": [],
+      "wire_forbid": [],
+      "wire_gate": false
+    },
+    {
+      "cli": {
         "positional": [],
         "words": [
           "graph",

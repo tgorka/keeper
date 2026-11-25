@@ -28,6 +28,7 @@
 
 pub use keeper_graph_protocol as protocol;
 
+pub mod annotation;
 pub mod client;
 pub mod outcome;
 pub mod prefix;
@@ -59,6 +60,8 @@ pub fn available() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
+#[cfg(test)]
+mod annotation_tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod capacity_tests;
 #[cfg(test)]

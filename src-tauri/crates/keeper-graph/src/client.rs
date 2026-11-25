@@ -439,6 +439,24 @@ impl GraphClient {
         Ok(self.requests.port().remote_query(operation, params)?)
     }
 
+    /// `files.resource_of` for `entry_id`: the node that holds it, as the
+    /// server's one read rule lets this person see it (116.5).
+    pub fn resource_of(&self, entry_id: &str) -> Result<Vec<Map<String, Value>>, GraphClientError> {
+        self.read(
+            super::annotation::RESOURCE_OF,
+            super::annotation::resource_of_params(entry_id),
+        )
+    }
+
+    /// `files.resolve` for the `internal` locator text `locator`: the entry
+    /// it names, its derived path and lifecycle (116.5).
+    pub fn resolve_file(&self, locator: &str) -> Result<Vec<Map<String, Value>>, GraphClientError> {
+        self.read(
+            super::annotation::RESOLVE,
+            super::annotation::resolve_params(locator),
+        )
+    }
+
     /// The node `id` (archived ones only with `include_archived`).
     pub fn get_node(
         &self,
