@@ -9,7 +9,13 @@ use keeper_replica::transfer::{HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::store::StandIn;
 use tempfile::TempDir;
 
+/// The store bound under test: a store that says nothing for this long is cut off.
 const TIMEOUT: Duration = Duration::from_secs(1);
+/// The grant server's bound. The grant server is not the store under test and is never paced or
+/// silenced here, but its `complete` verifies the whole object's SHA-256 (unoptimised, megabytes)
+/// before it answers; on a CPU-starved runner that outlasted the store's 1 s bound (CI 45541022967).
+/// keeper's own grant bound is 15 s (`keeper-replica`'s `REQUEST_TIMEOUT`).
+const GRANT_TIMEOUT: Duration = Duration::from_secs(15);
 const PART_BYTES: u64 = 2 * 1024 * 1024;
 const MULTI_PART_LEN: usize = 2 * (PART_BYTES as usize) + 1000;
 const DOWNLOAD_SILENCE_LEN: usize = 1024 * 1024;
@@ -49,7 +55,8 @@ fn make_transfer(
     part_bytes: u64,
     timeout: Duration,
 ) -> StoreTransfer {
-    let grants = Arc::new(HttpGrants::new(&s.base_url(), s.token(), timeout).expect("http grants"));
+    let grants =
+        Arc::new(HttpGrants::new(&s.base_url(), s.token(), GRANT_TIMEOUT).expect("http grants"));
     let config = TransferConfig {
         threshold: part_bytes,
         part_bytes,
@@ -142,15 +149,19 @@ fn an_upload_whose_store_goes_silent_fails_within_the_bound_and_resumes() {
     fs::write(&src, &bytes).expect("write source");
 
     let t1 = make_transfer(&s, slot_for(&s), plan_dir.clone(), PART_BYTES, TIMEOUT);
-    let started = Instant::now();
-    let mut silence_armed = false;
+    // Timed from the moment the store goes silent, not from the upload's start: what comes before
+    // (hashing the file, the grant, the first part and the store's check of it) is CPU work that a
+    // starved runner stretches, and none of it is the bound under test.
+    let mut silenced_at: Option<Instant> = None;
     let first = t1.upload(&src, None, &mut |progress| {
-        if !silence_armed && progress.done >= PART_BYTES {
-            silence_armed = true;
+        if silenced_at.is_none() && progress.done >= PART_BYTES {
             s.silence_next(4096, HOLD_FOR);
+            silenced_at = Some(Instant::now());
         }
     });
-    let elapsed = started.elapsed();
+    let elapsed = silenced_at
+        .expect("silence armed after the first part")
+        .elapsed();
 
     assert!(
         first.is_err(),
@@ -158,7 +169,7 @@ fn an_upload_whose_store_goes_silent_fails_within_the_bound_and_resumes() {
     );
     assert!(
         elapsed < 4 * TIMEOUT,
-        "silenced upload took {elapsed:?}, expected under {:?}",
+        "silenced upload took {elapsed:?} after the store went silent, expected under {:?}",
         4 * TIMEOUT
     );
     assert_eq!(
