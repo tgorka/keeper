@@ -27,6 +27,8 @@ keeper-core = { path = "../keeper-core" }
 # The domains view model `hq_domains_subscribe` streams (story 114.5).
 keeper-accounts = { path = "../keeper-accounts" }
 keeper-replica = { path = "../keeper-replica" }
+# The organisation's model set, hydrated from the general domain (story 121.3).
+keeper-settings = { path = "../keeper-settings" }
 # Folder sync (Epic 29, AD-40) — on every target since Epic 66 (AD-198).
 # It sat in the desktop-only table below for eight epics on the belief that
 # gitoxide had no place in an iOS bundle; `cargo check -p keeper-sync --target

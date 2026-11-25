@@ -48,16 +48,9 @@
 //! # LFS
 //!
 //! The copy itself never runs an LFS filter: a file the repository tracks
-//! through LFS is its pointer in the working tree. [`hydrate_lfs_dir`]
-//! materialises one directory of such pointers somewhere else (AD-341).
-
-mod hydrate;
-
-pub use hydrate::{
-    complete_file as hydrate_complete_file, completion_digest, hydrate_lfs_dir,
-    hydration_is_current, state_file as hydrate_state_file, Folders, HydrateGroup, HydrateReport,
-    Manifest,
-};
+//! through LFS is its pointer in the working tree. The models it once carried
+//! under `_models/` come from the organisation's general domain now
+//! (`keeper_settings::models`, story 121.3).
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -67,8 +60,6 @@ use std::{
     },
 };
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use gix::hash::ObjectId;
 
 use crate::{
@@ -136,18 +127,6 @@ impl RepoAuth {
             Self::None => None,
             Self::Basic { .. } => credential.map(HttpAuth::Basic),
             Self::Bearer(token) => Some(HttpAuth::Bearer(token)),
-        }
-    }
-
-    /// The `Authorization` value the LFS client sends for this repository.
-    fn lfs_authorization(&self) -> Option<String> {
-        match self {
-            Self::None => None,
-            Self::Basic { username, password } => Some(format!(
-                "Basic {}",
-                BASE64.encode(format!("{username}:{password}"))
-            )),
-            Self::Bearer(token) => Some(format!("Bearer {token}")),
         }
     }
 }

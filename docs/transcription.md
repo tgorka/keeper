@@ -135,71 +135,81 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
     Shift+Enter (or the ↑/↓ buttons) go to the next and previous match and wrap, and a jump
     seeks the player when Follow is on.
 
-## Models live in the config repository
+## Models live in the organisation's general domain
 
-keeper's bundle carries no model weights (D-5). The organisation that runs the account
-distributes them through its config repository (`docs/account.md` § *The config repository*),
-under `_models/`, tracked by git LFS. keeper's clone of that repository holds LFS pointers.
-After each config sync and on *Fetch models*, keeper hydrates into `<data_dir>/models/`, with
-its own LFS client and the account's credential, the part of `_models/` this machine runs: a
-Mac that can transcribe takes every folder but the turn models' (the **transcription group**);
+keeper's bundle carries no model weights (D-5). The organisation distributes them through its
+general domain (`makidrive`) on its agents server, as one published, checksummed version (story
+121.3, D-41): `config_values` rows `models.active` (the version id), `models/<version>` (the
+manifest: `models.toml` and the file count) and `models/<version>/<path>` (`{size, sha256}` and
+the file's blob). The operator publishes with `hq-admin models put <dir>`: files go up first,
+rows next, `models.active` last, so devices keep loading the previous version until a new one is
+whole. The config repository's `_models/` is no longer read; `hq-admin models put` moves it
+once, checked against its LFS pointers.
+
+On *Fetch models*, at launch and after each sync, keeper reads the active version from its
+replica of the general domain and hydrates into `<data_dir>/models/` the part this machine runs:
+a Mac that can transcribe takes every folder but the turn models' (the **transcription group**);
 a device whose voice runs the turn models — an Apple silicon Mac, the iPhone — takes the turn
 models' folders (the **turn group**, *The turn models* below). No folder is in both: the turn
 models' are the ones `models.toml` and the turn picks name and any other folder holding a
 `model.onnx` (an older version kept beside the new one), except a folder `[asr]` or `[diarizer]`
-names, which stays transcription's. Both take the plain files at the top of `_models/`
-(`models.toml`). A device that does neither fetches nothing; the phone fetches
-only the turn group (about 11 MB). Every object is checked against its sha256 and size. The LFS
-endpoint is derived from the repository's own URL and nothing else: a `.lfsconfig` in the
-config repository is ignored, so the credential never goes to a host the repository names. A
-file already in place is not fetched again.
+names, which stays transcription's. Both take the plain files at the top of the set
+(`models.toml`). A device that does neither fetches nothing; the phone fetches only the turn
+group (about 11 MB). Each file comes through the blob port's download: the generic blob route
+(`GET <server>/<domain>/blobs/<id>`) grants a presigned URL on the object store the server
+named, fetched ranged and resumed, and the whole file's size and sha256 are checked before it is
+renamed into place. A file whose bytes differ is refused and its group stays not ready. A file
+already in place is not fetched again. A version whose rows are incomplete, do not hash to its
+id, or name two paths that would be one file on a case-insensitive disk is refused whole. With
+no agents server paired, or no active version, there are no models, and Settings says so. The
+fetcher is `keeper_settings::models` with keeper-replica's `BlobRouteGrants`, outside the
+scanned engine files; the engine's callers read only `keeper_settings::models::ready_digest`.
 
 A group is complete, or it is not used. keeper removes the group's
 `<data_dir>/models/.keeper-models-complete.<group>.json` before it changes anything of that
-group and writes it last, only when every file of the group is in place; it records a digest of
-what every file holds (its LFS object id, or a plain file's sha256). A set is ready only when
-every file it needs is present and its group's digest matches what the clone names now, so a
-half-updated set (a new encoder beside an old decoder) is never loaded — and because each group
-keeps its own marker (and its own `.keeper-hydrate.<group>.json`), a new turn model never makes
-transcription's set look half-updated. `models.toml` counts in each group's digest only by the
-sections of that group's roles, so switching `[smart_turn] dir` to a new folder leaves
-transcription current, and an unavailable picked turn model fails only the turn group. A changed set is loaded at the next job's start, never
-in the middle of one. The engine loads a set only by path — it never downloads, and keeper
-never contacts Hugging Face.
+group and writes it last, only when every file of the group is in place; it records the version
+and a digest of what every file of the group holds. A set is ready only when every file it needs
+is present and its group's digest matches the active version's, so a half-updated set (a new
+encoder beside an old decoder) is never loaded — and because each group keeps its own marker
+(and its own `.keeper-hydrate.<group>.json`), a new turn model never makes transcription's set
+look half-updated. `models.toml` counts in each group's digest only by the sections of that
+group's roles, so switching `[smart_turn] dir` to a new folder leaves transcription current, and
+an unavailable picked turn model fails only the turn group. A changed set is loaded at the next
+job's start, never in the middle of one. Settings › Transcription shows the version the ready
+set came from. The engine loads a set only by path — it never downloads, and keeper never
+contacts Hugging Face.
 
 ### Layout
 
 ```text
-keeper-config.git/
-  .gitattributes                 # _models/** filter=lfs diff=lfs merge=lfs -text
-  _models/
-    models.toml                  # which folders form the set
-    LICENSE, NOTICE              # the models' licence and attribution files
-    parakeet-tdt-0.6b-v3/        # speech recognition
-      Preprocessor.mlmodelc/     # each .mlmodelc needs coremldata.bin, model.mil,
-      Encoder.mlmodelc/          #   weights/weight.bin
-      Decoder.mlmodelc/
-      JointDecisionv3.mlmodelc/
-      parakeet_vocab.json
-    speaker-diarization/         # diarization and 256-d speaker embeddings
-      Segmentation.mlmodelc/
-      FBank.mlmodelc/
-      Embedding.mlmodelc/
-      PldaRho.mlmodelc/
-      plda-parameters.json
-    silero-vad/                  # voice activity (the turn group)
-      model.onnx
-      LICENSE
-    smart-turn-v3/               # end of turn (the turn group)
-      model.onnx
-      LICENSE
+<models dir>/                    # what `hq-admin models put` publishes
+  models.toml                    # which folders form the set
+  LICENSE, NOTICE                # the models' licence and attribution files
+  parakeet-tdt-0.6b-v3/          # speech recognition
+    Preprocessor.mlmodelc/       # each .mlmodelc needs coremldata.bin, model.mil,
+    Encoder.mlmodelc/            #   weights/weight.bin
+    Decoder.mlmodelc/
+    JointDecisionv3.mlmodelc/
+    parakeet_vocab.json
+  speaker-diarization/           # diarization and 256-d speaker embeddings
+    Segmentation.mlmodelc/
+    FBank.mlmodelc/
+    Embedding.mlmodelc/
+    PldaRho.mlmodelc/
+    plda-parameters.json
+  silero-vad/                    # voice activity (the turn group)
+    model.onnx
+    LICENSE
+  smart-turn-v3/                 # end of turn (the turn group)
+    model.onnx
+    LICENSE
 ```
 
 The `.mlmodelc` folders are precompiled Core ML models; nothing is compiled on the Mac. Their
 sources are FluidInference's `parakeet-tdt-0.6b-v3-coreml` (int8 encoder) and
 `speaker-diarization-coreml`, both CC-BY-4.0; community-1's files carry a NOTICE requiring
 attribution to pyannote, WeSpeaker, BUT Speech@FIT and Fluid Inference, so copy the licence
-and NOTICE files into `_models/` beside them (DW-341).
+and NOTICE files into the set beside them (DW-341).
 
 `models.toml` names the set; every transcription section is optional and falls back to the
 default shown, and the turn sections are optional and name no turn model when absent:
@@ -242,31 +252,30 @@ repository is where it lives, as DW-341 records for the transcription models (a
 - **Who fetches them:** every device whose voice runs them (Apple silicon Macs and the iPhone),
   the turn group only, plus any turn model picked by its settings key. An Intel Mac and the iOS
   simulator have no runtime and no turn models.
-- **When they load:** only for an account, from a complete turn group whose marker the clone
-  names now — the same facts the line below is computed from. Forgetting the account unloads
-  them; with the server unreachable, models already here keep working.
+- **When they load:** only with an agents server paired, from a complete turn group whose
+  marker matches the active version — the same facts the line below is computed from. With the
+  server unreachable, models already here keep working.
 - **What voice shows:** one line under the voice switch (Settings › Agents & voice › *Voice*, on
   the Mac and the phone) — *Turn models ready*, *Turn models missing:
-  `silero-vad/model.onnx` — keeper waits 1.8 s after you stop*, or a refusal; without an account
-  there are no turn models, and the line says so. The line moves by itself: keeper tells the
+  `silero-vad/model.onnx` — keeper waits 1.8 s after you stop*, or a refusal; without an agents
+  server there are no turn models, and the line says so. The line moves by itself: keeper tells the
   window when a fetch starts and ends, when the models load at launch, when a synced model pick
   lands and when the account is forgotten, and reads it again when the voice settings open or
   keeper comes back to the front — so a fetch started by a sync while the settings are open is
   followed to its end. A device whose voice runs no turn models shows no line. Without them a
   turn ends 1.8 s after the person stops, as before.
-- **The order of the steps.** Add the two folders (with the `.gitattributes` rule in place, so
-  they go to LFS) and push; then, **only once every signed-in Mac runs a keeper with the turn
-  models** (Epic 97), add `[vad]` and `[smart_turn]` to `models.toml` and push. A Mac on an older
-  keeper refuses the whole file and stops transcribing until it is updated.
+- **The order of the steps.** Add the two folders to the set and publish it; then, **only once
+  every signed-in Mac runs a keeper with the turn models** (Epic 97), add `[vad]` and
+  `[smart_turn]` to `models.toml` and publish again. A Mac on an older keeper refuses the whole
+  file and stops transcribing until it is updated.
 
 ### Adding or upgrading a model set
 
-1. Put the new folders under `_models/` next to the old ones (a new folder name, e.g.
-   `parakeet-tdt-0.6b-v4/`), with the `.gitattributes` rule above in place **before** the
-   first `git add`, so the files go to LFS and not into git history. Add their licence files.
-2. Point `models.toml` at them, commit and push. Every signed-in Mac that can transcribe
-   hydrates the new files on its next sync; files the set no longer names stay in
-   `<data_dir>/models/` and are simply not loaded.
+1. Put the new folders in the set's directory next to the old ones (a new folder name, e.g.
+   `parakeet-tdt-0.6b-v4/`), with their licence files.
+2. Point `models.toml` at them and publish with `hq-admin models put <dir>`. Every paired Mac
+   that can transcribe hydrates the new files at its next fetch; files the set no longer names
+   stay in `<data_dir>/models/` and are simply not loaded.
 3. **Changing the embedding model** means a new `[embedding] id`. Bank vectors are kept per
    embedding model, under `embeddings/<id>/`, and a vector from one model is not comparable
    with another's. Voice clips are model-free, so nothing is lost: before matching, each

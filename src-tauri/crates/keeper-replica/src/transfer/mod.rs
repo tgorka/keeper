@@ -26,7 +26,7 @@ mod download;
 mod grants;
 mod upload;
 
-pub use grants::{announced_store, HttpGrants};
+pub use grants::{announced_store, BlobRouteGrants, HttpGrants};
 
 /// The code a URL off the server's and its store's origins fails with.
 pub const FOREIGN: &str = "transport.foreign_origin";

@@ -157,22 +157,30 @@ fn disk(data_dir: &Path) -> (PathBuf, TurnDisk) {
         Ok(set) => model_files::turn_missing(&root, set),
         Err(_) => Vec::new(),
     };
+    let active = crate::org_models::active();
     let current = chosen.is_ok()
         && missing.is_empty()
-        && crate::account_ipc::models_current(data_dir, &root, &turn_group(data_dir));
+        && crate::org_models::models_current(
+            active.as_ref(),
+            &root,
+            &turn_group(data_dir, active.as_ref()),
+        );
     let disk = TurnDisk {
-        account: crate::account_ipc::descriptor().is_some(),
+        account: crate::org_models::has_server(),
         chosen,
         missing,
         current,
-        marker: keeper_sync::config_repo::completion_digest(&root, TURN_GROUP),
+        marker: keeper_settings::models::ready_digest(&root, TURN_GROUP),
     };
     (root, disk)
 }
 
-/// The turn group as the account's clone and the picks name it now.
-fn turn_group(data_dir: &Path) -> model_files::FetchGroup {
-    let (_, repo) = crate::account_ipc::clone_models(data_dir);
+/// The turn group as the active model set and the picks name it now.
+fn turn_group(
+    data_dir: &Path,
+    active: Option<&keeper_settings::models::ActiveSet>,
+) -> model_files::FetchGroup {
+    let repo = crate::org_models::repo_set(active);
     let (vad, smart_turn) = registry::get_turn_models(data_dir).unwrap_or_default();
     model_files::turn_group(&repo, &vad, &smart_turn)
 }
@@ -215,7 +223,7 @@ fn load(ticket: Ticket, root: &Path, generation: TurnGeneration) {
         ),
         Err(error) => tracing::warn!(%error, "voice: the turn models could not be loaded"),
     }
-    let marker = keeper_sync::config_repo::completion_digest(root, TURN_GROUP);
+    let marker = keeper_settings::models::ready_digest(root, TURN_GROUP);
     if marker.as_deref() != Some(generation.marker.as_str()) {
         tracing::info!("voice: the turn models changed while loading; not published");
         return;

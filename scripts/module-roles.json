@@ -23,6 +23,7 @@
   "keeper-runtime": "runtime",
   "keeper-runtime-api": "contract",
   "keeper-settings-api": "contract",
+  "keeper-settings": "implementation",
   "keeper-testkit": "provider",
   "keeper-sync": "legacy",
   "keeper-syncd": "legacy",

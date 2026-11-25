@@ -124,6 +124,16 @@ describe("Transcription settings", () => {
 });
 
 describe("Transcription models", () => {
+  it("shows the published model set version the ready models came from", async () => {
+    const status = await ipc.transcriptionStatus();
+    vi.mocked(ipc.transcriptionStatus).mockResolvedValue({
+      ...status,
+      models: { state: "ready", sentence: "Ready", missing: [], version: "ab12cd34ef56".repeat(4) },
+    });
+    render(<TranscriptionSection open />);
+    expect(await screen.findByText("Model set version ab12cd34ef56")).toBeTruthy();
+  });
+
   it("offers the repository's choice first, disables incomplete ones and writes the key", async () => {
     const status = await ipc.transcriptionStatus();
     vi.mocked(ipc.transcriptionSettingsSet).mockResolvedValue({

@@ -4666,6 +4666,7 @@ dependencies = [
  "keeper-replica",
  "keeper-runtime",
  "keeper-runtime-api",
+ "keeper-settings",
  "keeper-sync",
  "keeper-wire",
  "keeper-wire-api",
@@ -5092,6 +5093,23 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "ts-rs",
+]
+
+[[package]]
+name = "keeper-settings"
+version = "0.12.0"
+dependencies = [
+ "hex",
+ "keeper-paths",
+ "keeper-ports",
+ "keeper-replica",
+ "keeper-settings-api",
+ "keeper-testkit",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

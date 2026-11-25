@@ -16,10 +16,11 @@
 //!   download entry point (FluidAudio itself carries them; the bridge loads
 //!   models only from a directory it is given).
 //!
-//! The ONE sanctioned fetch of transcription models is the Sync lane's
-//! hydration of the account config repo's `_models/` (keeper-sync
-//! `config_repo`, driven from the shell's account code), which reaches only
-//! the config repo host `docs/egress.md` already lists. It lives outside the
+//! The ONE sanctioned fetch of transcription models is the hydration of the
+//! organisation's model set from its general domain (story 121.3:
+//! `keeper_settings::models` through keeper-replica's blob route, driven from
+//! the shell's `org_models.rs`), which reaches only the agents server and the
+//! object store it names, both listed in `docs/egress.md`. It lives outside the
 //! scanned set on purpose: the engine and the job never fetch, they find a
 //! complete set on disk or refuse.
 //!

@@ -1,0 +1,29 @@
+[package]
+name = "keeper-settings"
+description = "A device's side of the settings that live with its data: the organisation's model set hydrated from the general domain's rows (story 121.3)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# An implementation (DF/AD-2/3): contracts, ports and the path leaf only —
+# never keeper-core, keeper-sync or another implementation. `bun run
+# check:module-edges` holds it there.
+[dependencies]
+keeper-settings-api = { path = "../keeper-settings-api" }
+keeper-ports = { path = "../keeper-ports" }
+keeper-paths = { path = "../keeper-paths" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+keeper-testkit = { path = "../keeper-testkit" }
+keeper-replica = { path = "../keeper-replica" }

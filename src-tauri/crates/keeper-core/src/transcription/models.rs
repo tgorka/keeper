@@ -464,29 +464,24 @@ fn names_for_transcription(repo: &ModelSet, folder: &str) -> bool {
     folder == repo.asr_dir || folder == repo.diarizer_dir
 }
 
-/// The transcription group: every folder of the clone's `_models/`
-/// (`clone_models`) but the turn models' — the ones [`turn_folders`] names,
-/// and any other folder holding a turn model's file (an older version kept
-/// beside the one `models.toml` names now). So the speech and speaker models
-/// a person may pick are all here, the two groups never share a folder, and
-/// no turn model, picked or replaced, makes transcription look half-updated.
+/// The transcription group: every folder of the active model set but the
+/// turn models' — the ones [`turn_folders`] names, and any other folder
+/// holding a turn model's file (an older version kept beside the one
+/// `models.toml` names now). `set_paths` are the set's file paths under its
+/// root. So the speech and speaker models a person may pick are all here,
+/// the two groups never share a folder, and no turn model, picked or
+/// replaced, makes transcription look half-updated.
 pub fn transcription_group(
-    clone_models: &Path,
+    set_paths: &[String],
     repo: &ModelSet,
     vad: &str,
     smart_turn: &str,
 ) -> FetchGroup {
     let mut turn = turn_folders(repo, vad, smart_turn);
-    if let Ok(listing) = std::fs::read_dir(clone_models) {
-        turn.extend(
-            listing
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                .filter(|entry| entry.path().join(ONNX_MODEL).is_file())
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| !names_for_transcription(repo, name)),
-        );
-    }
+    turn.extend(set_paths.iter().filter_map(|path| {
+        let (folder, file) = path.split_once('/')?;
+        (file == ONNX_MODEL && !names_for_transcription(repo, folder)).then(|| folder.to_owned())
+    }));
     turn.sort();
     turn.dedup();
     FetchGroup {
@@ -505,19 +500,19 @@ pub fn turn_group(repo: &ModelSet, vad: &str, smart_turn: &str) -> FetchGroup {
 
 /// What a machine hydrates: the transcription group where it can
 /// transcribe, the turn group where its voice runs turn models, nothing
-/// where it does neither. `clone_models` is the clone's `_models/`, `repo`
-/// the set its `models.toml` names now and `vad`/`smart_turn` the picks.
+/// where it does neither. `set_paths` are the active set's file paths,
+/// `repo` the set its `models.toml` names and `vad`/`smart_turn` the picks.
 pub fn fetch_groups(
     transcribes: bool,
     takes_turns: bool,
-    clone_models: &Path,
+    set_paths: &[String],
     repo: &ModelSet,
     vad: &str,
     smart_turn: &str,
 ) -> Vec<FetchGroup> {
     let mut groups = Vec::with_capacity(2);
     if transcribes {
-        groups.push(transcription_group(clone_models, repo, vad, smart_turn));
+        groups.push(transcription_group(set_paths, repo, vad, smart_turn));
     }
     if takes_turns {
         groups.push(turn_group(repo, vad, smart_turn));
@@ -829,7 +824,7 @@ mod tests {
 
     #[test]
     fn each_machine_fetches_the_roles_it_can_run() {
-        let clone = models_root();
+        let set_paths: Vec<String> = Vec::new();
         let repo = ModelSet::from_toml(TURN_TOML).expect("parse");
         let turn_dirs = || vec!["silero-vad".to_owned(), "smart-turn-v3".to_owned()];
         let transcription = FetchGroup {
@@ -841,7 +836,7 @@ mod tests {
             folders: Folders::Only(turn_dirs()),
         };
         let groups = |transcribes, takes_turns, repo: &ModelSet, vad: &str, smart_turn: &str| {
-            fetch_groups(transcribes, takes_turns, &clone, repo, vad, smart_turn)
+            fetch_groups(transcribes, takes_turns, &set_paths, repo, vad, smart_turn)
         };
 
         // A Mac on macOS 15 or later: both groups.
@@ -883,9 +878,9 @@ mod tests {
     /// missing object can never fail transcription's hydration.
     #[test]
     fn a_picked_turn_model_is_never_transcriptions() {
-        let clone = models_root();
+        let set_paths: Vec<String> = Vec::new();
         let repo = ModelSet::from_toml(TURN_TOML).expect("parse");
-        let groups = fetch_groups(true, true, &clone, &repo, " silero-vad-v7 ", "../x");
+        let groups = fetch_groups(true, true, &set_paths, &repo, " silero-vad-v7 ", "../x");
         let picked = vec![
             "silero-vad".to_owned(),
             "silero-vad-v7".to_owned(),
@@ -916,15 +911,20 @@ mod tests {
     /// as they were, so its digest does not move.
     #[test]
     fn a_turn_model_version_switch_leaves_transcriptions_group_alone() {
-        let clone = models_root();
-        for dir in ["silero-vad", "smart-turn-v3", "smart-turn-v4"] {
-            hydrate(&clone, ModelRole::Vad, dir, 0);
-        }
-        hydrate(&clone, ModelRole::Asr, DEFAULT_ASR_DIR, 0);
+        let mut set_paths: Vec<String> = ["silero-vad", "smart-turn-v3", "smart-turn-v4"]
+            .iter()
+            .map(|dir| format!("{dir}/{ONNX_MODEL}"))
+            .collect();
+        set_paths.push(format!("{DEFAULT_ASR_DIR}/config.json"));
         let before = TURN_TOML;
         let after = "[vad]\ndir = \"silero-vad\"\n\n[smart_turn]\ndir = \"smart-turn-v4\"\n";
         let group = |raw: &str| {
-            transcription_group(&clone, &ModelSet::from_toml(raw).expect("parse"), "", "")
+            transcription_group(
+                &set_paths,
+                &ModelSet::from_toml(raw).expect("parse"),
+                "",
+                "",
+            )
         };
         assert_eq!(group(before), group(after));
         assert_eq!(
@@ -952,6 +952,5 @@ mod tests {
         assert_eq!(turn(before.as_bytes()), turn(asr.as_bytes()));
         // A file that does not parse has no meaning to offer: its bytes count.
         assert_eq!(transcription(b"[asr\n"), None);
-        std::fs::remove_dir_all(&clone).expect("cleanup");
     }
 }

@@ -212,6 +212,31 @@ fn store_slot(stores: &mut HashMap<String, StoreSlot>, database: &str) -> StoreS
     stores.entry(database.to_owned()).or_default().clone()
 }
 
+/// The general domain's replica and its server's blob route
+/// ([`Hq::general_source`]): what the model set is read from and fetched
+/// through (story 121.3).
+#[derive(Clone)]
+pub struct GeneralSource {
+    pub database: String,
+    pub replica: Arc<dyn Replica>,
+    /// The domain's mount on the server (`<server>/<database>`).
+    pub base_url: String,
+    /// This device's credential on the server.
+    pub token: String,
+    /// The object store origin the server announced for the domain.
+    pub store: StoreSlot,
+}
+
+impl std::fmt::Debug for GeneralSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneralSource")
+            .field("database", &self.database)
+            .field("base_url", &self.base_url)
+            .field("token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 struct Db {
     name: String,
     replica: Arc<dyn Replica>,
@@ -551,6 +576,28 @@ impl Hq {
             .iter()
             .find(|db| db.name == database)
             .map(|db| Arc::clone(&db.replica))
+    }
+
+    /// The organisation's general domain as this device holds it, linked
+    /// (story 121.3): its replica, whose `config_values` rows name the model
+    /// set, and what the blob route of its server is reached with. `None`
+    /// with no server paired, no general domain held, or one that does not
+    /// sync. Chosen by its discovery kind, never by its name.
+    pub fn general_source(&self) -> Option<GeneralSource> {
+        let inner = lock(&self.inner);
+        let server = inner.server.as_ref()?;
+        let pairing = inner.pairing.as_ref()?;
+        let db = inner.dbs.iter().find(|db| {
+            db.linked
+                && inner.domains.kind_of(&db.name) == Some(keeper_accounts_api::DomainKind::General)
+        })?;
+        Some(GeneralSource {
+            database: db.name.clone(),
+            replica: Arc::clone(&db.replica),
+            base_url: server.mount(&db.name),
+            token: pairing.token.clone(),
+            store: inner.stores.get(&db.name).cloned().unwrap_or_default(),
+        })
     }
 
     /// The replica of what is written while no server is paired.

@@ -68,7 +68,6 @@ use keeper_core::org_account::{log_upload, oidc, AccountError};
 use keeper_core::platform::Platform;
 use keeper_core::providers::{self, Provider, ProviderKind};
 use keeper_core::registry;
-use keeper_core::transcription::models as model_files;
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::config_repo::{self, Author, PushResult, RepoAuth, RepoSpec, Write};
 use keeper_sync::SyncError;
@@ -180,9 +179,6 @@ struct Runtime {
     daily_kicked_ms: Mutex<Option<i64>>,
     #[cfg(desktop)]
     daily_running: AtomicBool,
-    /// Stops the models hydration in flight (AD-341); its own flag, because
-    /// it runs beside syncs rather than inside one.
-    models_interrupt: Mutex<Arc<AtomicBool>>,
     /// How many sign-ins have started: the newest owns the attempt line, so
     /// one a newer sign-in superseded (`account_sign_in`) does not write its
     /// closed attempt over the newer one's.
@@ -226,148 +222,6 @@ fn now_ms() -> i64 {
 /// The account's HTTP client, for the provider and drive credential paths too.
 pub fn http() -> Result<&'static reqwest::Client, String> {
     HTTP.as_ref().map_err(Clone::clone)
-}
-
-/// The client the models move through (AD-341): keeper-sync's transfer
-/// client, whose guard is silence rather than duration — the account client's
-/// sixty-second ceiling would end a multi-hundred-megabyte model mid-object.
-static MODELS_HTTP: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
-    keeper_sync::http::transfer_client(keeper_sync::AGENT).map_err(|error| error.to_string())
-});
-
-/// Why the models could not be hydrated.
-pub enum ModelsFetchError {
-    /// No account, or one that has never fetched its repository.
-    NoAccount,
-    /// The sentence to show.
-    Failed(String),
-}
-
-/// Hydrate `group`'s part of the config repository's `_models/` into `dest`
-/// (AD-341) with the repository's own credential, from the clone the last
-/// sync left. Only the config repository's host is reached; nothing else is
-/// asked for models.
-pub async fn hydrate_models(
-    platform: Arc<dyn Platform>,
-    dest: PathBuf,
-    group: &model_files::FetchGroup,
-) -> Result<config_repo::HydrateReport, ModelsFetchError> {
-    let Some(d) = descriptor() else {
-        return Err(ModelsFetchError::NoAccount);
-    };
-    let data_dir = platform
-        .data_dir()
-        .map_err(|error| ModelsFetchError::Failed(error.to_string()))?;
-    let clone = clone_dir(&data_dir, &d.id);
-    if !clone.join(".git").exists() {
-        return Err(ModelsFetchError::NoAccount);
-    }
-    let http = http().map_err(ModelsFetchError::Failed)?;
-    let transfer: &'static reqwest::Client = MODELS_HTTP
-        .as_ref()
-        .map_err(|error| ModelsFetchError::Failed(error.clone()))?;
-    let mut auth = repo_credential(platform.as_ref(), http, &d)
-        .await
-        .map_err(|error| ModelsFetchError::Failed(error.to_string()))?;
-    let interrupt = Arc::new(AtomicBool::new(false));
-    *lock(&RUNTIME.models_interrupt) = Arc::clone(&interrupt);
-    // Not `off_runtime`: that counts in `RUNTIME.blocking`, and every sync's
-    // end waits on it while holding the gate — a first download of hundreds
-    // of megabytes would hold every sync and settings push for its length.
-    // Only `models_interrupt` stops this one.
-    let hydrated = with_forge_retry(platform.as_ref(), http, &d, &mut auth, |auth| {
-        let (clone, dest, url, interrupt, group) = (
-            clone.clone(),
-            dest.clone(),
-            d.config.url.clone(),
-            Arc::clone(&interrupt),
-            group.clone(),
-        );
-        let handle = tokio::runtime::Handle::current();
-        async move {
-            tokio::task::spawn_blocking(move || {
-                handle.block_on(async move {
-                    config_repo::hydrate_lfs_dir(
-                        transfer,
-                        &clone,
-                        model_files::CONFIG_MODELS_DIR,
-                        hydrate_group(&group),
-                        &url,
-                        &auth,
-                        &dest,
-                        &interrupt,
-                    )
-                    .await
-                })
-            })
-            .await
-            .map_err(|error| format!("the models task ended unexpectedly: {error}"))
-        }
-    })
-    .await;
-    match hydrated {
-        Ok(Ok(report)) => Ok(report),
-        Ok(Err(error)) => Err(ModelsFetchError::Failed(error.to_string())),
-        Err(sentence) => Err(ModelsFetchError::Failed(sentence)),
-    }
-}
-
-/// keeper-sync's view of a group core decided on, reading `models.toml` as
-/// core says the group reads it.
-fn hydrate_group(group: &model_files::FetchGroup) -> config_repo::HydrateGroup<'_> {
-    config_repo::HydrateGroup {
-        name: group.name,
-        folders: match &group.folders {
-            model_files::Folders::Only(names) => config_repo::Folders::Only(names),
-            model_files::Folders::AllBut(names) => config_repo::Folders::AllBut(names),
-        },
-        manifest: Some(config_repo::Manifest {
-            file: model_files::MODELS_TOML,
-            fingerprint: group.manifest_fingerprint(),
-        }),
-    }
-}
-
-/// Whether `dest` holds exactly what the account's clone names for `group`
-/// (S2): the group's last hydration finished and the clone has not moved on
-/// since. No account, or no clone, is never current. Blocking: it hashes
-/// the group's non-pointer files in the clone.
-pub fn models_current(data_dir: &Path, dest: &Path, group: &model_files::FetchGroup) -> bool {
-    descriptor().is_some_and(|d| {
-        config_repo::hydration_is_current(
-            &clone_dir(data_dir, &d.id),
-            model_files::CONFIG_MODELS_DIR,
-            hydrate_group(group),
-            dest,
-        )
-    })
-}
-
-/// The account clone's `_models/` and the model set its `models.toml` names
-/// now — what the next hydration brings and what currency is measured
-/// against. Without an account no folder and the default set; without the
-/// file, or with one that does not parse, the default set too, here: the
-/// hydrated copy's refusal is what the person is shown.
-pub fn clone_models(data_dir: &Path) -> (PathBuf, model_files::ModelSet) {
-    let Some(d) = descriptor() else {
-        return (PathBuf::new(), model_files::ModelSet::default());
-    };
-    let dir = clone_dir(data_dir, &d.id).join(model_files::CONFIG_MODELS_DIR);
-    let path = dir.join(model_files::MODELS_TOML);
-    let set = match std::fs::read_to_string(&path) {
-        Ok(raw) => model_files::ModelSet::from_toml(&raw).unwrap_or_else(|error| {
-            tracing::warn!(%error, "account: models.toml does not parse; using the default set");
-            model_files::ModelSet::default()
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            model_files::ModelSet::default()
-        }
-        Err(error) => {
-            tracing::warn!(%error, "account: models.toml does not read; using the default set");
-            model_files::ModelSet::default()
-        }
-    };
-    (dir, set)
 }
 
 /// The configured account, if any — for the credential paths that may use it.
@@ -1252,7 +1106,6 @@ fn fresh_interrupt() {
 fn interrupt_all() {
     RUNTIME.attempts.interrupt();
     lock(&RUNTIME.interrupt).store(true, Ordering::SeqCst);
-    lock(&RUNTIME.models_interrupt).store(true, Ordering::SeqCst);
     // Only the account's sheets: a Matrix sign-in beside it is not ours.
     if let Some(app) = RUNTIME.app.get() {
         use tauri::Manager;

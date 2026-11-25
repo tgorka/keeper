@@ -543,6 +543,7 @@ impl TurnModelsState {
             state,
             sentence: self.sentence(),
             missing,
+            version: None,
         }
     }
 }
