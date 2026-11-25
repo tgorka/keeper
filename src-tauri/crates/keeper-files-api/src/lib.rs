@@ -7,6 +7,7 @@
 //! - [`rows`]: the synced rows — entries, events, operations, the head.
 //! - [`reversal`]: `files.preview_reversal`'s answer (story 116.3).
 //! - [`history`]: `files.history`'s params and pages (story 116.3).
+//! - [`review`]: proposals, decisions, reviews and their reads (story 116.6).
 //! - [`caller`]: who sends a command, and an agent's or a tool's file part.
 //! - [`refusal`]: the closed set of refusal codes.
 //! - [`view`]: what a client shows, each naming its data by `(server, domain)`.
@@ -22,6 +23,7 @@ pub mod ids;
 pub mod names;
 pub mod refusal;
 pub mod reversal;
+pub mod review;
 pub mod rows;
 pub mod rules;
 pub mod view;

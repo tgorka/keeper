@@ -53,11 +53,7 @@ pub(crate) fn authorize(
                 return Err(Refusal::new(Code::Forbidden));
             }
             if matches!(role, Role::Editor)
-                && reverses.is_some_and(|event_id| {
-                    !m.events
-                        .get(event_id)
-                        .is_some_and(|(event, _)| event.actor_id == caller.actor_id())
-                })
+                && reverses.is_some_and(|event_id| !owns(m, event_id, caller.actor_id()))
             {
                 return Err(Refusal::new(Code::Forbidden));
             }
@@ -76,11 +72,7 @@ pub(crate) fn authorize(
             // A reversal lands by the `write` class's mode; `reverse_own` only gates
             // whose events may be reversed (decision 3).
             if let Some(event_id) = reverses {
-                let is_own = m
-                    .events
-                    .get(event_id)
-                    .is_some_and(|(event, _)| event.actor_id == caller.actor_id());
-                if !is_own {
+                if !owns(m, event_id, caller.actor_id()) {
                     return Err(Refusal::new(Code::Forbidden));
                 }
             }
@@ -131,6 +123,18 @@ pub(crate) fn authorize(
             })
         }
     }
+}
+
+/// Whether `actor` owns event `event_id`'s effect: an approved proposal's
+/// proposer, else the event's actor (story 116.6).
+fn owns(m: &Manifest, event_id: &str, actor: &str) -> bool {
+    m.events.get(event_id).is_some_and(|(event, _)| {
+        let owner = match &event.approval_basis {
+            ApprovalBasis::Proposal { proposer_actor, .. } => proposer_actor,
+            _ => &event.actor_id,
+        };
+        owner == actor
+    })
 }
 
 /// Resolves `id` through any earlier `Create` in `ops` to a pre-change id.

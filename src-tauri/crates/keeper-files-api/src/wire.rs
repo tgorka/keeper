@@ -8,8 +8,8 @@ use crate::names::FileMode;
 use crate::rows::Kind;
 
 /// The registered command descriptors of this contract. `files.reverse` is
-/// 116.3's; 116.6 adds `files.propose`, `files.decide`, `files.acknowledge`.
-pub const DESCRIPTORS: [&str; 7] = [
+/// 116.3's; `files.propose`, `files.decide` and `files.acknowledge` 116.6's.
+pub const DESCRIPTORS: [&str; 10] = [
     "files.change",
     "files.put",
     "files.move",
@@ -17,9 +17,14 @@ pub const DESCRIPTORS: [&str; 7] = [
     "files.restore",
     "files.import",
     "files.reverse",
+    "files.propose",
+    "files.decide",
+    "files.acknowledge",
 ];
 
-/// A job's effect identity: reserved, refused when set (epic 122).
+/// A job's effect identity (epic 122): accepted only from a job caller, whose
+/// attempt the server's registration point judged current (story 116.6);
+/// from anyone else `reserved_field`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobRef {
@@ -171,4 +176,99 @@ pub struct ImportPayload {
 #[serde(deny_unknown_fields)]
 pub struct ReversePayload {
     pub event_id: String,
+}
+
+/// The most reviewers a revision enumerates.
+pub const REVIEWERS_MAX: usize = 16;
+
+/// The most items one `files.decide` or `files.acknowledge` list holds (the
+/// change bound, [`crate::CHANGE_LIMIT`]).
+pub const LIST_MAX: usize = crate::CHANGE_LIMIT;
+
+/// Who may decide a revision: 1 to [`REVIEWERS_MAX`] ascending distinct
+/// person actor ids, or the role — any person holding `reviewer` or `owner`
+/// in the domain when the decision is made (`{"role": "reviewer"}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Reviewers {
+    Actors(Vec<String>),
+    Role(RoleReviewers),
+}
+
+/// The role form of [`Reviewers`]: `{"role": "reviewer"}`, nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleReviewers {
+    pub role: ReviewerRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerRole {
+    Reviewer,
+}
+
+/// A proposal's `change`: one `files.change` payload without its own
+/// `change_set_id` (the proposal's is the one).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedChange {
+    pub operations: Vec<WireOp>,
+    #[serde(default)]
+    pub event_time_ms: Option<i64>,
+}
+
+/// `files.propose`'s payload: a new proposal (`base_revision` null,
+/// revision 1) or the next revision of the proposer's own open one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposePayload {
+    pub proposal_id: String,
+    pub base_revision: Option<String>,
+    pub change: ProposedChange,
+    pub reviewers: Reviewers,
+    pub expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub change_set_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Approve,
+    Reject,
+}
+
+/// One decision of a `files.decide` list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Decision {
+    pub proposal_id: String,
+    pub proposal_revision: String,
+    pub proposal_digest: String,
+    pub decision: Verdict,
+}
+
+/// `files.decide`'s payload: 1 to [`LIST_MAX`] decisions, distinct
+/// revisions, whose revisions' `op_count` sum to at most the change bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecidePayload {
+    pub decisions: Vec<Decision>,
+}
+
+/// The event a review names: its id and its `delta_digest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub target_event_id: String,
+    pub target_delta_digest: String,
+}
+
+/// `files.acknowledge`'s payload: 1 to [`LIST_MAX`] distinct targets,
+/// acknowledged as one event or refused whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgePayload {
+    pub targets: Vec<Target>,
 }

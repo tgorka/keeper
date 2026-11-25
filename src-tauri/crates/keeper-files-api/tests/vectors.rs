@@ -193,6 +193,7 @@ fn build_fixture(name: &str) -> Manifest {
         events: BTreeMap::new(),
         objects: spec.objects.into_iter().collect(),
         bindings: BTreeMap::new(),
+        ..Manifest::default()
     }
 }
 

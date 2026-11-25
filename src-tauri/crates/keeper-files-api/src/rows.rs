@@ -191,3 +191,89 @@ pub enum Outcome {
     Conflict,
     Rejected,
 }
+
+/// A proposal revision's `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Open,
+    Approved,
+    Rejected,
+    Expired,
+    Superseded,
+}
+
+/// One `files_proposals` row (schema 14): one immutable revision, `id`
+/// `<proposal_id>/<revision>`. `change` is the canonical
+/// [`crate::wire::ProposedChange`], `reviewers` the canonical
+/// [`crate::wire::Reviewers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    pub id: String,
+    pub domain: String,
+    pub proposal_id: String,
+    pub revision: String,
+    pub status: ProposalStatus,
+    pub reason: Option<String>,
+    pub digest: String,
+    pub change: Value,
+    pub reviewers: crate::wire::Reviewers,
+    pub expires_at_ms: Option<i64>,
+    pub proposer_actor: String,
+    pub proposer_client: String,
+    pub proposer_context: Option<String>,
+    pub origin_actor: Option<String>,
+    pub origin_chain: Option<Value>,
+    pub source_labels: Vec<String>,
+    pub created_at_ms: i64,
+    pub decided_at_ms: Option<i64>,
+    pub decided_by: Option<String>,
+    pub decided_event_id: Option<String>,
+    pub change_set_id: Option<String>,
+    pub job_id: Option<String>,
+    pub job_ordinal: Option<i64>,
+    pub job_attempt_id: Option<String>,
+}
+
+/// One `files_proposal_reviewers` row: a reviewer's inbox entry, ids and
+/// status only. `id` is `<proposal_id>/<revision>/<reviewer_actor>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalReviewer {
+    pub id: String,
+    pub domain: String,
+    pub reviewer_actor: String,
+    pub proposal_id: String,
+    pub revision: String,
+    pub status: ProposalStatus,
+    pub proposer_actor: String,
+    pub change_set_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub op_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewKind {
+    Acknowledgement,
+    Reversal,
+}
+
+/// One `files_reviews` row: equal to its `review` operation's after-image
+/// (`id`, `target_event_id`, `target_delta_digest`, `kind`,
+/// `reviewer_actor`, `revision` `"1"`), plus `domain`, its own event's
+/// `page_key` and `created_event_id`. Never updated or deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Review {
+    pub id: String,
+    pub domain: String,
+    pub page_key: String,
+    pub target_event_id: String,
+    pub target_delta_digest: String,
+    pub kind: ReviewKind,
+    pub reviewer_actor: String,
+    pub revision: String,
+    pub created_event_id: String,
+}

@@ -224,6 +224,8 @@ impl FilesServer {
             recorded_at_ms,
             client_id: client_id.to_owned(),
             review_id: None,
+            event_ids: Vec::new(),
+            review_ids: Vec::new(),
         };
 
         let result = evaluate(&mut state.manifest, caller, descriptor, &params, &server);

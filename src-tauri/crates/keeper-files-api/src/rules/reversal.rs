@@ -29,6 +29,7 @@ pub fn preview_reversal(m: &Manifest, caller: &Caller, params: &Value) -> Result
         descriptor: "files.reverse".to_owned(),
         request_id: parsed.event_id.clone(),
         context_id: None,
+        job: None,
         digest: Value::Null,
         body: Body::Reverse {
             event_id: parsed.event_id.clone(),

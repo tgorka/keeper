@@ -11,7 +11,8 @@ use crate::names::{self, FileMode};
 use crate::refusal::{Code, Refusal};
 use crate::rows::Kind;
 use crate::wire::{
-    self, ChangePayload, Envelope, ImportPayload, ReversePayload, ShorthandPayload, WireOp,
+    self, AcknowledgePayload, ChangePayload, DecidePayload, Envelope, ImportPayload,
+    ProposePayload, ReversePayload, ShorthandPayload, WireOp,
 };
 
 const fn invalid() -> Refusal {
@@ -46,8 +47,19 @@ pub(crate) fn digest_value(descriptor: &str, params: &Value) -> Value {
 pub(crate) fn parse(caller: &Caller, descriptor: &str, params: &Value) -> Result<Request, Refusal> {
     // Step 3: envelope shape, reserved fields, context_id rules, ULIDs.
     let env: Envelope = serde_json::from_value(params.clone()).map_err(|_| invalid())?;
-    if env.approval_id.is_some() || env.job.is_some() {
+    // `job` is a job caller's alone (the server's registration point judged
+    // its attempt current before deriving one); a job caller always names it.
+    let is_job = matches!(caller, Caller::Job { .. });
+    if env.approval_id.is_some() || (env.job.is_some() && !is_job) {
         return Err(Refusal::new(Code::ReservedField));
+    }
+    if is_job && env.job.is_none() {
+        return Err(Refusal::new(Code::Forbidden));
+    }
+    if env.job.as_ref().is_some_and(|job| {
+        !ids::is_ulid(&job.job_id) || !ids::is_ulid(&job.attempt_id) || job.ordinal < 0
+    }) {
+        return Err(invalid());
     }
     match caller {
         Caller::Agent { .. } => {
@@ -101,6 +113,7 @@ pub(crate) fn parse(caller: &Caller, descriptor: &str, params: &Value) -> Result
         descriptor: descriptor.to_owned(),
         request_id: env.request_id,
         context_id: env.context_id,
+        job: env.job,
         digest: digest_value(descriptor, params),
         body,
     })
@@ -166,6 +179,22 @@ fn parse_body(descriptor: &str, payload: Value) -> Result<Body, Refusal> {
             Ok(Body::Reverse {
                 event_id: parsed.event_id,
             })
+        }
+        // Shapes only here: `rules::propose` and `rules::decide` judge the
+        // rest (bounds, reviewers, revisions) in their own order.
+        "files.propose" => {
+            let parsed: ProposePayload = serde_json::from_value(payload).map_err(|_| invalid())?;
+            validate_ops(&parsed.change.operations, false)?;
+            Ok(Body::Propose(parsed))
+        }
+        "files.decide" => {
+            let parsed: DecidePayload = serde_json::from_value(payload).map_err(|_| invalid())?;
+            Ok(Body::Decide(parsed))
+        }
+        "files.acknowledge" => {
+            let parsed: AcknowledgePayload =
+                serde_json::from_value(payload).map_err(|_| invalid())?;
+            Ok(Body::Acknowledge(parsed.targets))
         }
         _ => Err(invalid()),
     }
