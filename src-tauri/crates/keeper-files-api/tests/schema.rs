@@ -75,7 +75,7 @@ fn is_snake_ident(name: &str) -> bool {
 }
 
 #[test]
-fn six_files_tables_and_exact_scopes() {
+fn files_tables_and_exact_scopes() {
     let ir = parse_ir();
     let expected: BTreeMap<&str, (&str, &str)> = BTreeMap::from([
         ("files_entries", ("files_drive", "drive_key")),
@@ -84,6 +84,12 @@ fn six_files_tables_and_exact_scopes() {
         ("files_event_ops", ("files_page", "page_key")),
         ("files_head", ("files_domain", "domain")),
         ("files_receipts", ("files_client", "client_scope")),
+        ("files_proposals", ("files_proposal", "proposer_actor")),
+        (
+            "files_proposal_reviewers",
+            ("files_reviewer", "reviewer_actor"),
+        ),
+        ("files_reviews", ("files_page", "page_key")),
     ]);
 
     let actual_files_tables: BTreeSet<&str> = ir
@@ -274,17 +280,10 @@ fn reserved_governance_and_op_columns_present() {
 fn deferred_tables_and_facts_scopes_absent() {
     let ir = parse_ir();
     let table_names: BTreeSet<&str> = ir.tables.iter().map(|t| t.name.as_str()).collect();
-    for forbidden in [
-        "files_facts",
-        "files_proposals",
-        "files_reviews",
-        "files_proposal_reviewers",
-    ] {
-        assert!(
-            !table_names.contains(forbidden),
-            "table '{forbidden}' must not exist yet"
-        );
-    }
+    assert!(
+        !table_names.contains("files_facts"),
+        "table 'files_facts' must not exist yet"
+    );
 
     for table in &ir.tables {
         for scope in &table.scopes {
@@ -336,4 +335,131 @@ fn no_path_columns_and_entry_sources_scope() {
     let entry_sources = table_by_name(&ir, "files_entry_sources");
     assert_eq!(entry_sources.scopes.len(), 1);
     assert_eq!(entry_sources.scopes[0].variable, "files_sources");
+}
+
+#[test]
+fn review_tables_and_exact_scopes() {
+    let ir = parse_ir();
+    let expected: BTreeMap<&str, (&str, &str)> = BTreeMap::from([
+        ("files_proposals", ("files_proposal", "proposer_actor")),
+        (
+            "files_proposal_reviewers",
+            ("files_reviewer", "reviewer_actor"),
+        ),
+        ("files_reviews", ("files_page", "page_key")),
+    ]);
+
+    for (table_name, (exp_var, exp_col)) in expected {
+        let table = table_by_name(&ir, table_name);
+        assert_eq!(
+            table.scopes.len(),
+            1,
+            "{table_name} must have exactly one scope"
+        );
+        let scope = &table.scopes[0];
+        assert_eq!(scope.variable, exp_var, "{table_name} scope variable");
+        assert_eq!(scope.column, exp_col, "{table_name} scope column");
+        assert_eq!(
+            scope.pattern,
+            format!("{exp_var}:{{{exp_var}}}"),
+            "{table_name} scope pattern"
+        );
+    }
+
+    let manifest = parse_manifest();
+    let subscriptions = manifest["subscriptions"]
+        .as_array()
+        .expect("manifest.subscriptions");
+    for (sub_name, exp_var) in [
+        ("filesProposals", "files_proposal"),
+        ("filesReviewer", "files_reviewer"),
+    ] {
+        let sub = subscriptions
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(sub_name))
+            .unwrap_or_else(|| panic!("missing subscription '{sub_name}' in syncular.json"));
+        let scopes = sub["scopes"].as_object().expect("subscription.scopes");
+        assert_eq!(scopes.len(), 1, "subscription '{sub_name}' scope count");
+        assert_eq!(
+            scopes.get(exp_var).and_then(Value::as_str),
+            Some("{actorId}"),
+            "subscription '{sub_name}' scope '{exp_var}'"
+        );
+    }
+
+    let schema_versions = manifest["schemaVersions"]
+        .as_array()
+        .expect("manifest.schemaVersions");
+    let last = schema_versions
+        .last()
+        .expect("manifest.schemaVersions non-empty");
+    assert_eq!(last["version"].as_u64(), Some(14), "last schema version");
+    assert_eq!(
+        last["through"].as_str(),
+        Some("0014_files_review"),
+        "last schema through"
+    );
+}
+
+#[test]
+fn proposal_columns_twin_kg_proposals() {
+    let ir = parse_ir();
+    let kg_proposals = column_names(table_by_name(&ir, "kg_proposals"));
+    let files_proposals = column_names(table_by_name(&ir, "files_proposals"));
+
+    let mut expected: BTreeSet<&str> = kg_proposals
+        .into_iter()
+        .filter(|col| *col != "graph")
+        .collect();
+    expected.extend([
+        "domain",
+        "change_set_id",
+        "job_id",
+        "job_ordinal",
+        "job_attempt_id",
+    ]);
+
+    assert_eq!(files_proposals, expected);
+}
+
+#[test]
+fn review_columns_twin_kg_reviews() {
+    let ir = parse_ir();
+    let kg_reviews = column_names(table_by_name(&ir, "kg_reviews"));
+    let files_reviews = column_names(table_by_name(&ir, "files_reviews"));
+
+    let mut expected: BTreeSet<&str> = kg_reviews
+        .into_iter()
+        .filter(|col| *col != "graph")
+        .collect();
+    expected.extend(["domain", "page_key"]);
+
+    assert_eq!(files_reviews, expected);
+}
+
+#[test]
+fn inbox_holds_no_content() {
+    let ir = parse_ir();
+    let cols = column_names(table_by_name(&ir, "files_proposal_reviewers"));
+    let expected = BTreeSet::from([
+        "id",
+        "domain",
+        "reviewer_actor",
+        "proposal_id",
+        "revision",
+        "status",
+        "proposer_actor",
+        "change_set_id",
+        "expires_at_ms",
+        "op_count",
+        "author_actor",
+        "author_client",
+    ]);
+    assert_eq!(cols, expected);
+    for forbidden in ["change", "digest", "reviewers"] {
+        assert!(
+            !cols.contains(forbidden),
+            "files_proposal_reviewers must not hold '{forbidden}'"
+        );
+    }
 }
