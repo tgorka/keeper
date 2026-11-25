@@ -3,7 +3,7 @@
 //! server waits in the queue under the request id it was given and is
 //! committed by a later [`Files::flush`]. A put the server answers with
 //! `conflict` (another device's change came first) keeps the person's
-//! bytes as a new entry beside it, named by `keeper-paths`' conflict name,
+//! bytes as a new entry beside it, named by `keeper-files-api`'s conflict-copy rule,
 //! through an ordinary put (116.3's rule): nothing a person put is lost.
 
 use std::path::Path;
@@ -372,8 +372,9 @@ impl Files {
 
     /// The put that keeps `pending`'s bytes after a conflict: a new entry
     /// beside the one it meant to write (where that entry lives now, if it
-    /// is still live), named by `keeper-paths`' conflict name and free
-    /// under the fold.
+    /// is still live), named by 116.3's one conflict-copy rule
+    /// (`keeper_files_api::names::conflict_copy_name`) against the folder's
+    /// live children; `None` from it is this put's refusal.
     fn conflict_copy(&self, pending: &Pending) -> Result<Pending, FilesError> {
         let (planned_parent, planned_name) = pending.place();
         let original_id = pending
@@ -393,32 +394,14 @@ impl Files {
             _ => planned_name.to_owned(),
         };
         let stamp = keeper_paths::conflict_stamp(now_ms());
-        let mut name = None;
-        for ordinal in 1..=COPY_ATTEMPTS * 4 {
-            let candidate = if ordinal == 1 {
-                keeper_paths::conflict::conflict_name(Path::new(&base), &stamp, &self.source.client)
-            } else {
-                keeper_paths::conflict::conflict_name_numbered(
-                    Path::new(&base),
-                    &stamp,
-                    &self.source.client,
-                    ordinal,
-                )
-            };
-            let Some(candidate) = candidate.to_str().map(str::to_owned) else {
-                continue;
-            };
-            if keeper_files_api::names::admit_name(&candidate).is_err() {
-                continue;
-            }
-            let fold = keeper_paths::names::name_fold(&candidate);
-            if self.child_by_fold(&parent_id, &fold)?.is_none() {
-                name = Some(candidate);
-                break;
-            }
-        }
+        let taken: Vec<String> = self
+            .children(&parent_id)?
+            .into_iter()
+            .map(|child| child.name_fold)
+            .collect();
         let name =
-            name.ok_or_else(|| FilesError::Storage(format!("no free conflict name for {base}")))?;
+            keeper_files_api::names::conflict_copy_name(&base, &stamp, &self.source.client, &taken)
+                .ok_or_else(|| FilesError::Storage(format!("no free conflict name for {base}")))?;
         Ok(Pending {
             request_id: ulid::Ulid::new().to_string(),
             drive: pending.drive.clone(),

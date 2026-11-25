@@ -747,3 +747,75 @@ fn no_replica_row_holds_file_bytes() {
         fetched.file.display()
     );
 }
+
+/// A conflict copy is named by 116.3's shared rule
+/// (`keeper_files_api::names::conflict_copy_name`), which counts up to
+/// ordinal 1000: with the plain copy name and ordinals 2..=32 already taken
+/// for every stamp the flush can land on, the copy is ordinal 33, not a
+/// refusal.
+#[test]
+fn a_conflict_copy_past_ordinal_32_takes_the_shared_rule_next_free_name() {
+    let world = World::new();
+    let base = pattern(512, 70);
+    let base_cid = world.store.seed(&base);
+    let base_size = u64::try_from(base.len()).expect("size fits u64");
+    let plan_id = world
+        .server
+        .create_file("owner", &world.docs, "plan.md", &base_cid, base_size);
+
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("ms fits i64");
+    let plan = Path::new("plan.md");
+    for second in -2..=30_i64 {
+        let stamp = keeper_paths::conflict_stamp(now_ms + second * 1_000);
+        let first = keeper_paths::conflict::conflict_name(plan, &stamp, "bo.1");
+        let taken = std::iter::once(first).chain((2..=32).map(|ordinal| {
+            keeper_paths::conflict::conflict_name_numbered(plan, &stamp, "bo.1", ordinal)
+        }));
+        for name in taken {
+            let name = name.into_string().expect("utf-8 name");
+            world
+                .server
+                .create_file("owner", &world.docs, &name, &base_cid, base_size);
+        }
+    }
+
+    let dev_a = device(&world, "ana", "ana.1");
+    let dev_b = device(&world, "bo", "bo.1");
+    let plan_target = path_target("Docs/plan.md");
+    dev_a.files.get(&plan_target, &mut |_| {}).expect("A get");
+    dev_b.files.get(&plan_target, &mut |_| {}).expect("B get");
+
+    dev_b.replica.set_online(false);
+    let file_a = write_local(dev_a.dir.path(), "x.md", &pattern(1_024, 71));
+    let file_b = write_local(dev_b.dir.path(), "y.md", &pattern(1_024, 72));
+    let put_a = dev_a
+        .files
+        .put(&file_a, &plan_target, &mut |_| {})
+        .expect("A put");
+    assert_eq!(put_a.outcome, PutOutcome::Accepted);
+    let put_b = dev_b
+        .files
+        .put(&file_b, &plan_target, &mut |_| {})
+        .expect("B put");
+    assert_eq!(put_b.outcome, PutOutcome::Queued);
+
+    dev_b.replica.set_online(true);
+    let flushed_b = dev_b.files.flush().expect("B flush");
+    assert_eq!(flushed_b.len(), 1);
+    match &flushed_b[0].outcome {
+        PutOutcome::ConflictCopy { of, name, .. } => {
+            assert_eq!(of, &plan_id);
+            assert!(
+                name.starts_with("plan.sync-conflict-") && name.ends_with("-bo.1-33.md"),
+                "expected the shared rule's ordinal 33, got {name}"
+            );
+        }
+        other => panic!("expected ConflictCopy, got {other:?}"),
+    }
+}
