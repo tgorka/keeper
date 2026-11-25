@@ -33,7 +33,7 @@ sha2 = { workspace = true }
 keeper-accounts = { path = "../keeper-accounts" }
 keeper-accounts-api = { path = "../keeper-accounts-api" }
 keeper-replica = { path = "../keeper-replica" }
-# `files` (story 116.4): drives, ls, get, put.
+# `files` (stories 116.4, 116.6): drives, ls, get, put; proposals, decisions, reviews, history.
 keeper-files = { path = "../keeper-files" }
 keeper-files-api = { path = "../keeper-files-api" }
 clap = { workspace = true }

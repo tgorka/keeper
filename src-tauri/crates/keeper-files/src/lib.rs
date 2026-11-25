@@ -11,15 +11,21 @@
 //! - [`tree`]: the listing view model, drives, folders, paths.
 //! - [`cache`]: the content-addressed cache and its digest check.
 //! - [`queue`]: the puts waiting for their commit.
+//! - [`review`]: proposals, decisions, acknowledgements, reversals and
+//!   history (story 116.6): a proposal's bytes go up through the upload
+//!   grant before `files.propose`, an open revision's come down through the
+//!   download grant; the proposer's own revisions are read from the replica.
 //! - [`Files`]: one domain of one server, as one device holds it.
 //!
 //! An implementation (DF/AD-2/3): it depends on the files contract, the
 //! ports and the path leaf only.
 
 pub mod cache;
+mod command;
 mod fetch;
 mod put;
 pub mod queue;
+pub mod review;
 pub mod tree;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +40,7 @@ use serde_json::Value;
 
 pub use fetch::Fetched;
 pub use put::{Dropped, PutOutcome, PutReport};
+pub use review::{Change, Committed, Opened, Proposed};
 pub use tree::{Listed, Listing};
 
 use crate::cache::Cache;
@@ -45,6 +52,10 @@ pub const DRIVE_VARIABLE: &str = "files_drive";
 pub const DOMAIN_VARIABLE: &str = "files_domain";
 /// The scope variable of a caller's own receipts.
 pub const CLIENT_VARIABLE: &str = "files_client";
+/// The scope variable of a proposer's own proposal revisions.
+pub const PROPOSAL_VARIABLE: &str = "files_proposal";
+/// The scope variable of a reviewer's proposal inbox.
+pub const REVIEWER_VARIABLE: &str = "files_reviewer";
 
 /// A caller's client scope: `<a>:<actor_id><c>:<client_id>`, `a` and `c`
 /// the UTF-8 byte lengths of each id (`syncular/README.md`, the client
@@ -66,6 +77,8 @@ pub fn units(domain: &str, actor: &str, client: &str) -> Vec<Unit> {
     vec![
         Unit::of(DOMAIN_VARIABLE, domain),
         Unit::of(CLIENT_VARIABLE, &client_scope(actor, client)),
+        Unit::of(PROPOSAL_VARIABLE, actor),
+        Unit::of(REVIEWER_VARIABLE, actor),
     ]
 }
 
@@ -104,6 +117,10 @@ pub enum FilesError {
     /// contract other than `conflict`), and its detail.
     #[error("refused: {code:?}")]
     Refused { code: Code, detail: Option<Value> },
+    /// The command was sent, but its receipt did not reach the replica within
+    /// `receipt_wait`.
+    #[error("sent; no receipt yet: {0}")]
+    Unanswered(String),
     /// A row of the replica does not have the contract's shape.
     #[error("unreadable row: {0}")]
     Row(String),

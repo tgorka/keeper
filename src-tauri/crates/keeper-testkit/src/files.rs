@@ -1,7 +1,7 @@
 //! The files half of a keeper-hq for tests, judged by
-//! [`keeper_files_api::rules::evaluate`], together with a [`Replica`]
-//! whose [`Replica::query`] runs real SQL over an in-memory SQLite holding
-//! the replicated `files_entries`, `files_head` and `files_receipts` rows.
+//! [`keeper_files_api::rules`], together with a [`Replica`] whose
+//! [`Replica::query`] runs real SQL over an in-memory SQLite holding the
+//! replicated `files_*` tables.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use keeper_accounts_api::Role;
 use keeper_files_api::caller::Caller;
 use keeper_files_api::refusal::{Code, Refusal};
-use keeper_files_api::rows::{Entry, Head};
-use keeper_files_api::rules::{evaluate, Accepted, Manifest, Server};
+use keeper_files_api::rows::{Entry, Event, Head, Op, Proposal, ProposalReviewer, Review};
+use keeper_files_api::rules::{self, evaluate, Accepted, Manifest, Server};
 use keeper_ports::{
     BlobBody, CommandResult, Covered, Delivery, LinkState, Peer, RefusedCommit, Replica,
     ReplicaError, ReplicaState, RowOp, RowWrites, Source, Unit, UploadRefusal, WindowBase,
@@ -76,6 +76,52 @@ CREATE TABLE files_receipts (
     author_client TEXT
 )";
 
+const CREATE_FILES_PROPOSALS: &str = "
+CREATE TABLE files_proposals (
+    id TEXT PRIMARY KEY,
+    domain TEXT,
+    proposal_id TEXT,
+    revision TEXT,
+    status TEXT,
+    reason TEXT,
+    digest TEXT,
+    change TEXT,
+    reviewers TEXT,
+    expires_at_ms INTEGER,
+    proposer_actor TEXT,
+    proposer_client TEXT,
+    proposer_context TEXT,
+    origin_actor TEXT,
+    origin_chain TEXT,
+    source_labels TEXT,
+    created_at_ms INTEGER,
+    decided_at_ms INTEGER,
+    decided_by TEXT,
+    decided_event_id TEXT,
+    change_set_id TEXT,
+    job_id TEXT,
+    job_ordinal INTEGER,
+    job_attempt_id TEXT,
+    author_actor TEXT,
+    author_client TEXT
+)";
+
+const CREATE_FILES_PROPOSAL_REVIEWERS: &str = "
+CREATE TABLE files_proposal_reviewers (
+    id TEXT PRIMARY KEY,
+    domain TEXT,
+    reviewer_actor TEXT,
+    proposal_id TEXT,
+    revision TEXT,
+    status TEXT,
+    proposer_actor TEXT,
+    change_set_id TEXT,
+    expires_at_ms INTEGER,
+    op_count INTEGER,
+    author_actor TEXT,
+    author_client TEXT
+)";
+
 type ObjectChecker = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 #[derive(Clone)]
@@ -107,6 +153,8 @@ struct Snapshot {
     entries: Vec<(Entry, String, String)>,
     head: Option<(Head, String, String)>,
     receipts: Vec<ReceiptRow>,
+    proposals: Vec<Proposal>,
+    proposal_reviewers: Vec<(ProposalReviewer, String)>,
 }
 
 /// `<a>:<actor><c>:<client>`, where `a` and `c` are the UTF-8 byte lengths.
@@ -122,6 +170,10 @@ fn value_to_text(value: Value) -> String {
     }
 }
 
+fn enum_word<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value).map_or_else(|_| String::new(), value_to_text)
+}
+
 fn collect_content_ids(params: &Value) -> Vec<String> {
     let mut ids = Vec::new();
     let Some(payload) = params.get("payload") else {
@@ -135,6 +187,17 @@ fn collect_content_ids(params: &Value) -> Vec<String> {
         ids.push(cid.to_owned());
     }
     if let Some(ops) = payload.get("operations").and_then(Value::as_array) {
+        for op in ops {
+            if let Some(cid) = op.get("content_id").and_then(Value::as_str) {
+                ids.push(cid.to_owned());
+            }
+        }
+    }
+    if let Some(ops) = payload
+        .get("change")
+        .and_then(|c| c.get("operations"))
+        .and_then(Value::as_array)
+    {
         for op in ops {
             if let Some(cid) = op.get("content_id").and_then(Value::as_str) {
                 ids.push(cid.to_owned());
@@ -193,43 +256,71 @@ impl FilesServer {
         self.lock().manifest.objects.insert(content_id.to_owned());
     }
 
-    /// Runs one command as `caller` from device `client_id` against the
-    /// contract's reference rules and records its receipt row.
-    pub fn apply(
-        &self,
-        caller: &Caller,
-        client_id: &str,
-        descriptor: &str,
-        params: Value,
-    ) -> Result<Accepted, Refusal> {
-        let mut state = self.lock();
-        state.commands += 1;
+    /// Sets `actor`'s domain role in the manifest.
+    pub fn set_role(&self, actor: &str, role: Role) {
+        self.lock().manifest.roles.insert(actor.to_owned(), role);
+    }
 
-        let present: Vec<String> = if let Some(has) = &state.object_check {
-            collect_content_ids(&params)
-                .into_iter()
-                .filter(|cid| has(cid))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for cid in present {
-            state.manifest.objects.insert(cid);
-        }
-
-        let recorded_at_ms = state.next_time_ms;
-        state.next_time_ms += RECORDED_AT_STEP_MS;
-        let server = Server {
+    fn make_server(&self, recorded_at_ms: i64, client_id: &str) -> Server {
+        Server {
             event_id: self.next_id(),
             recorded_at_ms,
             client_id: client_id.to_owned(),
-            review_id: None,
-            event_ids: Vec::new(),
-            review_ids: Vec::new(),
-        };
+            review_id: Some(self.next_id()),
+            event_ids: (0..127).map(|_| self.next_id()).collect(),
+            review_ids: (0..127).map(|_| self.next_id()).collect(),
+        }
+    }
 
-        let result = evaluate(&mut state.manifest, caller, descriptor, &params, &server);
+    fn prepare_caller_and_objects(
+        state: &mut ServerState,
+        caller: &Caller,
+        params: &Value,
+    ) -> Caller {
+        let content_ids = collect_content_ids(params);
+        if let Some(has) = &state.object_check {
+            for cid in &content_ids {
+                if has(cid) {
+                    state.manifest.objects.insert(cid.clone());
+                }
+            }
+        }
+        let mut effective = caller.clone();
+        match &mut effective {
+            Caller::Agent {
+                verified_uploads, ..
+            }
+            | Caller::Tool {
+                verified_uploads, ..
+            }
+            | Caller::Job {
+                verified_uploads, ..
+            } => {
+                for cid in content_ids {
+                    if state.manifest.objects.contains(&cid) && !verified_uploads.contains(&cid) {
+                        verified_uploads.push(cid);
+                    }
+                }
+            }
+            Caller::Person { .. } | Caller::Import { .. } => {}
+        }
+        effective
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn record_receipt(
+        state: &mut ServerState,
+        caller: &Caller,
+        client_id: &str,
+        descriptor: &str,
+        params: &Value,
+        recorded_at_ms: i64,
+        outcome: String,
+        reason: Option<String>,
+        event_id: Option<String>,
+        seq: Option<String>,
+        detail: String,
+    ) {
         let request_id = params
             .get("request_id")
             .and_then(Value::as_str)
@@ -237,39 +328,6 @@ impl FilesServer {
             .to_owned();
         let scope = client_scope(caller.actor_id(), client_id);
         let receipt_id = format!("{descriptor}/{request_id}/{scope}");
-
-        let (outcome, reason, event_id, seq, detail) = match &result {
-            Ok(accepted) => (
-                "accepted".to_owned(),
-                None,
-                Some(accepted.event.id.clone()),
-                Some(accepted.event.seq.clone()),
-                "{}".to_owned(),
-            ),
-            Err(refusal) if refusal.code == Code::Conflict => (
-                "conflict".to_owned(),
-                None,
-                None,
-                None,
-                refusal.detail.as_ref().map_or_else(
-                    || "{}".to_owned(),
-                    |d| serde_json::to_string(d).expect("serialize refusal detail"),
-                ),
-            ),
-            Err(refusal) => (
-                "rejected".to_owned(),
-                Some(value_to_text(
-                    serde_json::to_value(refusal.code).expect("serialize refusal code"),
-                )),
-                None,
-                None,
-                refusal.detail.as_ref().map_or_else(
-                    || "{}".to_owned(),
-                    |d| serde_json::to_string(d).expect("serialize refusal detail"),
-                ),
-            ),
-        };
-
         state.receipts.insert(
             receipt_id.clone(),
             ReceiptRow {
@@ -287,6 +345,194 @@ impl FilesServer {
                 author_actor: caller.actor_id().to_owned(),
                 author_client: client_id.to_owned(),
             },
+        );
+    }
+
+    fn refusal_receipt_fields(refusal: &Refusal) -> (String, Option<String>, String) {
+        let detail = refusal.detail.as_ref().map_or_else(
+            || "{}".to_owned(),
+            |d| serde_json::to_string(d).unwrap_or_else(|_| "{}".to_owned()),
+        );
+        if refusal.code == Code::Conflict {
+            ("conflict".to_owned(), None, detail)
+        } else {
+            ("rejected".to_owned(), Some(enum_word(refusal.code)), detail)
+        }
+    }
+
+    /// Runs one command (`files.propose`, `files.decide`, or any `evaluate`
+    /// command) as `caller` from device `client_id` and records its receipt.
+    /// Returns `Ok(Some(seq))` when an event was accepted, or `Ok(None)` when
+    /// no single event sequence was assigned (e.g. `proposed` or a list).
+    pub fn command(
+        &self,
+        caller: &Caller,
+        client_id: &str,
+        descriptor: &str,
+        params: Value,
+    ) -> Result<Option<String>, Refusal> {
+        match descriptor {
+            "files.propose" => {
+                let mut state = self.lock();
+                state.commands += 1;
+                let effective = Self::prepare_caller_and_objects(&mut state, caller, &params);
+                let recorded_at_ms = state.next_time_ms;
+                state.next_time_ms += RECORDED_AT_STEP_MS;
+                let server = self.make_server(recorded_at_ms, client_id);
+                let result = rules::propose(&mut state.manifest, &effective, &params, &server);
+                let (outcome, reason, detail) = match &result {
+                    Ok(detail) => (
+                        "proposed".to_owned(),
+                        None,
+                        serde_json::to_string(detail).unwrap_or_else(|_| "{}".to_owned()),
+                    ),
+                    Err(refusal) => Self::refusal_receipt_fields(refusal),
+                };
+                Self::record_receipt(
+                    &mut state,
+                    caller,
+                    client_id,
+                    descriptor,
+                    &params,
+                    recorded_at_ms,
+                    outcome,
+                    reason,
+                    None,
+                    None,
+                    detail,
+                );
+                result.map(|_| None)
+            }
+            "files.decide" => {
+                let mut state = self.lock();
+                state.commands += 1;
+                let effective = Self::prepare_caller_and_objects(&mut state, caller, &params);
+                let recorded_at_ms = state.next_time_ms;
+                state.next_time_ms += RECORDED_AT_STEP_MS;
+                let server = self.make_server(recorded_at_ms, client_id);
+                let result = rules::decide(&mut state.manifest, &effective, &params, &server);
+                let (outcome, reason, event_id, seq, detail) = match &result {
+                    Ok(receipt) => (
+                        enum_word(receipt.outcome),
+                        receipt.code.map(enum_word),
+                        receipt.event_id.clone(),
+                        receipt.seq.clone(),
+                        serde_json::to_string(&receipt.detail).unwrap_or_else(|_| "[]".to_owned()),
+                    ),
+                    Err(refusal) => {
+                        let (outcome, reason, detail) = Self::refusal_receipt_fields(refusal);
+                        (outcome, reason, None, None, detail)
+                    }
+                };
+                Self::record_receipt(
+                    &mut state,
+                    caller,
+                    client_id,
+                    descriptor,
+                    &params,
+                    recorded_at_ms,
+                    outcome,
+                    reason,
+                    event_id,
+                    seq,
+                    detail,
+                );
+                result.map(|receipt| receipt.seq)
+            }
+            _ => self
+                .apply(caller, client_id, descriptor, params)
+                .map(|accepted| Some(accepted.event.seq)),
+        }
+    }
+
+    /// Evaluates one read query (`files.history`, `files.preview_reversal`,
+    /// `files.proposal`, `files.proposals`, `files.unreviewed`) as `caller`.
+    pub fn query(
+        &self,
+        caller: &Caller,
+        operation: &str,
+        params: &Value,
+    ) -> Result<Value, Refusal> {
+        let state = self.lock();
+        match operation {
+            "files.history" => {
+                let page = rules::history(&state.manifest, params)?;
+                serde_json::to_value(page).map_err(|_| Refusal::new(Code::InvalidChange))
+            }
+            "files.preview_reversal" => {
+                let preview = rules::preview_reversal(&state.manifest, caller, params)?;
+                serde_json::to_value(preview).map_err(|_| Refusal::new(Code::InvalidChange))
+            }
+            "files.proposal" => {
+                let proposals = rules::proposal(&state.manifest, caller, params)?;
+                let value = serde_json::to_value(proposals)
+                    .map_err(|_| Refusal::new(Code::InvalidChange))?;
+                Ok(json!({ "proposals": value }))
+            }
+            "files.proposals" => {
+                let page = rules::proposals(&state.manifest, caller, params, state.next_time_ms)?;
+                serde_json::to_value(page).map_err(|_| Refusal::new(Code::InvalidChange))
+            }
+            "files.unreviewed" => {
+                let page = rules::unreviewed(&state.manifest, caller, params)?;
+                serde_json::to_value(page).map_err(|_| Refusal::new(Code::InvalidChange))
+            }
+            _ => Err(Refusal::new(Code::InvalidChange)),
+        }
+    }
+
+    /// Runs one command as `caller` from device `client_id` against the
+    /// contract's reference rules and records its receipt row.
+    pub fn apply(
+        &self,
+        caller: &Caller,
+        client_id: &str,
+        descriptor: &str,
+        params: Value,
+    ) -> Result<Accepted, Refusal> {
+        let mut state = self.lock();
+        state.commands += 1;
+
+        let effective = Self::prepare_caller_and_objects(&mut state, caller, &params);
+
+        let recorded_at_ms = state.next_time_ms;
+        state.next_time_ms += RECORDED_AT_STEP_MS;
+        let server = self.make_server(recorded_at_ms, client_id);
+
+        let result = evaluate(
+            &mut state.manifest,
+            &effective,
+            descriptor,
+            &params,
+            &server,
+        );
+
+        let (outcome, reason, event_id, seq, detail) = match &result {
+            Ok(accepted) => (
+                "accepted".to_owned(),
+                None,
+                Some(accepted.event.id.clone()),
+                Some(accepted.event.seq.clone()),
+                "{}".to_owned(),
+            ),
+            Err(refusal) => {
+                let (outcome, reason, detail) = Self::refusal_receipt_fields(refusal);
+                (outcome, reason, None, None, detail)
+            }
+        };
+
+        Self::record_receipt(
+            &mut state,
+            caller,
+            client_id,
+            descriptor,
+            &params,
+            recorded_at_ms,
+            outcome,
+            reason,
+            event_id,
+            seq,
+            detail,
         );
 
         result
@@ -434,11 +680,56 @@ impl FilesServer {
         self.lock().commands
     }
 
+    /// Returns every proposal revision currently in the manifest, ascending by id.
+    #[must_use]
+    pub fn proposals(&self) -> Vec<Proposal> {
+        self.lock()
+            .manifest
+            .proposals
+            .values()
+            .map(|state| state.row.clone())
+            .collect()
+    }
+
+    /// Returns every proposal-reviewer inbox row currently in the manifest.
+    #[must_use]
+    pub fn inbox(&self) -> Vec<ProposalReviewer> {
+        self.lock().manifest.inbox.values().cloned().collect()
+    }
+
+    /// Returns every review row currently in the manifest.
+    #[must_use]
+    pub fn reviews(&self) -> Vec<Review> {
+        self.lock().manifest.reviews.values().cloned().collect()
+    }
+
+    /// Returns every accepted event with its operations, ascending by numeric sequence.
+    #[must_use]
+    pub fn events(&self) -> Vec<(Event, Vec<Op>)> {
+        let mut out: Vec<(Event, Vec<Op>)> =
+            self.lock().manifest.events.values().cloned().collect();
+        out.sort_by(|(a, _), (b, _)| {
+            a.seq
+                .len()
+                .cmp(&b.seq.len())
+                .then_with(|| a.seq.cmp(&b.seq))
+        });
+        out
+    }
+
+    /// Returns the domain head row, if any event has been accepted.
+    #[must_use]
+    pub fn head(&self) -> Option<Head> {
+        self.lock().manifest.head.clone()
+    }
+
     fn snapshot(
         &self,
         drives: &BTreeSet<String>,
         domains: &BTreeSet<String>,
         clients: &BTreeSet<String>,
+        proposers: &BTreeSet<String>,
+        reviewers: &BTreeSet<String>,
     ) -> Snapshot {
         let state = self.lock();
         let entries = state
@@ -476,10 +767,36 @@ impl FilesServer {
             .filter(|receipt| clients.contains(&receipt.client_scope))
             .cloned()
             .collect();
+        let proposals = state
+            .manifest
+            .proposals
+            .values()
+            .map(|p| &p.row)
+            .filter(|row| proposers.contains(&row.proposer_actor))
+            .cloned()
+            .collect();
+        let proposal_reviewers = state
+            .manifest
+            .inbox
+            .values()
+            .filter(|row| reviewers.contains(&row.reviewer_actor))
+            .map(|row| {
+                let key = format!("{}/{}", row.proposal_id, row.revision);
+                let client = state
+                    .manifest
+                    .proposals
+                    .get(&key)
+                    .map(|p| p.row.proposer_client.clone())
+                    .unwrap_or_default();
+                (row.clone(), client)
+            })
+            .collect();
         Snapshot {
             entries,
             head,
             receipts,
+            proposals,
+            proposal_reviewers,
         }
     }
 }
@@ -487,9 +804,8 @@ impl FilesServer {
 /// A device's local replica of a [`FilesServer`]'s files tables.
 pub struct FilesReplica {
     server: Arc<FilesServer>,
-    actor: String,
+    caller: Caller,
     client: String,
-    role: Role,
     online: AtomicBool,
     requests: AtomicUsize,
     units: Mutex<Vec<Unit>>,
@@ -507,9 +823,23 @@ impl FilesReplica {
         client: &str,
         role: Role,
     ) -> Arc<FilesReplica> {
+        Self::with_caller(
+            server,
+            Caller::Person {
+                actor_id: actor.to_owned(),
+                role,
+            },
+            client,
+        )
+    }
+
+    /// Opens a new connected replica for `caller` and device `client` backed
+    /// by an in-memory SQLite database holding the files tables.
+    #[must_use]
+    pub fn with_caller(server: Arc<FilesServer>, caller: Caller, client: &str) -> Arc<Self> {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(&format!(
-            "{CREATE_FILES_ENTRIES};{CREATE_FILES_HEAD};{CREATE_FILES_RECEIPTS};"
+            "{CREATE_FILES_ENTRIES};{CREATE_FILES_HEAD};{CREATE_FILES_RECEIPTS};{CREATE_FILES_PROPOSALS};{CREATE_FILES_PROPOSAL_REVIEWERS};"
         ))
         .expect("create files tables");
         let (state, _) = watch::channel(ReplicaState {
@@ -522,9 +852,8 @@ impl FilesReplica {
         });
         Arc::new(Self {
             server,
-            actor: actor.to_owned(),
+            caller,
             client: client.to_owned(),
-            role,
             online: AtomicBool::new(true),
             requests: AtomicUsize::new(0),
             units: Mutex::new(Vec::new()),
@@ -558,7 +887,7 @@ impl FilesReplica {
         Source {
             database: database.to_owned(),
             replica: Arc::clone(self) as Arc<dyn Replica>,
-            actor: self.actor.clone(),
+            actor: self.caller.actor_id().to_owned(),
             client: self.client.clone(),
         }
     }
@@ -572,6 +901,8 @@ impl FilesReplica {
         let mut drives = BTreeSet::new();
         let mut domains = BTreeSet::new();
         let mut clients = BTreeSet::new();
+        let mut proposers = BTreeSet::new();
+        let mut reviewers = BTreeSet::new();
         {
             let units = self.units.lock().unwrap_or_else(PoisonError::into_inner);
             for unit in units.iter() {
@@ -584,13 +915,21 @@ impl FilesReplica {
                 if let Some(client) = unit.scopes.get("files_client") {
                     clients.insert(client.clone());
                 }
+                if let Some(proposer) = unit.scopes.get("files_proposal") {
+                    proposers.insert(proposer.clone());
+                }
+                if let Some(reviewer) = unit.scopes.get("files_reviewer") {
+                    reviewers.insert(reviewer.clone());
+                }
             }
         }
 
-        let snapshot = self.server.snapshot(&drives, &domains, &clients);
+        let snapshot = self
+            .server
+            .snapshot(&drives, &domains, &clients, &proposers, &reviewers);
         let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.execute_batch(
-            "DELETE FROM files_entries; DELETE FROM files_head; DELETE FROM files_receipts;",
+            "DELETE FROM files_entries; DELETE FROM files_head; DELETE FROM files_receipts; DELETE FROM files_proposals; DELETE FROM files_proposal_reviewers;",
         )
         .expect("clear files tables");
 
@@ -691,8 +1030,102 @@ impl FilesReplica {
             }
         }
 
+        insert_proposals(&db, &snapshot.proposals);
+        insert_proposal_reviewers(&db, &snapshot.proposal_reviewers);
+
         drop(db);
         self.state.send_modify(|state| state.rows += 1);
+    }
+}
+
+fn insert_proposals(db: &rusqlite::Connection, proposals: &[Proposal]) {
+    let Ok(mut stmt) = db.prepare(
+        "INSERT INTO files_proposals (
+            id, domain, proposal_id, revision, status, reason, digest,
+            change, reviewers, expires_at_ms, proposer_actor, proposer_client,
+            proposer_context, origin_actor, origin_chain, source_labels,
+            created_at_ms, decided_at_ms, decided_by, decided_event_id,
+            change_set_id, job_id, job_ordinal, job_attempt_id,
+            author_actor, author_client
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+        )",
+    ) else {
+        return;
+    };
+    for proposal in proposals {
+        let status = enum_word(proposal.status);
+        let change = serde_json::to_string(&proposal.change).unwrap_or_else(|_| "{}".to_owned());
+        let reviewers =
+            serde_json::to_string(&proposal.reviewers).unwrap_or_else(|_| "[]".to_owned());
+        let origin_chain = proposal
+            .origin_chain
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
+        let source_labels =
+            serde_json::to_string(&proposal.source_labels).unwrap_or_else(|_| "[]".to_owned());
+        let _ = stmt.execute(rusqlite::params![
+            proposal.id,
+            proposal.domain,
+            proposal.proposal_id,
+            proposal.revision,
+            status,
+            proposal.reason,
+            proposal.digest,
+            change,
+            reviewers,
+            proposal.expires_at_ms,
+            proposal.proposer_actor,
+            proposal.proposer_client,
+            proposal.proposer_context,
+            proposal.origin_actor,
+            origin_chain,
+            source_labels,
+            proposal.created_at_ms,
+            proposal.decided_at_ms,
+            proposal.decided_by,
+            proposal.decided_event_id,
+            proposal.change_set_id,
+            proposal.job_id,
+            proposal.job_ordinal,
+            proposal.job_attempt_id,
+            proposal.proposer_actor,
+            proposal.proposer_client,
+        ]);
+    }
+}
+
+fn insert_proposal_reviewers(
+    db: &rusqlite::Connection,
+    proposal_reviewers: &[(ProposalReviewer, String)],
+) {
+    let Ok(mut stmt) = db.prepare(
+        "INSERT INTO files_proposal_reviewers (
+            id, domain, reviewer_actor, proposal_id, revision, status,
+            proposer_actor, change_set_id, expires_at_ms, op_count,
+            author_actor, author_client
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    ) else {
+        return;
+    };
+    for (row, author_client) in proposal_reviewers {
+        let status = enum_word(row.status);
+        let op_count = i64::from(row.op_count);
+        let _ = stmt.execute(rusqlite::params![
+            row.id,
+            row.domain,
+            row.reviewer_actor,
+            row.proposal_id,
+            row.revision,
+            status,
+            row.proposer_actor,
+            row.change_set_id,
+            row.expires_at_ms,
+            op_count,
+            row.proposer_actor,
+            author_client,
+        ]);
     }
 }
 
@@ -852,12 +1285,24 @@ impl Replica for FilesReplica {
         ))
     }
 
-    fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+    fn remote_query(
+        &self,
+        operation_id: &str,
+        params: Value,
+    ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         if !self.online.load(Ordering::SeqCst) {
             return Err(offline_error());
         }
-        Ok(Vec::new())
+        match self.server.query(&self.caller, operation_id, &params) {
+            Ok(Value::Object(map)) => Ok(vec![map]),
+            Ok(_) => Ok(Vec::new()),
+            Err(refusal) => Err(ReplicaError::Remote {
+                code: enum_word(refusal.code),
+                message: String::new(),
+                retryable: false,
+            }),
+        }
     }
 
     fn remote_command(
@@ -870,17 +1315,13 @@ impl Replica for FilesReplica {
         if !self.online.load(Ordering::SeqCst) {
             return Err(offline_error());
         }
-        let caller = Caller::Person {
-            actor_id: self.actor.clone(),
-            role: self.role,
-        };
         match self
             .server
-            .apply(&caller, &self.client, operation_id, params)
+            .command(&self.caller, &self.client, operation_id, params)
         {
-            Ok(accepted) => Ok(CommandResult {
+            Ok(seq) => Ok(CommandResult {
                 request_id: request_id.to_owned(),
-                commit_seq: accepted.event.seq.parse().ok(),
+                commit_seq: seq.and_then(|s| s.parse().ok()),
                 cached: false,
             }),
             Err(_) => Ok(CommandResult {
@@ -957,5 +1398,112 @@ mod tests {
             }
         ));
         assert_eq!(replica.requests(), 1);
+    }
+
+    #[test]
+    fn propose_replicates_to_proposer_and_reviewer_and_lists_via_query() {
+        let server = FilesServer::new("alpha");
+        let root = server.create_drive("owner-1", "notes");
+        server.set_role("r", Role::Reviewer);
+        let content_id = crate::blob_id(b"draft");
+        server.add_object(&content_id);
+
+        let proposer = FilesReplica::new(Arc::clone(&server), "editor-1", "dev-1", Role::Editor);
+        proposer
+            .subscribe(Unit::of("files_proposal", "editor-1"))
+            .expect("subscribe proposer");
+
+        let reviewer = FilesReplica::new(Arc::clone(&server), "r", "dev-2", Role::Reviewer);
+        reviewer
+            .subscribe(Unit::of("files_reviewer", "r"))
+            .expect("subscribe reviewer");
+
+        let request_id = "01J00000000000000000000100";
+        let proposal_id = "01J00000000000000000000101";
+        let entry_id = "01J00000000000000000000102";
+        let params = json!({
+            "version": 1,
+            "request_id": request_id,
+            "context_id": null,
+            "payload": {
+                "proposal_id": proposal_id,
+                "base_revision": null,
+                "change": {
+                    "operations": [
+                        {
+                            "op": "create",
+                            "id": entry_id,
+                            "kind": "file",
+                            "parent_id": root,
+                            "name": "draft.md",
+                            "content_id": content_id,
+                            "size": 5
+                        }
+                    ]
+                },
+                "reviewers": ["r"],
+                "expires_at_ms": null
+            }
+        });
+
+        let cmd = proposer
+            .remote_command("files.propose", request_id, params)
+            .expect("propose command");
+        assert_eq!(cmd.commit_seq, None);
+        assert_eq!(server.proposals().len(), 1);
+        assert_eq!(server.inbox().len(), 1);
+
+        proposer.pull();
+        reviewer.pull();
+
+        let proposer_rows = proposer
+            .query("SELECT proposal_id, status FROM files_proposals", &[])
+            .expect("query proposer files_proposals");
+        assert_eq!(proposer_rows.len(), 1);
+        assert_eq!(
+            proposer_rows[0].get("proposal_id").and_then(Value::as_str),
+            Some(proposal_id)
+        );
+        assert_eq!(
+            proposer_rows[0].get("status").and_then(Value::as_str),
+            Some("open")
+        );
+
+        let reviewer_inbox = reviewer
+            .query(
+                "SELECT reviewer_actor, proposal_id, status FROM files_proposal_reviewers",
+                &[],
+            )
+            .expect("query reviewer files_proposal_reviewers");
+        assert_eq!(reviewer_inbox.len(), 1);
+        assert_eq!(
+            reviewer_inbox[0]
+                .get("reviewer_actor")
+                .and_then(Value::as_str),
+            Some("r")
+        );
+        assert_eq!(
+            reviewer_inbox[0].get("proposal_id").and_then(Value::as_str),
+            Some(proposal_id)
+        );
+
+        let reviewer_proposals = reviewer
+            .query("SELECT id FROM files_proposals", &[])
+            .expect("query reviewer files_proposals");
+        assert!(reviewer_proposals.is_empty());
+
+        let pages = reviewer
+            .remote_query("files.proposals", json!({ "version": 1, "limit": 10 }))
+            .expect("query files.proposals");
+        assert_eq!(pages.len(), 1);
+        let listed = pages[0]
+            .get("proposals")
+            .and_then(Value::as_array)
+            .expect("proposals array");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].get("proposal_id").and_then(Value::as_str),
+            Some(proposal_id)
+        );
     }
 }
