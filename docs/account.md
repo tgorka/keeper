@@ -554,12 +554,6 @@ keeper-config.git/
       desktop.toml               # optional: seeds settings.<device>.toml when no other desktop of yours has one
       tablet.toml                #   … iPad
       mobile.toml                #   … phone
-  .gitattributes                 # _models/** filter=lfs diff=lfs merge=lfs -text
-  _models/                       # optional: transcription models, git LFS (docs/transcription.md)
-    models.toml                  # names the set: [asr] dir, [diarizer] dir, [embedding] id
-    parakeet-tdt-0.6b-v3/        # speech recognition (precompiled .mlmodelc + vocabulary)
-    speaker-diarization/         # diarization and speaker embeddings
-    LICENSE, NOTICE              # the models' own licence files travel with them
   tgorka/                        # one directory per person, named by their login
     user.toml                    # who this directory belongs to
     keeper.toml                  # your pinned settings, every device
@@ -634,12 +628,10 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
    commit back and forth. A record from before these keys gains them the same way; a sync
    that finds them current commits nothing, a record that does not read as TOML is left
    alone, and another device's record is never rewritten from here.
-7. **Models, on a Mac that can transcribe:** after a sync, `_models/` is hydrated into
-   `<data_dir>/models/` through keeper's own LFS client, with the same credential, each
-   file checked against its sha256. The LFS endpoint is derived from the repository's URL
-   alone; a `.lfsconfig` in this repository is never read, so the credential goes to no
-   other host. keeper only reads `_models/`; it never writes there. See
-   `docs/transcription.md`.
+7. **Models are not read from this repository** (story 121.3, D-41): they come from the
+   organisation's general domain on its agents server, one published version at a time.
+   `hq-admin models put` moves an existing `_models/` there once, checked against its LFS
+   pointers. See `docs/transcription.md`.
 
 **The rules keeper keeps:**
 - **Create-only, except seven files and three keys.** A file that already exists is never

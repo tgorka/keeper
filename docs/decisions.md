@@ -1498,6 +1498,9 @@ anyone but the person's own organisation.
   repository names now. keeper makes no request to Hugging Face. D-5 holds: keeper's bundle
   carries no weights, and the organisation that runs the account chooses to distribute them.
   Without an account there are no models, and Settings says so. (AD-341)
+  > **Amended by D-41 (story 121.3).** The models come from the organisation's general domain
+  > on its agents server, one published, checksummed version at a time, not the config
+  > repository; without a paired agents server there are no models.
 - **Why on this Mac, and not a NAS or the cloud:** the owner asked for offline processing and
   refused a NAS option ("nie rob opcji nas skoro mozna miec wszystko lokalnie"). A NAS would make
   keeper depend on a server the person runs, and add a destination; a cloud API would hand
@@ -1960,6 +1963,9 @@ them, download them from anyone else, send audio anywhere, or start the micropho
   on-device recogniser in segmented sessions with echo-cancelled capture and, where `ort` has no
   runtime, no turn models (DW-413); continuous duplex on Android is a documented limitation, not a
   promise. (AD-410, AD-411, AD-414; FR-814…FR-816, FR-820; NFR-114, NFR-119; Epics 97, 98)
+
+> **Amended by D-41 (story 121.3).** The turn models, like transcription's, come from the
+> organisation's general domain, not the configuration repository; the rest stands.
 - **A complete set, per group (as built, 97.1):** hydration runs per role group into
   `<data_dir>/models/` — `transcription` (every folder but the turn models') and `turn` (the
   turn models' folders and any picked in Settings) — each with its own completion marker over
@@ -2225,3 +2231,23 @@ store, or follow a server-issued URL to an unannounced origin.
   a `D-` entry here) and `docs/egress.md` (amendments 3–5). D-4 still holds: keeper names no
   store, and the server announces the origin per database.
 - **Status / owner:** decided for story 115.3, 2026-11-24. Owner is the architect.
+
+## D-41 — The models come from the organisation's general domain, one published version at a time
+
+keeper takes its transcription and turn models from the `config_values` rows of the organisation's
+general domain (`makidrive`) on its agents server, and **not** from the config repository's
+`_models/`. Number provisional until the coordinator allocates it at landing.
+
+- **How:** the operator publishes a set with `hq-admin models put` (files first, rows next,
+  `models.active` last). A device reads the active version from its replica of the general
+  domain, refuses a version that is incomplete, does not hash to its id or names paths that
+  collide caselessly, and fetches its group's files through the blob port's download (the generic
+  blob route's presigned, ranged `GET` on the store the server named), each checked whole for size
+  and sha256 before it is renamed into `<data_dir>/models/`.
+- **What stays:** D-5 as D-36 left it (no weights bundled, none fetched from anyone but the
+  organisation); the engine and `TurnDisk::load` load complete groups by path; each group's marker
+  is written last and now records the version; a new version loads at the next job's start.
+- **Residual (DF/OQ-14):** whoever holds the operator's token chooses the files every member's
+  device loads; the sha256 check proves only that a device loads what was published.
+- **What it amends:** D-29's and D-36's "where the models come from". **Status / owner:** decided
+  for story 121.3 (DF/AD-16), 2026-11-25.
