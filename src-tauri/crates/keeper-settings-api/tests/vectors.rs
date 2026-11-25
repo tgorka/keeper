@@ -2,13 +2,17 @@
 //! `syncular/settings.travel.json` and `syncular/limits.json`. keeper-hq's
 //! TypeScript reads the same files.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use keeper_settings_api::adoption::{check_adoption, Claim, DeviceRecord};
 use keeper_settings_api::blob::{check_upload, read_value_blob, BlobAnswer, BlobReader};
 use keeper_settings_api::config::{check_config_write, template_key, ConfigWriter, Role};
 use keeper_settings_api::credential::{check_value, PATTERNS};
 use keeper_settings_api::limits;
+use keeper_settings_api::models::{
+    canonical_text, check_model_upload, check_model_write, check_set, parse_key, read_config_blob,
+    version_id, BlobRef, ConfigBlobReader, ModelFile, ModelWrite, VersionState,
+};
 use keeper_settings_api::record::{classify, parse_id, record_id, Device, OfferKind, RecordKey};
 use keeper_settings_api::refusal::Refusal;
 use keeper_settings_api::scope::{settings_owner_scope, CallerKind};
@@ -311,6 +315,12 @@ fn limits_match_corpus() {
             .as_u64()
             .expect("attachmentMaxBytes")
     );
+    assert_eq!(
+        lim.model_file_max_bytes,
+        c["limits"]["modelFileMaxBytes"]
+            .as_u64()
+            .expect("modelFileMaxBytes")
+    );
 }
 
 #[test]
@@ -566,5 +576,181 @@ fn every_refusal_is_exercised_in_corpus() {
             "refusal {} never appears as an expected refusal in corpus",
             refusal.code()
         );
+    }
+}
+
+#[test]
+fn model_keys() {
+    let c = corpus();
+    for case in entries(&c, "modelKeys") {
+        let name = case_name(case);
+        let key = case["key"].as_str().expect("key");
+        let expected_refusal = case["refusal"].as_str();
+        let result = parse_key(key);
+        assert_eq!(
+            result.as_ref().err().map(|r| r.code()),
+            expected_refusal,
+            "case {name}"
+        );
+        let actual_parsed = result
+            .ok()
+            .map(|k| serde_json::to_value(k).expect("serialize ModelKey"));
+        if case["parsed"].is_null() {
+            assert_eq!(actual_parsed, None, "case {name}");
+        } else {
+            assert_eq!(actual_parsed.as_ref(), Some(&case["parsed"]), "case {name}");
+        }
+    }
+}
+
+#[test]
+fn model_versions() {
+    let c = corpus();
+    let mut by_name: BTreeMap<&str, String> = BTreeMap::new();
+    let mut distinct: BTreeSet<String> = BTreeSet::new();
+    for case in entries(&c, "modelVersions") {
+        let name = case_name(case);
+        let files: Vec<ModelFile> =
+            serde_json::from_value(case["files"].clone()).expect("model files");
+        let models_toml = case["models_toml"].as_str().expect("models_toml");
+        let expected_refusal = case["refusal"].as_str();
+
+        let canonical = canonical_text(&files, models_toml);
+        assert_eq!(
+            canonical.as_ref().err().map(|r| r.code()),
+            expected_refusal,
+            "case {name} canonical"
+        );
+        let version = version_id(&files, models_toml);
+        assert_eq!(
+            version.as_ref().err().map(|r| r.code()),
+            expected_refusal,
+            "case {name} version"
+        );
+
+        if let (Ok(canon), Ok(ver)) = (canonical, version) {
+            assert_eq!(
+                canon,
+                case["canonical"].as_str().expect("expected canonical"),
+                "case {name} canonical text"
+            );
+            assert_eq!(
+                ver,
+                case["version"].as_str().expect("expected version"),
+                "case {name} version id"
+            );
+            if let Some(other) = case["same_as"].as_str() {
+                let other_id = by_name
+                    .get(other)
+                    .unwrap_or_else(|| panic!("case {name}: unknown same_as {other}"));
+                assert_eq!(&ver, other_id, "case {name} same_as {other}");
+            } else {
+                assert!(
+                    distinct.insert(ver.clone()),
+                    "case {name}: duplicate version id {ver}"
+                );
+            }
+            by_name.insert(name, ver);
+        }
+    }
+}
+
+#[test]
+fn model_sets() {
+    let c = corpus();
+    let lim = limits();
+    for case in entries(&c, "modelSets") {
+        let name = case_name(case);
+        let files: Vec<ModelFile> =
+            serde_json::from_value(case["files"].clone()).expect("model files");
+        let models_toml = case["models_toml"].as_str().expect("models_toml");
+        let expected_refusal = case["refusal"].as_str();
+        let domains: Vec<&str> = case["domains"]
+            .as_array()
+            .expect("domains")
+            .iter()
+            .map(|v| v.as_str().expect("domain entry"))
+            .collect();
+        let result = check_set(&files, models_toml, &domains, &lim);
+        assert_eq!(
+            result.as_ref().err().map(|r| r.code()),
+            expected_refusal,
+            "case {name}"
+        );
+        if let Ok(ver) = result {
+            assert_eq!(
+                ver,
+                case["version"].as_str().expect("expected version"),
+                "case {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn model_uploads() {
+    let c = corpus();
+    let lim = limits();
+    for case in entries(&c, "modelUploads") {
+        let name = case_name(case);
+        let writer = parse_config_writer(&case["writer"]);
+        let domain_kind = parse_domain_kind(case["domain_kind"].as_str().expect("domain_kind"));
+        let size = case["size"].as_u64().expect("size");
+        let sha256 = case["sha256"].as_str().expect("sha256");
+        let expected_refusal = case["refusal"].as_str();
+        let result = check_model_upload(&writer, domain_kind, size, sha256, &lim);
+        assert_eq!(
+            result.err().map(Refusal::code),
+            expected_refusal,
+            "case {name}"
+        );
+    }
+}
+
+#[test]
+fn model_writes() {
+    let c = corpus();
+    let lim = limits();
+    for case in entries(&c, "modelWrites") {
+        let name = case_name(case);
+        let writer = parse_config_writer(&case["writer"]);
+        let domain_kind = parse_domain_kind(case["domain_kind"].as_str().expect("domain_kind"));
+        let key = case["key"].as_str().expect("key");
+        let blob: Option<BlobRef> = serde_json::from_value(case["blob"].clone()).expect("blob");
+        let state: VersionState = serde_json::from_value(case["state"].clone()).expect("state");
+        let domains: Vec<&str> = case["domains"]
+            .as_array()
+            .expect("domains")
+            .iter()
+            .map(|v| v.as_str().expect("domain entry"))
+            .collect();
+        let expected_refusal = case["refusal"].as_str();
+        let write = ModelWrite {
+            key,
+            value: &case["value"],
+            blob: blob.as_ref(),
+        };
+        let result = check_model_write(&writer, domain_kind, &write, &state, &domains, &lim);
+        assert_eq!(
+            result.err().map(Refusal::code),
+            expected_refusal,
+            "case {name}"
+        );
+    }
+}
+
+#[test]
+fn config_blob_reads() {
+    let c = corpus();
+    for case in entries(&c, "configBlobReads") {
+        let name = case_name(case);
+        let reader_val = &case["reader"];
+        let reader = ConfigBlobReader {
+            kind: parse_caller_kind(reader_val["kind"].as_str().expect("reader.kind")),
+            member: reader_val["member"].as_bool().expect("reader.member"),
+        };
+        let expected = case["answer"].as_str().expect("answer");
+        let actual = blob_answer_str(read_config_blob(&reader));
+        assert_eq!(actual, expected, "case {name}");
     }
 }

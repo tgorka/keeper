@@ -11,6 +11,7 @@ pub mod adoption;
 pub mod blob;
 pub mod config;
 pub mod credential;
+pub mod models;
 pub mod record;
 pub mod refusal;
 pub mod scope;
@@ -37,6 +38,9 @@ pub struct Limits {
     pub setting_value_max_bytes: u64,
     /// Maximum byte length of an uploaded blob attachment.
     pub attachment_max_bytes: u64,
+    /// Maximum byte length of one model file of a published model set, sent
+    /// in one presigned PUT on the admin path.
+    pub model_file_max_bytes: u64,
 }
 
 /// Parses the compiled-in [`LIMITS_JSON`] into [`Limits`].

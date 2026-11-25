@@ -18,7 +18,7 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
-| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; `settingValueMaxBytes` (16,384), the longest `value` a `settings_values` or `config_values` row holds before it must be a blob (*Settings*); and the generic job bounds (*Jobs*): `jobRowMaxBytes` (65,536), the most bytes an encoded `jobs.*` command, and so a row it writes, may have; `jobInlineMaxBytes` (16,384), the most canonical bytes of an inline `input` or `result`; `jobNoteMaxBytes` (1,024), the most bytes of a progress note or a failure's sentence; `jobRefsMax` (64), the most references one job's input may name; `jobEffectsMax` (256), the most effects one completion or failure may report; `jobPlanMaxBytes` (1,048,576), the most bytes of a plan blob; `jobOpenMaxPerDomain` (10,000), the most jobs not yet ended one domain may hold; `jobAttemptsMax` (10), the highest `max_attempts`; `jobLeaseMinMs` (10,000) and `jobLeaseMaxMs` (600,000), the shortest and longest lease a claim may ask for; hand-written, never generated |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; `settingValueMaxBytes` (16,384), the longest `value` a `settings_values` or `config_values` row holds before it must be a blob (*Settings*); `modelFileMaxBytes` (5,368,709,120), the most bytes one file of a published model set may have, sent in one presigned `PUT` on the admin path (*Model sets*); and the generic job bounds (*Jobs*): `jobRowMaxBytes` (65,536), the most bytes an encoded `jobs.*` command, and so a row it writes, may have; `jobInlineMaxBytes` (16,384), the most canonical bytes of an inline `input` or `result`; `jobNoteMaxBytes` (1,024), the most bytes of a progress note or a failure's sentence; `jobRefsMax` (64), the most references one job's input may name; `jobEffectsMax` (256), the most effects one completion or failure may report; `jobPlanMaxBytes` (1,048,576), the most bytes of a plan blob; `jobOpenMaxPerDomain` (10,000), the most jobs not yet ended one domain may hold; `jobAttemptsMax` (10), the highest `max_attempts`; `jobLeaseMinMs` (10,000) and `jobLeaseMaxMs` (600,000), the shortest and longest lease a claim may ask for; hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
@@ -206,6 +206,50 @@ travel data, generated from keeper-core's registry and never edited by hand.
 
 On a revision conflict the syncing device writes its pending value again over the newer one, so
 per key the write the server accepts last wins: still "last to sync" (D-26).
+
+### Model sets
+
+Model sets are rows of `0011`'s `config_values` in the `makidrive` domain (story 121.3, DF/AD-16;
+no schema change), pinned in `settings.vectors.json` (`modelKeys`, `modelVersions`, `modelSets`,
+`modelUploads`, `modelWrites`, `configBlobReads`).
+
+- **Keys and values.** `models/<version>/<path>` holds one file: value `{"size", "sha256"}` and
+  `value_blob` with `blobId` `sha256:<sha256>` and `byteLength` `size`. `models/<version>` is the
+  manifest: value `{"models_toml", "file_count"}`, inline (within `settingValueMaxBytes`, no
+  `value_blob`). `models.active` is the active version id as a JSON string, no `value_blob`.
+  `<version>` is 64-character lowercase hex sha256; `<path>` is `/`-separated `[A-Za-z0-9._-]`
+  segments, none empty, none starting with `.`, and not `models.toml` (keys at most 256 bytes;
+  `modelKeys`). The generic `config_values` write refuses `models.active` and `models/…`
+  (`config.malformed`).
+- **Version id.** Lowercase hex sha256 of `keeper-models-v1\n`, then `<path>\t<size>\t<sha256>\n`
+  per file sorted by path bytes, an empty line, and `models.toml`'s bytes (`modelVersions`,
+  `modelSets`).
+- **Publication and sealing.** Every write is on the operator's admin path in the general domain
+  only (`config.writer_refused` for every device credential, the owner's included, and for any
+  other domain). Upload each file under an admin-path grant bound to `size` and `sha256` in one
+  presigned `PUT` within `modelFileMaxBytes` (`config.model_too_large`; `modelUploads`), write the
+  file rows, then write the manifest (refused `config.model_incomplete` until every file row is
+  present and hashes to `<version>`), then write `models.active` last (refused
+  `config.model_incomplete` for a version without its manifest; `modelWrites`). A key or
+  `models.toml` naming a domain is refused (`config.names_domain`). Version rows are never
+  rewritten and no file row is added after the manifest (`config.model_sealed`); only
+  `models.active` moves.
+- **Check order.** A set is checked whole before its first upload (`modelSets`): paths and
+  digests well formed with no path twice, then the manifest value within `settingValueMaxBytes`,
+  then every file row's key (`models/<v>/<path>`) within the 256-byte key bound, for every file
+  before any upload (`config.malformed`), then no key and no `models.toml` naming a domain
+  (`config.names_domain`), then no file above `modelFileMaxBytes` (`config.model_too_large`).
+  Each row write is checked in
+  this order, first failure wins: writer and domain (`config.writer_refused`); key grammar
+  (`config.malformed`); the key naming a domain (`config.names_domain`); the value and blob shape
+  (`config.malformed`; for a file row then `config.model_too_large`; for a manifest then
+  `models.toml` naming a domain, `config.names_domain`); then sealing and completeness. The
+  manifest bound measures the value as compact JSON (no whitespace, `"` and `\` and control
+  characters escaped, other characters unescaped) in UTF-8 bytes.
+- **Blob reads.** Reading `config_values.value_blob` through the generic download route is granted
+  to a person who is a member of the row's domain; anyone else (non-member person, agent, tool,
+  service) gets the absent-blob answer (`configBlobReads`). Model blobs live in the conversation
+  key space, never the files module's (DF/AD-8).
 
 ## Domains and the map
 
