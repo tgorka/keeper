@@ -303,16 +303,44 @@ pub fn check_model_upload(
     Ok(())
 }
 
-/// Check a set before anything of it is written: every path and digest well
-/// formed, no path twice (`config.malformed`), no file above
-/// `modelFileMaxBytes` (`config.model_too_large`). Returns its version id.
-/// `hq-admin models put` runs it before its first upload.
+/// Whether a manifest's value, measured as compact JSON in UTF-8 bytes, is
+/// longer than `settingValueMaxBytes`.
+fn manifest_too_large(manifest: &Manifest, limits: &Limits) -> bool {
+    serde_json::to_string(manifest).map_or(true, |text| {
+        text.len() as u64 > limits.setting_value_max_bytes
+    })
+}
+
+/// Check a set before anything of it is written, in this order: every path
+/// and digest well formed, no path twice, and its manifest value within
+/// `settingValueMaxBytes` (`config.malformed`); no key and no `models.toml`
+/// naming a domain (`config.names_domain`); no file above `modelFileMaxBytes`
+/// (`config.model_too_large`). Returns its version id. Every refusal
+/// `check_model_write` can give a well-formed set's own rows comes here
+/// first; `hq-admin models put` runs it before its first upload.
 pub fn check_set(
     files: &[ModelFile],
     models_toml: &str,
+    domains: &[&str],
     limits: &Limits,
 ) -> Result<String, Refusal> {
     let version = version_id(files, models_toml)?;
+    let manifest = Manifest {
+        models_toml: models_toml.to_owned(),
+        file_count: files.len() as u64,
+    };
+    if manifest_too_large(&manifest, limits) {
+        return Err(Refusal::ConfigMalformed);
+    }
+    let manifest_key = format!("models/{version}");
+    if names_domain(&manifest_key, domains)
+        || names_domain(models_toml, domains)
+        || files
+            .iter()
+            .any(|file| names_domain(&format!("{manifest_key}/{}", file.path), domains))
+    {
+        return Err(Refusal::ConfigNamesDomain);
+    }
     if files
         .iter()
         .any(|file| file.size > limits.model_file_max_bytes)
@@ -370,9 +398,7 @@ pub fn check_model_write(
         ModelKey::Manifest { version: id } => {
             let manifest: Manifest = serde_json::from_value(write.value.clone())
                 .map_err(|_| Refusal::ConfigMalformed)?;
-            if write.blob.is_some()
-                || write.value.to_string().len() as u64 > limits.setting_value_max_bytes
-            {
+            if write.blob.is_some() || manifest_too_large(&manifest, limits) {
                 return Err(Refusal::ConfigMalformed);
             }
             if names_domain(&manifest.models_toml, domains) {

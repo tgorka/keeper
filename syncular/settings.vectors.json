@@ -2525,6 +2525,7 @@
         }
       ],
       "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
       "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
       "refusal": null
     },
@@ -2553,6 +2554,7 @@
         }
       ],
       "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
       "version": "09f6de23684774298f714de49c771a18a89b5472763be249d73ff097ed6ac948",
       "refusal": null
     },
@@ -2581,6 +2583,7 @@
         }
       ],
       "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
       "version": null,
       "refusal": "config.model_too_large"
     }

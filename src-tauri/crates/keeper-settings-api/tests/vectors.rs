@@ -665,7 +665,13 @@ fn model_sets() {
             serde_json::from_value(case["files"].clone()).expect("model files");
         let models_toml = case["models_toml"].as_str().expect("models_toml");
         let expected_refusal = case["refusal"].as_str();
-        let result = check_set(&files, models_toml, &lim);
+        let domains: Vec<&str> = case["domains"]
+            .as_array()
+            .expect("domains")
+            .iter()
+            .map(|v| v.as_str().expect("domain entry"))
+            .collect();
+        let result = check_set(&files, models_toml, &domains, &lim);
         assert_eq!(
             result.as_ref().err().map(|r| r.code()),
             expected_refusal,
