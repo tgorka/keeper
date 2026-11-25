@@ -155,6 +155,9 @@ impl State for Graph {
             .cloned()
             .collect()
     }
+    fn file_ref(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 /// A reversal's extra reads: every row was last written before any event

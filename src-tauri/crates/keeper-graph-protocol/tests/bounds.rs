@@ -79,6 +79,9 @@ impl State for Wide {
     fn merged_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
         Vec::new()
     }
+    fn file_ref(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 fn contain_new_child(parents: usize) -> (Verdict, usize, usize) {

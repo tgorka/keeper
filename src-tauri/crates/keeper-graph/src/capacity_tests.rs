@@ -424,6 +424,9 @@ impl State for Graph {
             .cloned()
             .collect()
     }
+    fn file_ref(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 impl candidate::Retained for Graph {

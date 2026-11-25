@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 12,
+  "schemaVersion": 13,
   "schemaVersions": [
     {
       "version": 1,
@@ -72,6 +72,12 @@
       "version": 12,
       "migrations": [
         "0012_jobs"
+      ]
+    },
+    {
+      "version": 13,
+      "migrations": [
+        "0013_knowledge_graph_file_refs"
       ]
     }
   ],
@@ -1936,7 +1942,7 @@
     },
     {
       "name": "kg_nodes",
-      "generation": "eb45e61e0354397cc06278ce97ee6059",
+      "generation": "f215387952db4932d1dd32cd9289bff5",
       "primaryKey": "id",
       "columns": [
         {
@@ -2415,6 +2421,57 @@
           "columns": [
             "owner_node_id",
             "id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_file_refs",
+      "generation": "7485fd67e2aad211493067a7e2e74540",
+      "primaryKey": "entry_id",
+      "columns": [
+        {
+          "name": "entry_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "node_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "node_kind",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "node_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_file_refs_node_id_ref",
+          "columns": [
+            "node_id"
           ],
           "unique": false
         }

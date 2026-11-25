@@ -144,6 +144,9 @@ impl State for Graph {
             merged_into(r).is_some_and(|m| node_ids.iter().any(|i| i == m))
         })
     }
+    fn file_ref(&self, _: &str) -> Option<Image> {
+        None
+    }
 }
 
 impl Retained for Graph {

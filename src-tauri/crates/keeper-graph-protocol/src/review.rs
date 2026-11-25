@@ -148,5 +148,6 @@ pub fn acknowledgement(id: &str, target: &Target, reviewer: &str) -> Result<Effe
         ops,
         delta_digest,
         affected: vec![json!({"entity_type": "review", "id": id, "revision": "1"})],
+        file_refs: Vec::new(),
     })
 }

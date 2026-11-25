@@ -150,6 +150,14 @@ tables omitted, and refuses every `jobs.*` command until it enforces 122.2's fen
 to the three tables refused, service writes included. The number 12 is provisional while `0010`
 (116.1) and `0011` (121.1) are unmerged; the coordinator assigns the final one.
 
+### Schema 13 release prerequisite
+
+Schema 13 (`0013_knowledge_graph_file_refs`, story 116.5) adds `kg_file_refs` under `kg_graph` and
+changes nothing else; migrations `0001` through `0012` and their hashes are byte-identical to
+schema 12. The server serves older schemas beside it with `kg_file_refs` omitted, and refuses every
+raw write of the table until it writes rows in the graph command's own commit (keeper-hq's commit
+check admitting its upsert and delete).
+
 ## Settings
 
 A person's settings are rows of their personal domain (D-26, D-27; story 121.1), and a domain's
@@ -846,6 +854,8 @@ an edge's never does, and no member is a query symbol:
   by a `remove` operation.
 - **`kg_contents`** (schema 7) — `owner_node_id` (fixed for good), `revision`, `body`,
   `created_event_id`, `updated_event_id`. A content has no lifecycle: its owner node's governs it.
+- **`kg_file_refs`** (schema 13) — `entry_id` (key), `node_id`, `node_kind`; the graph's state;
+  see **Files**.
 - **`kg_proposals`** (schema 8) — one immutable proposal revision, `id`
   `<proposal_id>/<revision>`: `status` (`open` | `approved` | `rejected` | `expired` |
   `superseded`), `reason`, `digest`, `change` (the `graph.apply` payload), `reviewers`,
@@ -1138,6 +1148,44 @@ domain-visible reference written after the target) is a `conflict` whose precond
 `inverse_caps[]` (the 128-operation cap as generators: `creates` node creates, reversed, fit
 with their review at 127 and refuse `change_limit` at 128), `reversals[]`, `reviews[]`,
 `previews[]` (preview rows decoded or refused), `proposals[]` and `outcomes[]` pin these.
+
+**Files** (story 116.5). A `Resource` node points at a file entry with `$locator` kind `internal`
+and text `files:<domain>/<entry_id>` (116.1 decision 1). The locator names the entry by id and
+carries no version (a version is `(entry_id, revision)`), so it follows renames, moves, deletes and
+restores. A `Collection` node binds a `dir` entry through top-level property `okf:directory` set to
+the same text. Each drive has one `Collection` under the domain's root `Collection`, bound to the
+drive's own root `dir` entry (H-16); the domain's root `Collection` (carrying
+`okf:profile_version`) is never bound. The legacy `internal` locator (`keeper:drive/notes`) is
+resolved by nobody (`files.resolve` answers `unresolved`) and counts for no entry.
+
+At most one active node of either kind may name an entry in a final candidate; a second is refused
+`conflict` with detail `{"entity":{"entity_type":"node","id":<the other active
+node>},"precondition":"file_ref","current_revision":<its accepted revision>}`. Whole-candidate
+validation enforces this across `create_node`, `update_node` retarget, `unarchive_node`,
+`merge_nodes` and every reversal (`graph.reverse`). `kg_file_refs` holds at most one row per entry
+by one rule (H-10): the active node counting for the entry, else the one archived last; a node
+merged away counts only when its survivor names the entry. The server writes `kg_file_refs` in the
+graph command's own commit, never as an event operation, so `delta_digest` never covers it. Raw
+sync writes to `kg_file_refs` are refused for person, agent and service clients alike, and no
+`files.*` command (`files.change`, `files.import`, `files.reverse`) writes it. Deleting a file
+leaves its row in place; restoring the file finds the same node. No graph change writes a manifest
+row or moves an entry's revision. `keeper-graph-protocol::file_ref` implements the rule, and
+`file_refs[]` and `file_ref_admissions[]` in `knowledge-graph.vectors.json` pin it. Whether an
+entry exists in the domain and is a `dir` is the server's (`file_ref::admit`); another domain's id
+answers as one that exists nowhere (`invalid_change`).
+
+**Generated text, reserved.** Top-level node property `okf:summary` and provenance names
+`okf:model`, `okf:prompt`, `okf:generator` and `okf:source_content_id` are reserved and unused; the
+later program decides their carrier, value and place. A hand-written note is a content
+(`kg_contents`) the node owns, referenced by no reserved property and not by
+`description_source_id`, and kept out of `description`.
+
+**Vectors, reserved.** Table name `kg_vectors`, key `(subject_type, subject_id, model, chunk)` and
+per-graph scope variable `kg_vectors` are reserved. Its rows will be derived and disposable, never
+an event and subject to no graph limit, written by a job kind's tool identity using a per-domain
+provider; a label-less reader sees no labelled entry, and nothing under untrusted globs is indexed
+until D-34's mark (G-20). Neither the table nor any granted `kg_vectors` variable exists yet; a
+test over `syncular.json` holds that.
 
 ### Domain capacity
 

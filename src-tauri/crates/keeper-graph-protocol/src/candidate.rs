@@ -22,10 +22,12 @@
 //! `contains` edge created, unarchived or rewritten by a merge; then the
 //! final candidate ([`Candidate::finish`]: every node written within its
 //! kind's reserved-member rules, description provenance, content owners
-//! and reference bodies, and the verification rules); then the event's
-//! bounds ([`crate::delta::digest`]). The receipt's `affected` lists nodes,
-//! edges, new tags and contents in order of their first touch by the
-//! change, which may differ from the order of their event operations.
+//! and reference bodies, the verification rules, and the one-node rule of
+//! [`crate::file_ref`] with the `kg_file_refs` writes it leaves); then the
+//! event's bounds ([`crate::delta::digest`]). The receipt's `affected`
+//! lists nodes, edges, new tags and contents in order of their first touch
+//! by the change, which may differ from the order of their event
+//! operations.
 //!
 //! **Revisions.** A created node or edge starts at revision 1 (a node also at
 //! lifecycle revision 1, active); a new tag or content at revision 1. A node
@@ -116,6 +118,7 @@ use crate::assertion::{self, MAX_CHECKED_CONTENTS, MAX_CHECKED_SOURCES};
 use crate::change::{Change, ChangeOp, CheckedContent, CheckedSource, MergeEdge};
 use crate::content::{revise, Revision};
 use crate::delta::{self, Op};
+use crate::file_ref;
 use crate::value::{check_node_properties, check_properties, typed_ref, RefType};
 use crate::vocabulary::{EntityType, Operation};
 use crate::Refusal;
@@ -158,6 +161,9 @@ pub trait State {
     /// The nodes whose `merged_into_id` is one of `node_ids`
     /// (`kg_nodes_merged_into_id`).
     fn merged_into(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>>;
+    /// The `kg_file_refs` row of entry `entry_id` (`{entry_id, node_id,
+    /// node_kind}`, its `graph` column optional), if any.
+    fn file_ref(&self, entry_id: &str) -> Option<Map<String, Value>>;
 }
 
 impl<S: State + ?Sized> assertion::Current for S {
@@ -199,6 +205,9 @@ pub struct Effects {
     /// with `lifecycle_revision`) for each node, edge, new tag and content,
     /// in order of their first operation.
     pub affected: Vec<Value>,
+    /// The `kg_file_refs` writes of the change's own commit, ascending by
+    /// entry ([`crate::file_ref::judge`]); never an event operation.
+    pub file_refs: Vec<file_ref::Write>,
 }
 
 impl Effects {
@@ -284,6 +293,8 @@ struct Candidate<'a> {
     /// Nodes, edges, new tags (by text) and contents in order of first
     /// touch: the receipt's `affected` order.
     order: Vec<(&'static str, String)>,
+    /// The `kg_file_refs` writes [`Candidate::finish`] judged.
+    file_refs: Vec<file_ref::Write>,
 }
 
 fn text(image: &Image, key: &str) -> String {
@@ -491,6 +502,7 @@ impl<'a> Candidate<'a> {
             provenance: Vec::new(),
             slots: Vec::new(),
             order: Vec::new(),
+            file_refs: Vec::new(),
         }
     }
 
@@ -1405,6 +1417,46 @@ impl<'a> Candidate<'a> {
                 assertion::clear(&mut entry.after);
             }
         }
+        self.judge_file_refs()
+    }
+
+    /// The one-node rule and the `kg_file_refs` rows
+    /// ([`file_ref::judge`]), over the nodes this change wrote in order of
+    /// first touch: a second active node naming an entry is a conflict
+    /// (precondition [`file_ref::PRECONDITION`]) naming the other one at
+    /// its accepted revision.
+    fn judge_file_refs(&mut self) -> Result<(), Stop> {
+        let written: Vec<&Entry> = self
+            .order
+            .iter()
+            .filter(|(kind, _)| *kind == "node")
+            .filter_map(|(_, id)| self.nodes.get(id))
+            .filter(|e| e.touched || e.before.is_none())
+            .collect();
+        let touched: Vec<file_ref::Touched<'_>> = written
+            .iter()
+            .map(|e| file_ref::Touched {
+                before: e.before.as_ref(),
+                after: &e.after,
+            })
+            .collect();
+        let node_of = |id: &str| self.final_node(id);
+        let mut writes = Vec::new();
+        for entry_id in file_ref::entries(&touched) {
+            let row = self
+                .state
+                .file_ref(&entry_id)
+                .and_then(|image| file_ref::Row::of(&image));
+            match file_ref::judge(&entry_id, &touched, row.as_ref(), &node_of) {
+                file_ref::Outcome::Keep => {}
+                file_ref::Outcome::Write(write) => writes.push(write),
+                file_ref::Outcome::Conflict { node_id } => {
+                    let current = self.state.node(&node_id).map(|n| text(&n, "revision"));
+                    return Err(conflict("node", &node_id, file_ref::PRECONDITION, current));
+                }
+            }
+        }
+        self.file_refs = writes;
         Ok(())
     }
 
@@ -1493,6 +1545,7 @@ impl<'a> Candidate<'a> {
             ops,
             delta_digest,
             affected: self.affected()?,
+            file_refs: self.file_refs.clone(),
         })
     }
 

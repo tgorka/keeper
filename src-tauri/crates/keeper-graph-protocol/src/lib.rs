@@ -23,6 +23,7 @@ pub mod candidate;
 pub mod change;
 pub mod content;
 pub mod delta;
+pub mod file_ref;
 pub mod inverse;
 pub mod locator;
 pub mod profile;
@@ -47,6 +48,9 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// no graph table — only which scope variable carries the ledger
 /// (`scope::HISTORY_VARIABLE`, story 115.6) — so the tables, and the
 /// worker protocol that names their version, stay at 8.
+/// Schema 13 (story 116.5) adds `kg_file_refs`, a map the graph command
+/// writes and no worker frame or change operation names, so the version
+/// stays 8.
 pub const SCHEMA_VERSION: u32 = 8;
 /// The query profile [`profile`] admits and whose symbols [`symbol`] maps.
 pub const PROFILE: &str = "KG-Cypher/1";
