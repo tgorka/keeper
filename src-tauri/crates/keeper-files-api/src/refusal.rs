@@ -24,11 +24,14 @@ pub enum Code {
     NotEmpty,
     ContentAbsent,
     ChangeLimit,
+    /// A proposal revision that is no longer open, current, unexpired or
+    /// applicable (story 116.6): terminal, never rebased.
+    ProposalStale,
 }
 
 impl Code {
     /// Every code, in the README's order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::UnsupportedVersion,
         Self::IdempotencyMismatch,
         Self::InvalidChange,
@@ -45,6 +48,7 @@ impl Code {
         Self::NotEmpty,
         Self::ContentAbsent,
         Self::ChangeLimit,
+        Self::ProposalStale,
     ];
 }
 

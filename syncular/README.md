@@ -158,6 +158,14 @@ schema 12. The server serves older schemas beside it with `kg_file_refs` omitted
 raw write of the table until it writes rows in the graph command's own commit (keeper-hq's commit
 check admitting its upsert and delete).
 
+### Schema 14 release prerequisite
+
+Schema 14 (`0014_files_review`, story 116.6) adds the three drive review tables
+(`files_proposals`, `files_proposal_reviewers`, `files_reviews`) and two scope variables
+(`files_proposal`, `files_reviewer`). It changes no existing table, column, index or scope variable;
+migrations `0001` through `0013` are unchanged. The server serves earlier schemas beside 14 with
+these three tables omitted.
+
 ## Settings
 
 A person's settings are rows of their personal domain (D-26, D-27; story 121.1), and a domain's
@@ -377,9 +385,11 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `kg_proposal` | a proposer's actor id | itself | itself | `kg_proposals` |
 | `files_drive` | `<domain>/<drive>` (`drive_key`) | every live drive of a domain where the person holds `reader` or above (never `'*'`, never from membership alone; a device holds a whole drive or none) | the drives of a domain covering the instance's file capability roots (and tools with a file class) | `files_entries` (schema 10) |
 | `files_domain` | the name of the database (its drive's domain) | when the person holds `reader` or above in the domain | when the instance or tool holds a file class in the domain | `files_head` (schema 10) |
-| `files_page` | `<domain>/<yyyy-mm>` (UTC month of `recorded_at_ms`) or `<domain>/import` | as `files_domain` | as `files_domain` | `files_events`, `files_event_ops` (schema 10; and `files_reviews` from 116.6) |
+| `files_page` | `<domain>/<yyyy-mm>` (UTC month of `recorded_at_ms`) or `<domain>/import` | as `files_domain` | as `files_domain` | `files_events`, `files_event_ops` (schema 10), `files_reviews` (schema 14) |
 | `files_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `files_receipts` (schema 10) |
 | `files_sources` | the name of the database (its drive's domain) | never, whatever the role | agent instances and tools with a file class in the domain | `files_entry_sources` (schema 10; reserved, holds no row until 120.2) |
+| `files_proposal` | a proposer's actor id | itself | itself | `files_proposals` (schema 14) |
+| `files_reviewer` | a reviewer's actor id | itself | never (no value) | `files_proposal_reviewers` (schema 14) |
 | `jobs_page` | `<domain>/open` or `<domain>/<yyyy-mm>` (*Jobs*) | as the domain's job-read policy grants (membership of the domain) | when the instance serves the domain | `jobs`, `job_claims` (schema 12) |
 | `jobs_nodes` | the domain's name | as `jobs_page` | as `jobs_page` | `job_capabilities` (schema 12) |
 
@@ -1294,6 +1304,20 @@ its own `id`.
   (`<descriptor>/<request_id>/<client_scope>`), `client_scope`, `descriptor`, `request_id`,
   `request_digest`, `outcome`, `reason`, `event_id`, `seq`, `detail`, `recorded_at_ms`,
   `author_actor`, `author_client`.
+- `files_proposals` (`files_proposal` on `proposer_actor`; schema 14, `0014_files_review`): `id`
+  (`<proposal_id>/<revision>`), `domain`, `proposal_id`, `revision`, `status` (`open` | `approved`
+  | `rejected` | `expired` | `superseded`), `reason`, `digest`, `change` (JSON), `reviewers`
+  (JSON), `expires_at_ms`, `proposer_actor`, `proposer_client`, `proposer_context`, `origin_actor`,
+  `origin_chain` (JSON), `source_labels` (JSON), `created_at_ms`, `decided_at_ms`, `decided_by`,
+  `decided_event_id`, `change_set_id`, `job_id`, `job_ordinal`, `job_attempt_id`, `author_actor`,
+  `author_client`.
+- `files_proposal_reviewers` (`files_reviewer` on `reviewer_actor`; schema 14, `0014_files_review`;
+  ids and status only, never content): `id` (`<proposal_id>/<revision>/<reviewer>`), `domain`,
+  `reviewer_actor`, `proposal_id`, `revision`, `status`, `proposer_actor`, `change_set_id`,
+  `expires_at_ms`, `op_count`, `author_actor`, `author_client`.
+- `files_reviews` (`files_page` on `page_key`; schema 14, `0014_files_review`): `id`, `domain`,
+  `page_key`, `target_event_id`, `target_delta_digest`, `kind` (`acknowledgement` | `reversal`),
+  `reviewer_actor`, `revision`, `created_event_id`, `author_actor`, `author_client`.
 
 **Scopes and grants.** A person is granted `files_drive`, `files_domain` and `files_page` only when
 holding `reader` or above in the domain — never `'*'`, never from domain membership alone. A
@@ -1301,7 +1325,9 @@ credential with no role or file class in the domain is granted none of these row
 is never allowed to a person, whatever the role; only agent instances and tools holding a file class
 in the domain may be granted it. `drive_key` is the finest scope key, so a device holds a whole
 drive or none; deeper folder roots are enforced on commands, never by scopes. `files_client` is each
-caller's own `(actor, client)`.
+caller's own `(actor, client)`. A person is allowed `files_proposal` and `files_reviewer` for their
+own actor id only; agents and tools hold `files_proposal` for their own actor id and hold no
+`files_reviewer` value.
 
 **Requests.** Every `files.*` command's `params` is the closed envelope
 `{"version": 1, "request_id": <ULID>, "context_id": <ULID> | null, "approval_id"?: <ULID> | null, "job"?: {"job_id", "ordinal", "attempt_id"} | null, "payload": {…}}`.
@@ -1320,7 +1346,10 @@ command runs with lock mode `shared`.
   instead of `mode` on file creates/replaces, with no `mtime_ms`.
 - `files.reverse`: `{"event_id": <ULID>}` (implemented in 116.3). `files.preview_reversal` and
   `files.history` are read-only queries (like `files.freshness`), not commands.
-- Story 116.6 adds `files.propose`, `files.decide` and `files.acknowledge`.
+- `files.propose`: `{"proposal_id": <ULID>, "base_revision": <decimal> | null, "change": {"operations": [op…], "event_time_ms"?: <int> | null}, "reviewers": [<actor_id>…] | {"role": "reviewer"}, "expires_at_ms": <int> | null, "change_set_id"?: <ULID> | null}`.
+- `files.decide`: `{"decisions": [{"proposal_id": <ULID>, "proposal_revision": <decimal>, "proposal_digest": <hex>, "decision": "approve" | "reject"}…]}`.
+- `files.acknowledge`: `{"targets": [{"target_event_id": <ULID>, "target_delta_digest": <hex>}…]}`.
+  `files.proposal`, `files.proposals` and `files.unreviewed` are read-only queries, not commands.
 
 **Outcomes.** `files_receipts.outcome` is `accepted`, `proposed` (from 116.6, `detail` carrying
 proposal id, revision and digest), `conflict` or `rejected`. Receipts work as KG1's: a `request_id`
@@ -1333,8 +1362,9 @@ row in one commit; a refused command mutates no manifest row and writes only a r
 
 1. `version` ≠ 1 → `unsupported_version`.
 2. `request_id` bound to another digest → `idempotency_mismatch`; same digest → earlier outcome.
-3. Reserved envelope fields: non-null `approval_id` or `job` → `reserved_field`; non-null
-   `context_id` from person, tool or import → `reserved_field`; null `context_id` from agent →
+3. Reserved envelope fields: non-null `approval_id` → `reserved_field`; non-null `job` from anyone
+   other than a job caller → `reserved_field`, null `job` from a job caller → `forbidden`; non-null
+   `context_id` from person, tool, job or import → `reserved_field`, null `context_id` from agent →
    `forbidden`.
 4. Command dispatch: `files.import` from anyone but the import identity, or import sending anything
    else → `forbidden`; unknown descriptor → `invalid_change`.
@@ -1367,11 +1397,13 @@ row in one commit; a refused command mutates no manifest row and writes only a r
 - `invalid_name`: name is not a single `keeper-paths` segment, contains NUL, or exceeds 255 UTF-8
   bytes.
 - `reserved_name`: drive name folds to `.keeper-logs`.
-- `reserved_field`: a reserved field (`approval_id`, `job`, `context_id` from non-agent, any
-  `sources` member, or non-null `approval_id`/`origin_chain`/`context_id` on a `release` event).
+- `reserved_field`: a reserved field (`approval_id`, `job` from a non-job caller, `context_id` from
+  non-agent, any `sources` member, or non-null `approval_id`/`origin_chain`/`context_id` on a
+  `release` event).
 - `forbidden`: caller lacks role/identity authority (reader write, a reader reversing, an editor or
-  agent/tool/job reversing another's event, non-owner drive create, non-import `files.import`, or
-  agent with null `context_id`).
+  agent/tool/job reversing another's event, non-owner drive create, non-import `files.import`,
+  agent with null `context_id`, job caller with null `job`, non-proposer revising a proposal, or
+  non-reviewer deciding/acknowledging/reading reviewer queries).
 - `outside_roots`: rooted caller touches an entry or parent outside its covering `write` (and, for a
   reversal, `reverse_own`) roots.
 - `propose_required`: strictest covering mode for a rooted caller's write or reversal is `propose`.
@@ -1384,6 +1416,8 @@ row in one commit; a refused command mutates no manifest row and writes only a r
 - `content_absent`: a create or replace names a `content_id` not present in the domain's file key
   space (or not readable/uploaded by a rooted caller).
 - `change_limit`: charged operations exceed 128.
+- `proposal_stale`: a proposal revision is no longer `open`, is not the latest revision, has
+  expired, does not match the named `proposal_digest`, or fails re-judgement at approval.
 
 **Operation bound and arithmetic.** One change may carry at most 128 charged operations. Every
 ordinary operation charges 1; a cross-drive `move` charges 2 per row it carries (the entry and every
@@ -1416,8 +1450,10 @@ or `parent_invalid` (restored or moved-back entry would sit under an absent, del
 parent), reversal answers `conflict` (`dependency`, naming the smallest such child id or that parent
 id); later edits stay `conflict` (`revision`/`lifecycle`) and another live entry now folding equal at
 the move-back target stays `conflict` (`name`). An accepted reversal records `reverses_event_id` and
-appends one `review` op (`entity_type` `review`, `operation` `create`, outside the 128 bound; 116.6
-adds `files_reviews`). `files.preview_reversal` is a read-only query with closed params
+appends one `review` op (`entity_type` `review`, `operation` `create`, outside the 128 bound) whose
+after-image is `{"id", "target_event_id", "target_delta_digest", "kind", "reviewer_actor",
+"revision"}`, with its `files_reviews` row written in the same transaction. `files.preview_reversal`
+is a read-only query with closed params
 `{"version": 1, "event_id": <ULID>}` (`version` ≠ 1 → `unsupported_version`, other shape →
 `invalid_change`) that runs inverse, authority, preconditions and final state as `files.reverse`
 would for this caller, writing nothing and binding no request, returning
@@ -1447,6 +1483,79 @@ server never invents a name. Modification beats deletion: a replace refused `con
 deleted by another device) is written the same way, using the plain `name` when its fold is free. A
 stale delete refused `conflict` (`revision`) is dropped and the edited file stays live. Vectors:
 `conflict_copies[]`, `cases: conflict-copy-two-clients`, `cases: conflict-stale-delete-refused`.
+
+**Proposals, decisions and reviews (116.6).** `files.propose` takes
+`{"proposal_id": <ULID>, "base_revision": <decimal> | null, "change": {"operations": [op…], "event_time_ms"?: <int> | null}, "reviewers": [<actor_id>…] | {"role": "reviewer"}, "expires_at_ms": <int> | null, "change_set_id"?: <ULID> | null}`
+and stores private metadata (never an event, never a head move). `reviewers` is either 1 to 16
+strictly ascending non-empty person actor ids each holding `reviewer` or `owner` at propose time
+(else `invalid_change`, nothing stored), or `{"role": "reviewer"}` (any person holding `reviewer`
+or `owner` here, judged at decide time; inbox rows are written at propose time for current holders,
+and a later holder finds the revision through `files.proposals`, with no back-fill of inbox rows).
+`proposal_digest` is the lowercase hex SHA-256 of RFC 8785 canonical JSON of
+`{"version": 1, "domain", "proposal_id", "revision", "change", "reviewers", "expires_at_ms", "change_set_id"}`
+(absent optional fields as null), each member exactly as sent; `files_proposals.change` stores the
+`change` member as sent too. The proposal's `change` carries no `change_set_id` of its own (refused
+`invalid_change`): the top-level one lands on the approved event. Only the proposer may revise a proposal: `base_revision: null`
+creates revision `"1"` (if the `proposal_id` already exists: `invalid_change` for the latest
+proposer, `forbidden` otherwise); a non-null `base_revision` creates `base + 1` and marks the prior
+revision and its inbox rows `superseded` (absent base or another `proposer_actor` → `forbidden`;
+base not latest, not `open`, or expired at `now >= expires_at_ms` → `proposal_stale`). `import` is
+`forbidden`; a person `reader` or non-owner drive create is `forbidden`; rooted callers must pass
+`write` roots (`outside_roots`), and `propose_required` is accepted here (any mode may propose).
+Per-entry preconditions are judged as the write would be (roots and the naming rule included), at
+propose time (refused → nothing stored) and again at approval for the proposer; staleness (non-`open`,
+digest mismatch, expiry, or failed re-judgement) is terminal `rejected` `proposal_stale`, never a
+rebase (expiry moves the revision to `expired`, failed re-judgement to `rejected`, both with reason
+`proposal_stale`), and an approval is never a release. `files.decide` takes
+`{"decisions": [{"proposal_id", "proposal_revision", "proposal_digest", "decision": "approve" | "reject"}…]}`
+(person holding `reviewer`/`owner` only → else `forbidden`; 1..=128 unique `(proposal_id, proposal_revision)`
+items → else `invalid_change`; sum of `op_count` of existing listed revisions > 128 → `change_limit`;
+whole-list refusals change nothing). Items run in order on the manifest left by earlier items: an
+absent or unaddressed revision answers item `rejected` `forbidden` without disclosing existence;
+`reject` moves the revision to `rejected` (item `proposed`); `approve` commits one event (`descriptor`
+`files.decide`, the decider's actor and client, `origin_class` `human`, the proposer's captured
+`origin_actor`/`origin_chain`, `approval_basis` `proposal`, `proposal_id`, the revision's
+`change_set_id` and job columns; head + 1 per approval, all approvals of the list landing in one
+commit) and moves the revision to `approved` (item `accepted` with `event_id` and
+`seq`). The list receipt mirrors the sole item when length is 1; for several items it is `accepted`
+if any approved, else `proposed` if any rejected-by-decision, else `rejected` with the first item's
+code (`event_id`/`seq` null), with every item in `detail`. `files.acknowledge` takes
+`{"targets": [{"target_event_id": <ULID>, "target_delta_digest": <hex>}…]}` (person holding
+`reviewer`/`owner` only → else `forbidden`; 1..=128 unique ULID targets; all-or-nothing: any unknown
+event, digest mismatch, `files.acknowledge` event, or already-reviewed event → `invalid_change`,
+nothing written) and commits one `files.acknowledge` event (`origin_class` `human`, `approval_basis`
+`direct`, head + 1, no entry changes) with one `review` op (`kind` `acknowledgement`) and one
+`files_reviews` row per target. Reads: `files.proposal` (`{"version": 1, "proposal_id": <ULID>}`)
+returns revisions ascending by revision readable by the caller (all revisions to their proposer,
+those addressed to them now to a person, else none; never a refusal); `files.proposals`
+(`{"version": 1, "after"?, "limit": 1..=100, "change_set_id"?}`) and `files.unreviewed`
+(`{"version": 1, "after": <decimal>, "limit": 1..=100, "change_set_id"?}`) are restricted to a
+person holding `reviewer` or `owner` (`forbidden` otherwise), `files.proposals` listing open
+unexpired revisions addressed to the caller ascending by row id (`next` when full) and
+`files.unreviewed` listing unreviewed `agent`/`tool`/`job` events ascending numerically by `seq`
+(`scanned_through` as `files.history`) from server-only `files_unreviewed` (a 116.3-era reversal
+counts as reviewed through `reverses_event_id`). `files.reverse` now also writes its `files_reviews`
+row, and event ownership is an approved proposal's proposer (`approval_basis.proposer_actor`) else
+the event's `actor_id`; a rooted caller's reversal lands by its `write` class's mode, so an agent in
+`propose` mode is refused `propose_required` and proposes the inverse instead. A direct write under
+a class in `propose` mode stays `propose_required`. `apply` mode is accepted at once with
+`{"basis": "grant", "grant_id", "grant_revision", "mode": "apply"}`; an agent's `apply` write and
+proposal name a `context_id` and are refused by the server with `kg.sink_audience` in a
+graph-labelled session until 120.2 and `approval_required` in an untrusted session, while with the
+graph switched off an agent has no context so its propose, `apply` and reversal are `forbidden`.
+Envelope `job` is accepted only from a job caller whose attempt the server's registration point (one
+check a jobs module registers, called inside the command's transaction; none registered → refused)
+judges current, recording event `origin_class` `job` with `job_id`, `job_ordinal` and
+`job_attempt_id`. Every command and read first reads the map barrier ("map not reconciled", nothing
+written) then the per-domain `shadow` record (116.2's stable reason); each command's lock mode is
+`shared`. The push of a propose or decide is allowed exactly the `files_reviewer` values of the
+revision's reviewers and, for a decide, each proposer's `files_proposal` value, never as a read
+scope. The keep-set holds an open unexpired revision's content ids, an expired one's until the grace
+from `expires_at_ms`, and a rejected or superseded one's until the grace from that transition. The
+files ledger is not the graph's: nothing here counts toward a graph domain's limit of accepted
+changes. Server-side reasons (`kg.sink_audience`, `approval_required`, barrier, `shadow`,
+`mode_unavailable`, `hq.job.stale_attempt`) stay outside the closed code set. Vectors:
+`proposals[]`, `reviews[]`, `outcomes[]`.
 
 **`files.freshness` and server-only tables.** `files.freshness` is a read-only query with params
 `{"version": 1, "domain": <domain>}` returning

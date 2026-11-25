@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 13,
+  "schemaVersion": 14,
   "schemaVersions": [
     {
       "version": 1,
@@ -78,6 +78,12 @@
       "version": 13,
       "migrations": [
         "0013_knowledge_graph_file_refs"
+      ]
+    },
+    {
+      "version": 14,
+      "migrations": [
+        "0014_files_review"
       ]
     }
   ],
@@ -3463,6 +3469,340 @@
       "extensions": {}
     },
     {
+      "name": "files_proposals",
+      "generation": "d4165f81e32916a921ba84b0d4af2bc1",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposal_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "change",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "reviewers",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "proposer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposer_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposer_context",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "origin_actor",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "origin_chain",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "source_labels",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "decided_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "decided_by",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "decided_event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "change_set_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "job_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "job_ordinal",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "job_attempt_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_proposal:{files_proposal}",
+          "variable": "files_proposal",
+          "column": "proposer_actor"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_proposals_revision",
+          "columns": [
+            "proposal_id",
+            "revision"
+          ],
+          "unique": true
+        },
+        {
+          "name": "files_proposals_proposer",
+          "columns": [
+            "proposer_actor"
+          ],
+          "unique": false
+        },
+        {
+          "name": "files_proposals_change_set",
+          "columns": [
+            "change_set_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_proposal_reviewers",
+      "generation": "aa0645841165210770b72066aacca435",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reviewer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposal_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "change_set_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "op_count",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_reviewer:{files_reviewer}",
+          "variable": "files_reviewer",
+          "column": "reviewer_actor"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_proposal_reviewers_revision",
+          "columns": [
+            "proposal_id",
+            "revision"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "files_reviews",
+      "generation": "f653cde5a06e4be0e70950b37eee1dd1",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "target_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "target_delta_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reviewer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "files_page:{files_page}",
+          "variable": "files_page",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "files_reviews_target",
+          "columns": [
+            "target_event_id",
+            "kind"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
       "name": "settings_devices",
       "generation": "733a1742f8b43ad8dc1a288dacaa0a58",
       "primaryKey": "device_id",
@@ -4240,6 +4580,30 @@
           "value": {
             "kind": "parameter",
             "name": "database"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesProposals",
+      "scopes": [
+        {
+          "variable": "files_proposal",
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
+          }
+        }
+      ]
+    },
+    {
+      "name": "filesReviewer",
+      "scopes": [
+        {
+          "variable": "files_reviewer",
+          "value": {
+            "kind": "parameter",
+            "name": "actorId"
           }
         }
       ]

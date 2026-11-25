@@ -5,12 +5,15 @@ use std::cmp::Reverse;
 use serde_json::{json, Map, Value};
 
 use super::helpers::digest_hex;
-use super::{Accepted, Body, Manifest, Request, Server, Staged, StagedOp};
+use super::review_common::review_op_and_row;
+use super::{Accepted, Body, EventMeta, Manifest, Request, Server, Staged, StagedOp};
 use crate::caller::Caller;
 use crate::ids;
 use crate::names::FileMode;
 use crate::refusal::{Code, Refusal};
-use crate::rows::{ApprovalBasis, Drive, EntityType, Entry, Event, Head, Lifecycle, Op, Operation};
+use crate::rows::{
+    ApprovalBasis, Drive, EntityType, Entry, Event, Head, Lifecycle, Op, Operation, ReviewKind,
+};
 use crate::wire::WireOp;
 
 /// The inverse of every entry operation of event `event_id`, in reverse
@@ -141,7 +144,10 @@ fn invert_op(op: &Op) -> Result<WireOp, Refusal> {
     }
 }
 
-/// Step 10: writes the accepted change into `m` and returns its event.
+/// Step 10: writes the accepted change into `m` and returns its event. A
+/// reversal's event ends with one `review` operation of kind `reversal`,
+/// whose `files_reviews` row is written with it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit(
     m: &mut Manifest,
     caller: &Caller,
@@ -150,6 +156,7 @@ pub(crate) fn commit(
     mut staged: Staged,
     reverses: Option<&str>,
     server: &Server,
+    meta: &EventMeta,
 ) -> Accepted {
     let seq = ids::next_decimal(m.head.as_ref().map_or("0", |h| h.seq.as_str()));
     let import = request.descriptor == "files.import";
@@ -180,32 +187,31 @@ pub(crate) fn commit(
         }
     }
 
+    let mut review = None;
     if let Some(target_event_id) = reverses {
         let ordinal = next_ordinal(&ops);
         let review_id = server
             .review_id
             .clone()
             .unwrap_or_else(|| format!("{}/review", server.event_id));
-        ops.push(Op {
-            id: format!("{}/{ordinal}", server.event_id),
-            domain: m.domain.clone(),
-            event_id: server.event_id.clone(),
+        let target_delta_digest = m
+            .events
+            .get(target_event_id)
+            .map(|(event, _)| event.delta_digest.clone())
+            .unwrap_or_default();
+        let (op, row) = review_op_and_row(
+            &m.domain,
+            &server.event_id,
             ordinal,
-            page_key: page_key.clone(),
-            entity_type: EntityType::Review,
-            entity_id: review_id,
-            operation: Operation::Create,
-            before_revision: None,
-            after_revision: Some("1".to_owned()),
-            before_value: None,
-            after_value: Some(json!({
-                "target_event_id": target_event_id,
-                "kind": "reversal",
-                "reviewer_actor": caller.actor_id(),
-            })),
-            before_content_id: None,
-            after_content_id: None,
-        });
+            &page_key,
+            &review_id,
+            target_event_id,
+            &target_delta_digest,
+            ReviewKind::Reversal,
+            caller.actor_id(),
+        );
+        ops.push(op);
+        review = Some(row);
     }
 
     let delta_digest = compute_delta_digest(&ops);
@@ -216,7 +222,9 @@ pub(crate) fn commit(
             event_time_ms,
             ..
         } => (change_set_id.clone(), *event_time_ms),
-        Body::Reverse { .. } => (None, None),
+        Body::Reverse { .. } | Body::Propose(_) | Body::Decide(_) | Body::Acknowledge(_) => {
+            (None, None)
+        }
     };
 
     let event = Event {
@@ -230,16 +238,16 @@ pub(crate) fn commit(
         actor_id: caller.actor_id().to_owned(),
         client_id: server.client_id.clone(),
         origin_class: caller.origin_class(),
-        origin_actor: None,
-        origin_chain: None,
+        origin_actor: meta.origin_actor.clone(),
+        origin_chain: meta.origin_chain.clone(),
         context_id: request.context_id.clone(),
         approval_id: None,
         approval_basis: basis,
-        proposal_id: None,
+        proposal_id: meta.proposal_id.clone(),
         change_set_id,
-        job_id: None,
-        job_ordinal: None,
-        job_attempt_id: None,
+        job_id: meta.job.as_ref().map(|job| job.job_id.clone()),
+        job_ordinal: meta.job.as_ref().map(|job| job.ordinal),
+        job_attempt_id: meta.job.as_ref().map(|job| job.attempt_id.clone()),
         reverses_event_id: reverses.map(str::to_owned),
         event_time_ms,
         recorded_at_ms: server.recorded_at_ms,
@@ -260,13 +268,16 @@ pub(crate) fn commit(
         digest: delta_digest,
         drives,
     });
+    if let Some(row) = review {
+        m.reviews.insert(row.id.clone(), row);
+    }
     m.events
         .insert(server.event_id.clone(), (event.clone(), ops.clone()));
 
     Accepted { event, ops }
 }
 
-fn next_ordinal(ops: &[Op]) -> u32 {
+pub(crate) fn next_ordinal(ops: &[Op]) -> u32 {
     u32::try_from(ops.len()).unwrap_or(u32::MAX)
 }
 
@@ -445,7 +456,7 @@ fn move_values(before: &Entry, after: &Entry) -> (Value, Value) {
     (Value::Object(bv), Value::Object(av))
 }
 
-fn compute_delta_digest(ops: &[Op]) -> String {
+pub(crate) fn compute_delta_digest(ops: &[Op]) -> String {
     let array = Value::Array(
         ops.iter()
             .map(|op| {

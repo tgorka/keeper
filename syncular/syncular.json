@@ -22,7 +22,8 @@
     { "version": 10, "through": "0010_files" },
     { "version": 11, "through": "0011_settings" },
     { "version": 12, "through": "0012_jobs" },
-    { "version": 13, "through": "0013_knowledge_graph_file_refs" }
+    { "version": 13, "through": "0013_knowledge_graph_file_refs" },
+    { "version": 14, "through": "0014_files_review" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -131,6 +132,18 @@
       "scopes": [{ "pattern": "files_client:{files_client}", "column": "client_scope" }]
     },
     {
+      "name": "files_proposals",
+      "scopes": [{ "pattern": "files_proposal:{files_proposal}", "column": "proposer_actor" }]
+    },
+    {
+      "name": "files_proposal_reviewers",
+      "scopes": [{ "pattern": "files_reviewer:{files_reviewer}", "column": "reviewer_actor" }]
+    },
+    {
+      "name": "files_reviews",
+      "scopes": [{ "pattern": "files_page:{files_page}", "column": "page_key" }]
+    },
+    {
       "name": "settings_devices",
       "scopes": [{ "pattern": "settings_owner:{settings_owner}", "column": "owner_actor" }]
     },
@@ -168,6 +181,8 @@
     { "name": "filesPage", "scopes": { "files_page": "{pageKey}" } },
     { "name": "filesReceipts", "scopes": { "files_client": "{clientScope}" } },
     { "name": "filesSources", "scopes": { "files_sources": "{database}" } },
+    { "name": "filesProposals", "scopes": { "files_proposal": "{actorId}" } },
+    { "name": "filesReviewer", "scopes": { "files_reviewer": "{actorId}" } },
     { "name": "settingsOwn", "scopes": { "settings_owner": "{actorId}" } },
     { "name": "jobsPage", "scopes": { "jobs_page": "{pageKey}" } },
     { "name": "jobsNodes", "scopes": { "jobs_nodes": "{database}" } }
