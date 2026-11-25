@@ -10,6 +10,7 @@
 //! is unsafe, is locked by another process, cannot be locked here, or its
 //! socket's place is refused; `1` anything else.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -106,6 +107,11 @@ async fn serve(args: Args, lock: Arc<DataLock>, printer: &Printer) -> u8 {
         }
     };
     let dispatch = Arc::new(runtime.wire_dispatcher());
+    // Install the handlers before the socket exists and before the serving
+    // line is printed: a supervisor that sends SIGTERM as soon as it reads
+    // that line must get a clean stop (exit 0, socket unlinked), not the
+    // default action.
+    let stop = stop_signal();
     let server = match Server::start(lock, dispatch, Limits::default(), Hooks::default()) {
         Ok(server) => server,
         Err(error) => return refuse(printer, error.code(), &error.to_string()),
@@ -114,23 +120,27 @@ async fn serve(args: Args, lock: Arc<DataLock>, printer: &Printer) -> u8 {
     printer.answer(&json!({"ok": true, "serving": socket}), |_| {
         format!("keeper-cli is serving {socket}; stop it with Ctrl-C")
     });
-    wait_for_signal().await;
+    stop.await;
     server.stop().await;
     EXIT_OK
 }
 
-async fn wait_for_signal() {
+/// Register SIGINT and SIGTERM now; the returned future resolves on either.
+fn stop_signal() -> impl Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
-    let (Ok(mut interrupt), Ok(mut terminate)) = (
+    let handlers = (
         signal(SignalKind::interrupt()),
         signal(SignalKind::terminate()),
-    ) else {
-        // No signal handler: serve until killed.
-        std::future::pending::<()>().await;
-        return;
-    };
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
+    );
+    async move {
+        let (Ok(mut interrupt), Ok(mut terminate)) = handlers else {
+            // No signal handler: serve until killed.
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
     }
 }
