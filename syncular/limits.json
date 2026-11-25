@@ -6,6 +6,7 @@
   "graphMaxEntities": 1000000,
   "graphExportMaxBytes": 1073741824,
   "settingValueMaxBytes": 16384,
+  "modelFileMaxBytes": 5368709120,
   "jobRowMaxBytes": 65536,
   "jobInlineMaxBytes": 16384,
   "jobNoteMaxBytes": 1024,

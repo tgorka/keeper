@@ -16,7 +16,10 @@
     "settings.adoption_refused",
     "config.writer_refused",
     "config.names_domain",
-    "config.malformed"
+    "config.malformed",
+    "config.model_sealed",
+    "config.model_incomplete",
+    "config.model_too_large"
   ],
   "credentialPatterns": [
     {
@@ -67,7 +70,8 @@
   "credentialChoices": ["account", "own", "none"],
   "limits": {
     "settingValueMaxBytes": 16384,
-    "attachmentMaxBytes": 26214400
+    "attachmentMaxBytes": 26214400,
+    "modelFileMaxBytes": 5368709120
   },
   "ids": [
     {
@@ -2029,6 +2033,28 @@
       "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "domains": ["anadrive", "makidrive", "teamdrive"],
       "refusal": "config.malformed"
+    },
+    {
+      "name": "admin refused writing models.active via config write",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": "x",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "admin refused writing models file key via config write",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/silero-vad/model.onnx",
+      "value": "{}",
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
     }
   ],
   "templateKeys": [
@@ -2126,6 +2152,1264 @@
       "name": "one byte over attachmentMaxBytes refused",
       "size": 26214401,
       "refusal": "settings.blob_too_large"
+    }
+  ],
+  "modelKeys": [
+    {
+      "name": "active key",
+      "key": "models.active",
+      "parsed": {
+        "kind": "active"
+      },
+      "refusal": null
+    },
+    {
+      "name": "manifest key",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "parsed": {
+        "kind": "manifest",
+        "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec"
+      },
+      "refusal": null
+    },
+    {
+      "name": "file key with upper-case path",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "parsed": {
+        "kind": "file",
+        "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+        "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin"
+      },
+      "refusal": null
+    },
+    {
+      "name": "upper-case hex version refused",
+      "key": "models/C2383451A90C1D68C7F190B7212BD9E4E7E32EE9F59C7FD3703475AF483413EC",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "short version refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "empty file path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "double slash in path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/a//b",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "parent traversal in path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/../x",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "dotfile path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/.keeper-models-complete",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "models.toml as file path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/models.toml",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "space in path refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/a b",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "key outside models namespace refused",
+      "key": "template/settings.toml",
+      "parsed": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "key over 256 bytes refused",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parsed": null,
+      "refusal": "config.malformed"
+    }
+  ],
+  "modelVersions": [
+    {
+      "name": "base set",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE\t11357\tc693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "same_as": null,
+      "refusal": null
+    },
+    {
+      "name": "same set in another order",
+      "files": [
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE\t11357\tc693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "same_as": "base set",
+      "refusal": null
+    },
+    {
+      "name": "changed file size",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11358,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE\t11358\tc693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "44b46b94728d8700e65427fcf575125fc9a86ef92f4d1e748e152d0fb62ff577",
+      "same_as": null,
+      "refusal": null
+    },
+    {
+      "name": "changed file sha256",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "aa4286110bfff283b7f4eccdc521ce11ccc759b3b5c96eed76b1d52edf3894d0"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE\t11357\taa4286110bfff283b7f4eccdc521ce11ccc759b3b5c96eed76b1d52edf3894d0\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "dbdf6e9bc22377f976cf42d9eb666df617d4396c1fd198882a1c21d6241995b7",
+      "same_as": null,
+      "refusal": null
+    },
+    {
+      "name": "renamed file path",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE.txt",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE.txt\t11357\tc693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "02489b4cfc9c21af1b8e0bc5ee1ecab9e80b1f41e268c6764d5ebc848a461074",
+      "same_as": null,
+      "refusal": null
+    },
+    {
+      "name": "changed models.toml by one byte",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 2\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": "keeper-models-v1\nLICENSE\t11357\tc693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7\nparakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin\t446200000\t79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50\nparakeet-tdt-0.6b-v3/parakeet_vocab.json\t128400\tf3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d\nsilero-vad/model.onnx\t2327524\tadf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed\n\nversion = 2\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "440a9b0d6a75c3e891ebf658da8e213bf9763c6e80351d95b6014562bcd4a423",
+      "same_as": null,
+      "refusal": null
+    },
+    {
+      "name": "empty file list refused",
+      "files": [],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": null,
+      "version": null,
+      "same_as": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "duplicate file path refused",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": null,
+      "version": null,
+      "same_as": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "upper-case sha256 refused",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79DE52A3D11548725D19E7419C32C945D68F6B009352A11B6F90BD72F3811C50"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": null,
+      "version": null,
+      "same_as": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "models.toml path refused",
+      "files": [
+        {
+          "path": "models.toml",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": null,
+      "version": null,
+      "same_as": null,
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "dotfile path refused",
+      "files": [
+        {
+          "path": ".hidden",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "canonical": null,
+      "version": null,
+      "same_as": null,
+      "refusal": "config.malformed"
+    }
+  ],
+  "modelSets": [
+    {
+      "name": "base set accepted",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 446200000,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "refusal": null
+    },
+    {
+      "name": "file at exact modelFileMaxBytes accepted",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 5368709120,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": "09f6de23684774298f714de49c771a18a89b5472763be249d73ff097ed6ac948",
+      "refusal": null
+    },
+    {
+      "name": "file one byte over modelFileMaxBytes refused",
+      "files": [
+        {
+          "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+          "size": 5368709121,
+          "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+        },
+        {
+          "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+          "size": 128400,
+          "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+        },
+        {
+          "path": "silero-vad/model.onnx",
+          "size": 2327524,
+          "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11357,
+          "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+        }
+      ],
+      "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+      "version": null,
+      "refusal": "config.model_too_large"
+    }
+  ],
+  "modelUploads": [
+    {
+      "name": "admin general realistic size accepted",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": null
+    },
+    {
+      "name": "admin general exact modelFileMaxBytes accepted",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "size": 5368709120,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": null
+    },
+    {
+      "name": "admin general one byte over modelFileMaxBytes refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "size": 5368709121,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.model_too_large"
+    },
+    {
+      "name": "admin general malformed sha256 refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "not-a-sha256",
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "person owner general refused",
+      "writer": {
+        "kind": "person",
+        "role": "owner"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "person without role general refused",
+      "writer": {
+        "kind": "person"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "agent general refused",
+      "writer": {
+        "kind": "agent"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "tool general refused",
+      "writer": {
+        "kind": "tool"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "service general refused",
+      "writer": {
+        "kind": "service"
+      },
+      "domain_kind": "general",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "admin group domain refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "group",
+      "size": 446200000,
+      "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+      "refusal": "config.writer_refused"
+    }
+  ],
+  "modelWrites": [
+    {
+      "name": "first file row accepted",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": null
+    },
+    {
+      "name": "file row already in state sealed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_sealed"
+    },
+    {
+      "name": "file row after manifest sealed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+      "value": {
+        "size": 128400,
+        "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+      },
+      "blob": {
+        "blobId": "sha256:f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d",
+        "byteLength": 128400
+      },
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_sealed"
+    },
+    {
+      "name": "file row with mismatched blob sha refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "file row with mismatched blob size refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200001
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "file row without blob refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": null,
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "file row value with extra field refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "extra": true
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "file row over modelFileMaxBytes refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 5368709121,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 5368709121
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_too_large"
+    },
+    {
+      "name": "file row by person owner refused",
+      "writer": {
+        "kind": "person",
+        "role": "owner"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "file row by service refused",
+      "writer": {
+        "kind": "service"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "file row by admin in group domain refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "group",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec/parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+      "value": {
+        "size": 446200000,
+        "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    },
+    {
+      "name": "manifest with all 4 files present accepted",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+        "file_count": 4
+      },
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": null
+    },
+    {
+      "name": "manifest with only 2 of 4 files incomplete",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+        "file_count": 4
+      },
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_incomplete"
+    },
+    {
+      "name": "manifest with wrong key version incomplete",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/77d82fc188f16a2ef6c3b14ce9d95218f6f9af76cdb32e947956d92a8932c49b",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+        "file_count": 4
+      },
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_incomplete"
+    },
+    {
+      "name": "manifest already present sealed",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+        "file_count": 4
+      },
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_sealed"
+    },
+    {
+      "name": "manifest with blob refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+        "file_count": 4
+      },
+      "blob": {
+        "blobId": "sha256:79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50",
+        "byteLength": 446200000
+      },
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "manifest naming domain refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models/c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "value": {
+        "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n# hosted on makidrive\n",
+        "file_count": 4
+      },
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.names_domain"
+    },
+    {
+      "name": "models.active pointing to complete version accepted",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": null
+    },
+    {
+      "name": "models.active pointing to incomplete version refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          }
+        ],
+        "manifest": null
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.model_incomplete"
+    },
+    {
+      "name": "models.active non-string value refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": 42,
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "models.active upper-case hex refused",
+      "writer": {
+        "kind": "admin"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": "C2383451A90C1D68C7F190B7212BD9E4E7E32EE9F59C7FD3703475AF483413EC",
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.malformed"
+    },
+    {
+      "name": "models.active by person owner refused",
+      "writer": {
+        "kind": "person",
+        "role": "owner"
+      },
+      "domain_kind": "general",
+      "key": "models.active",
+      "value": "c2383451a90c1d68c7f190b7212bd9e4e7e32ee9f59c7fd3703475af483413ec",
+      "blob": null,
+      "state": {
+        "files": [
+          {
+            "path": "parakeet-tdt-0.6b-v3/Encoder.mlmodelc/weights/weight.bin",
+            "size": 446200000,
+            "sha256": "79de52a3d11548725d19e7419c32c945d68f6b009352a11b6f90bd72f3811c50"
+          },
+          {
+            "path": "parakeet-tdt-0.6b-v3/parakeet_vocab.json",
+            "size": 128400,
+            "sha256": "f3b6ec8f355d3210e6896473b03a1361f414c00f28558bbb57082b441611b17d"
+          },
+          {
+            "path": "silero-vad/model.onnx",
+            "size": 2327524,
+            "sha256": "adf92ead7152de3d69e337156a5f80f55c9ef857ef8f39ebfe741c5bcfb46fed"
+          },
+          {
+            "path": "LICENSE",
+            "size": 11357,
+            "sha256": "c693279643b8cd5d248172d9c22cb7cf4ed163a3c98c8a3f69c2717edd3eacb7"
+          }
+        ],
+        "manifest": {
+          "models_toml": "version = 1\n\n[asr]\npath = \"parakeet-tdt-0.6b-v3\"\n\n[vad]\npath = \"silero-vad/model.onnx\"\n",
+          "file_count": 4
+        }
+      },
+      "domains": ["anadrive", "makidrive", "teamdrive"],
+      "refusal": "config.writer_refused"
+    }
+  ],
+  "configBlobReads": [
+    {
+      "name": "person member granted",
+      "reader": {
+        "kind": "person",
+        "member": true
+      },
+      "answer": "granted"
+    },
+    {
+      "name": "person non-member absent",
+      "reader": {
+        "kind": "person",
+        "member": false
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "agent member absent",
+      "reader": {
+        "kind": "agent",
+        "member": true
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "tool member absent",
+      "reader": {
+        "kind": "tool",
+        "member": true
+      },
+      "answer": "absent"
+    },
+    {
+      "name": "service member absent",
+      "reader": {
+        "kind": "service",
+        "member": true
+      },
+      "answer": "absent"
     }
   ]
 }

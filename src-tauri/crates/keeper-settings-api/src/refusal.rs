@@ -61,11 +61,22 @@ pub enum Refusal {
     /// byte limit.
     #[serde(rename = "config.malformed")]
     ConfigMalformed,
+    /// A row of a published model version already exists; a version's rows
+    /// are never rewritten.
+    #[serde(rename = "config.model_sealed")]
+    ModelSealed,
+    /// A model version's manifest or `models.active` was written before the
+    /// version's file rows were complete and hashed to its id.
+    #[serde(rename = "config.model_incomplete")]
+    ModelIncomplete,
+    /// A model file exceeds `modelFileMaxBytes`.
+    #[serde(rename = "config.model_too_large")]
+    ModelTooLarge,
 }
 
 impl Refusal {
     /// Every refusal variant in contract order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::WriterRefused,
         Self::NotOwner,
         Self::NotThisDevice,
@@ -82,6 +93,9 @@ impl Refusal {
         Self::ConfigWriterRefused,
         Self::ConfigNamesDomain,
         Self::ConfigMalformed,
+        Self::ModelSealed,
+        Self::ModelIncomplete,
+        Self::ModelTooLarge,
     ];
 
     /// Stable dot-delimited wire code for this refusal.
@@ -104,6 +118,9 @@ impl Refusal {
             Self::ConfigWriterRefused => "config.writer_refused",
             Self::ConfigNamesDomain => "config.names_domain",
             Self::ConfigMalformed => "config.malformed",
+            Self::ModelSealed => "config.model_sealed",
+            Self::ModelIncomplete => "config.model_incomplete",
+            Self::ModelTooLarge => "config.model_too_large",
         }
     }
 }

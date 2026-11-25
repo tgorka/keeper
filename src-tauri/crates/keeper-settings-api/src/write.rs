@@ -246,6 +246,7 @@ mod tests {
         Limits {
             setting_value_max_bytes: 16,
             attachment_max_bytes: 1024,
+            model_file_max_bytes: 4096,
         }
     }
 

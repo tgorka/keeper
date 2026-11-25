@@ -81,6 +81,7 @@ mod tests {
         let limits = Limits {
             setting_value_max_bytes: 16_384,
             attachment_max_bytes: 1024,
+            model_file_max_bytes: 4096,
         };
         assert_eq!(check_upload(1024, &limits), Ok(()));
         assert_eq!(check_upload(1025, &limits), Err(Refusal::BlobTooLarge));

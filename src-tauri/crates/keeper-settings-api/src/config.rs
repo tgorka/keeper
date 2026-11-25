@@ -107,6 +107,11 @@ pub fn check_config_write(
     }
 
     check_key(key)?;
+    // The model namespace has its own grammar, sealing and completeness
+    // rules; a generic write may not reach it (`models::check_model_write`).
+    if crate::models::is_model_key(key) {
+        return Err(Refusal::ConfigMalformed);
+    }
 
     if names_domain(key, domains) || names_domain(value, domains) {
         return Err(Refusal::ConfigNamesDomain);
@@ -127,6 +132,7 @@ mod tests {
         Limits {
             setting_value_max_bytes: 16,
             attachment_max_bytes: 1024,
+            model_file_max_bytes: 4096,
         }
     }
 
