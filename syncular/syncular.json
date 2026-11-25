@@ -19,7 +19,8 @@
     { "version": 7, "through": "0007_knowledge_graph_contents" },
     { "version": 8, "through": "0008_knowledge_graph_review" },
     { "version": 9, "through": "0009_knowledge_graph_history" },
-    { "version": 10, "through": "0010_files" }
+    { "version": 10, "through": "0010_files" },
+    { "version": 11, "through": "0011_settings" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -125,7 +126,16 @@
     {
       "name": "files_receipts",
       "scopes": [{ "pattern": "files_client:{files_client}", "column": "client_scope" }]
-    }
+    },
+    {
+      "name": "settings_devices",
+      "scopes": [{ "pattern": "settings_owner:{settings_owner}", "column": "owner_actor" }]
+    },
+    {
+      "name": "settings_values",
+      "scopes": [{ "pattern": "settings_owner:{settings_owner}", "column": "owner_actor" }]
+    },
+    { "name": "config_values", "scopes": ["dir:{dir}"] }
   ],
   "subscriptions": [
     { "name": "directory", "scopes": { "dir": "{database}" } },
@@ -145,6 +155,7 @@
     { "name": "filesDomain", "scopes": { "files_domain": "{database}" } },
     { "name": "filesPage", "scopes": { "files_page": "{pageKey}" } },
     { "name": "filesReceipts", "scopes": { "files_client": "{clientScope}" } },
-    { "name": "filesSources", "scopes": { "files_sources": "{database}" } }
+    { "name": "filesSources", "scopes": { "files_sources": "{database}" } },
+    { "name": "settingsOwn", "scopes": { "settings_owner": "{actorId}" } }
   ]
 }

@@ -18,7 +18,7 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
-| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; and `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; hand-written, never generated |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes` (26,214,400), the most bytes one attachment's blob may have; `filePartThresholdBytes` (67,108,864), the largest file that goes in one presigned `PUT`; `filePartBytes` (67,108,864), the size of every part but the last, grown to `ceil(size / 10000)` rounded up to a MiB when needed (no file size bound); `graphMaxEvents` (100,000), the longest accepted graph prefix one generation may hold; `graphMaxEntities` (1,000,000), the most graph entities one generation may hold; `graphExportMaxBytes` (1,073,741,824), the most bytes one graph export may have; and `settingValueMaxBytes` (16,384), the longest `value` a `settings_values` or `config_values` row holds before it must be a blob (*Settings*); hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `roles` (the four roles a membership of a domain may carry, *Domains and the map*), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 | `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 | `accounts.vectors.json` | the accounts contract's shared vectors (*Domains and the map*): `GET /databases` entries, the operator's admin requests and answers, and the refusal codes with their statuses; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-accounts-api`) |
@@ -26,6 +26,8 @@ keeper ships no server URL).
 | `graph-capacity.vectors.json` | the knowledge graph's domain-capacity vectors (*Domain capacity*): event frames with their line lengths and SHA-256 digests, and histories with each step's cumulative creates, review creates, removals and export bytes and the worker's and the consumer's entity counts; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and `keeper-graph` tests, the latter through the real exporter and worker) |
 | `files.vectors.json` | the drive contract's shared vectors (*The drive*): names, folds, media types, git modes, content ids, page keys, locators, default modes, roots, narrower-or-equal, event-row checks, reserved facts and end-to-end command cases, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-files-api`) |
 | `files.media-types.json` | the closed extension-to-media-type table (*The drive*, decision 9) both sides read, with `default` (`application/octet-stream`) and `extensions`; hand-written, never generated |
+| `settings.vectors.json` | the settings contract's shared vectors (*Settings*): record ids and keys, who may write a record, a device record and shared configuration, adoption, the `settings_owner` scope, credential-shaped values, the domain-name check and the blob rule, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-settings-api`) |
+| `settings.travel.json` | every settings key's travel class (`every_device`, `this_device`, `never`) and which layer file may set it, generated from keeper-core's key registry (`config::keys::tests::travel::regenerate`) and pinned by its test |
 
 Everything generated comes from `@syncular/typegen` 0.97.0 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -129,6 +131,64 @@ changes no existing table, column, index or scope variable; migrations `0001` th
 their hashes are byte-identical to schema 9. A server must serve schema 10 before a keeper build
 carrying it is published; older clients keep their schema window and continue to sync against a
 server serving schema 10 alongside schema 9.
+
+### Schema 11 release prerequisite: settings
+
+Schema 11 (`0011_settings`, story 121.1) adds three tables and changes none: `settings_values` and
+`settings_devices` under a new variable, `settings_owner`, and `config_values` under `dir`. Number
+10 is held by story 116.1; when it lands first the two are rebased in order and nothing in 0011
+changes. The server serves the earlier schemas beside 11 with the three tables omitted, and grants
+`settings_owner` (*Settings*) before a schema-11 keeper writes a record; until it enforces every
+rule of *Settings* it refuses every write of the three tables.
+
+## Settings
+
+A person's settings are rows of their personal domain (D-26, D-27; story 121.1), and a domain's
+shared configuration is rows of that domain. `keeper-settings-api` is keeper's copy of the rules;
+`settings.vectors.json` pins them for both sides and `settings.travel.json` is the key registry's
+travel data, generated from keeper-core's registry and never edited by hand.
+
+- **Scope.** `settings_values` and `settings_devices` are under `settings_owner:{settings_owner}`
+  on `owner_actor`, never `actor`: an agent holds the `actor` of every person it serves. The server
+  resolves `settings_owner` to `[self]` for a person in their own personal domain, to nothing for a
+  person anywhere else, refuses it to an agent instance or a tool (`settings.scope_refused`), and
+  keeps it out of its own client's wildcard grant. A client subscribes with `settingsOwn`.
+- **Records.** `id` is `<device>/<key>`: `*` for the person's record, which any of the person's own
+  device clients writes, or a `device_id`, written only by the client its `settings_devices` row is
+  bound to. A key is a registry key (a preference), `pin:<registry key>` (an account pin: under `*`
+  the account's `keeper.toml`, under a device its `keeper.<device>.toml`, each allowed only where
+  the registry's layer rule lets that file set the key), `offer:drive:…`, `offer:provider:…` or
+  `offer:matrix:…` (person only), or `roles:drive:…` (a drive's roles on one device). A key in the
+  never-leaves class is refused (`settings.never_leaves`), one this contract does not know is
+  refused (`settings.unknown_key`), and a key outside its class is refused (`settings.wrong_class`):
+  an every-device key travels in `*`, a this-device key in the device's own records.
+- **No secret travels.** A credential-shaped value is refused (`settings.credential_value`), and a
+  credential choice (`sync.credential_source.…`, `bots.provider_credential_source.…`) records only
+  `account`, `own` or `none`, inline: such a key's value as a `value_blob` is refused
+  (`settings.credential_value`), since the server cannot read a blob at commit.
+- **Bounds.** A `value` longer than `limits.json`'s `settingValueMaxBytes` is refused
+  (`settings.value_too_large`); it is `value_blob` instead, uploaded under the generic upload grant
+  within `attachmentMaxBytes` (`settings.blob_too_large` above it) and read through the generic
+  download route by the owning person's own device clients only; anyone else gets the answer an
+  absent blob gets.
+- **The device record (D-27).** The server binds a `settings_devices` row to the client that
+  creates it (`client_id`). Only that client writes the row and its device's records
+  (`settings.not_this_device`), and a raw write never changes `client_id`
+  (`settings.binding_changed`). An adoption moves the binding to a new client of the same person
+  when the claim's fingerprint, class and platform match the record, or, for a record with no
+  fingerprint, when it is untouched for 30 days (`settings.adoption_refused` otherwise); the name
+  follows the claimant, and the earlier client loses its write. The host name a client reports is
+  never consulted. "Restored once" is `account.<id>.restored` in the install's own table.
+- **Shared configuration.** `config_values` in the `makidrive` domain is written only on the
+  operator's admin path — never by a device credential, the domain owner's included, an agent, a
+  tool or the server's own client (`config.writer_refused`). In any other domain the admin path or
+  a person holding `owner` there writes it. Its keys are `/`-separated lowercase segments
+  (`config.malformed`); the setting seeds are `template/keeper.toml`, `template/settings.toml`,
+  `template/class/<class>.toml` and `template/settings/<class>.toml`, each one file's text. A key
+  or value naming a domain is refused (`config.names_domain`).
+
+On a revision conflict the syncing device writes its pending value again over the newer one, so
+per key the write the server accepts last wins: still "last to sync" (D-26).
 
 ## Domains and the map
 

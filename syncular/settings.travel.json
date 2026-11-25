@@ -1,0 +1,436 @@
+{
+  "keys": [
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "sdk_encryption",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "honor_remote_deletions",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "favorites_collapsed",
+      "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": true,
+      "key": "account.",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "agents.default",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "agents.server_url",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "agents.view_mode",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": true,
+      "key": "bots.provider_credential_source.",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "debug.mode",
+      "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "device.name",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "diagnostics.log_upload",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "hotkey.global",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "hotkey.recording",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "hotkey.capture",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "hotkey.voice",
+      "settable": "machine_file"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "incognito.global",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "notes.active_vault",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "tasks.ledger_vault",
+      "settable": "machine_file"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "notes.service_file_names",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "notes.hide_service_files",
+      "settable": "never"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "notes.include_private",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "notes.embedding_model",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": true,
+      "key": "notes.capture_draft.",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": true,
+      "key": "notes.capture_placement.",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": true,
+      "key": "notes.pristine.",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": true,
+      "key": "notes.read.",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "notify.previews_enabled",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "notify.dnd_global",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "notify.dock_badge_mode",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "push.gateway_url",
+      "settable": "never"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "recording.destination_dir",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "recording.destination_profile_id",
+      "settable": "machine_file"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.path_template",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.fps",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.codec",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.scale_percent",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.segment_mb",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.duration_cap_minutes",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.echo_cancellation",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.system_audio",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.microphone",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "recording.camera",
+      "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "recordings.last_reconcile_ms",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "sessions.spaces_folded",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "sync.git_path",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "sync.drive_folder",
+      "settable": "machine_file"
+    },
+    {
+      "class": "this_device",
+      "family": true,
+      "key": "sync.credential_source.",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "sync.list_folded",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "sync.list_unfolded",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "system.menu_bar_presence",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "telemetry.diagnostics",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "telemetry.product_analytics",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.after_recording",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.asr_model",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.diarization_model",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.language",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.smart_turn_model",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "transcription.vad_model",
+      "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "ui.default_agent_chooser_dismissed",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "ui.first_run_setup_skipped",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "ui.ios_sync_disclosure_shown",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "ui.recovered_sessions_acknowledged",
+      "settable": "never"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "ui.voice_old_target_notice",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "undo_send.agent_window",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "undo_send.window",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "update.auto",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "voice.wake_enabled",
+      "settable": "never"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "voice.wake_phrase",
+      "settable": "any_layer"
+    },
+    {
+      "class": "this_device",
+      "family": false,
+      "key": "voice.locale",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "voice.target",
+      "settable": "any_layer"
+    },
+    {
+      "class": "every_device",
+      "family": false,
+      "key": "voice.stop_phrase",
+      "settable": "any_layer"
+    },
+    {
+      "class": "never",
+      "family": false,
+      "key": "wire.enabled",
+      "settable": "never"
+    }
+  ]
+}

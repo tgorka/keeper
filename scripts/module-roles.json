@@ -19,6 +19,7 @@
   "keeper-replica": "provider",
   "keeper-runtime": "runtime",
   "keeper-runtime-api": "contract",
+  "keeper-settings-api": "contract",
   "keeper-testkit": "provider",
   "keeper-sync": "legacy",
   "keeper-syncd": "legacy",
