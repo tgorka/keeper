@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's files contract vectors (syncular/README.md, The drive; story 116.1). Hand-written, never generated; every implementation reproduces each entry (keeper's in keeper-files-api and keeper-paths tests). Format: fixtures are manifests (bulk rows expand to count live text/markdown files with ids prefix + zero-padded n); a case's steps run in order on its fixture, each through the reference evaluator, and its expect is a subset of the result (or a refusal code with nothing changed).",
+  "about": "Keeper's files contract vectors (syncular/README.md, The drive; story 116.1). Hand-written, never generated; every implementation reproduces each entry (keeper's in keeper-files-api and keeper-paths tests). Format: fixtures are manifests (bulk rows expand to count live text/markdown files with ids prefix + zero-padded n); a case's steps run in order on its fixture, each through the reference evaluator, and its expect is a subset of the result (or a refusal code with nothing changed). Review sections (proposals, reviews, outcomes; story 116.6; runner keeper-files-api tests/review_vectors.rs): a case's optional roles map sets domain roles (actor -> owner|editor|reviewer|reader) before its steps. A step is either {roles: {actor: role|null}} (set a role; null removes it) or {caller, descriptor, params, server?, expect}. Before a step runs, any string in params of the form $digest:<proposal_id>/<revision> becomes that stored revision's digest and $delta:<event_id> that event's delta_digest (so most digests come from the implementation; a literal digest pins the formula). server: event_id, recorded_at_ms (the clock for expiry, also for files.proposals), client_id, review_id (first review of files.acknowledge or files.reverse), review_ids (further acknowledgement reviews, in order), event_ids (further approvals of a files.decide list, in order). expect, per descriptor: files.propose: outcome proposed (detail: subset of {proposal_id, proposal_revision, proposal_digest}) or rejected with code (and detail subset); files.decide: receipt (subset of the whole receipt, per-decision detail in list order) or outcome rejected with code for a whole-list refusal; files.proposal, files.proposals, files.unreviewed: read (subset of the result) and/or read_ids (the exact ordered row ids, or event ids for files.unreviewed), or outcome rejected with code; other descriptors: outcome accepted (event, op_count, ops subsets) or rejected with code. Every step may also check the state after it: proposal_rows (row id -> subset, null = absent), inbox (id -> subset), inbox_absent (ids), reviews (id -> subset), events (event id -> subset), entries (id -> subset, null = absent), head (subset). A rejected step must leave entries, head, proposals, inbox and reviews unchanged.",
   "schema_version": 10,
   "names": [
     {
@@ -14254,6 +14254,107 @@
             "actor_id": "p-rev",
             "role": "reviewer"
           },
+          "descriptor": "files.proposal",
+          "params": {
+            "version": 1,
+            "proposal_id": "01K0000000000000000000R180"
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R910",
+            "recorded_at_ms": 1795478400500,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": []
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R911",
+            "recorded_at_ms": 1795478400500,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "forbidden"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-reader",
+            "role": "reader"
+          },
+          "descriptor": "files.proposal",
+          "params": {
+            "version": 1,
+            "proposal_id": "01K0000000000000000000R180"
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R912",
+            "recorded_at_ms": 1795478400500,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": []
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-new",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R913",
+            "recorded_at_ms": 1795478400500,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R180/1"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-new",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposal",
+          "params": {
+            "version": 1,
+            "proposal_id": "01K0000000000000000000R180"
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R914",
+            "recorded_at_ms": 1795478400500,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R180/1"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
           "descriptor": "files.decide",
           "params": {
             "version": 1,
@@ -16574,6 +16675,648 @@
           }
         }
       ]
+    },
+    {
+      "id": "propose-digest-literal-change-set-and-role",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R901",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R900",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R902",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "digest.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": {
+                "role": "reviewer"
+              },
+              "expires_at_ms": 1795564800000,
+              "change_set_id": "01K0000000000000000000R909"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R903",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "proposed",
+            "detail": {
+              "proposal_id": "01K0000000000000000000R900",
+              "proposal_revision": "1",
+              "proposal_digest": "5333f11af724d0a933ec49b7fd9d8228cc12895abfa0ffe222d4bdf1044263c7"
+            },
+            "proposal_rows": {
+              "01K0000000000000000000R900/1": {
+                "digest": "5333f11af724d0a933ec49b7fd9d8228cc12895abfa0ffe222d4bdf1044263c7",
+                "change_set_id": "01K0000000000000000000R909"
+              }
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.decide",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R904",
+            "context_id": null,
+            "payload": {
+              "decisions": [
+                {
+                  "proposal_id": "01K0000000000000000000R900",
+                  "proposal_revision": "1",
+                  "proposal_digest": "5333f11af724d0a933ec49b7fd9d8228cc12895abfa0ffe222d4bdf1044263c7",
+                  "decision": "approve"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R905",
+            "recorded_at_ms": 1795478401000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "receipt": {
+              "outcome": "accepted",
+              "event_id": "01K0000000000000000000R905",
+              "seq": "4"
+            },
+            "events": {
+              "01K0000000000000000000R905": {
+                "change_set_id": "01K0000000000000000000R909",
+                "proposal_id": "01K0000000000000000000R900"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "reads-change-set-filters",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R921",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R920",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R922",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "cs-a.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": null,
+              "change_set_id": "01K0000000000000000000R928"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R923",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "proposed"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R925",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R924",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R926",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "cs-b.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": null,
+              "change_set_id": "01K0000000000000000000R929"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R927",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "proposed"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R930",
+            "recorded_at_ms": 1795478400100,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R920/1", "01K0000000000000000000R924/1"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10,
+            "change_set_id": "01K0000000000000000000R928"
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R931",
+            "recorded_at_ms": 1795478400100,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R920/1"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "tool",
+            "actor_id": "tool-9",
+            "grant": {
+              "grant_id": "g9",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000A012"],
+                "classes": ["read", "write"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R932",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000R933",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "tool-a.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 12
+              },
+              "change_set_id": "01K0000000000000000000R928"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R934",
+            "recorded_at_ms": 1795478400200,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted"
+          }
+        },
+        {
+          "caller": {
+            "kind": "tool",
+            "actor_id": "tool-9",
+            "grant": {
+              "grant_id": "g9",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000A012"],
+                "classes": ["read", "write"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R935",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000R936",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "tool-b.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 12
+              },
+              "change_set_id": "01K0000000000000000000R929"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R937",
+            "recorded_at_ms": 1795478400300,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.unreviewed",
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R938",
+            "recorded_at_ms": 1795478400400,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R934", "01K0000000000000000000R937"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.unreviewed",
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10,
+            "change_set_id": "01K0000000000000000000R929"
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R939",
+            "recorded_at_ms": 1795478400400,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R937"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "propose-outside-roots-refused",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "tool",
+            "actor_id": "tool-8",
+            "grant": {
+              "grant_id": "g9",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000A013"],
+                "classes": ["read", "write"],
+                "mode": "propose"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R941",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R940",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R942",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "out.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": null
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R943",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "outside_roots",
+            "proposal_rows": {
+              "01K0000000000000000000R940/1": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "propose-next-revision-over-expired-base-stale",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R951",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R950",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R952",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "exp1.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": 1795478401000
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R953",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "proposed"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R954",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R950",
+              "base_revision": "1",
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R952",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "exp2.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": null
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R955",
+            "recorded_at_ms": 1795478401000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "proposal_stale",
+            "proposal_rows": {
+              "01K0000000000000000000R950/1": {
+                "status": "open"
+              },
+              "01K0000000000000000000R950/2": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "proposals-omits-expired-revision",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-editor",
+            "role": "editor"
+          },
+          "descriptor": "files.propose",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R961",
+            "context_id": null,
+            "payload": {
+              "proposal_id": "01K0000000000000000000R960",
+              "base_revision": null,
+              "change": {
+                "operations": [
+                  {
+                    "op": "create",
+                    "id": "01K0000000000000000000R962",
+                    "kind": "file",
+                    "parent_id": "01K0000000000000000000A012",
+                    "name": "lapse.md",
+                    "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    "size": 12
+                  }
+                ]
+              },
+              "reviewers": ["p-rev"],
+              "expires_at_ms": 1795478401000
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R963",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "proposed"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R964",
+            "recorded_at_ms": 1795478400999,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R960/1"]
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.proposals",
+          "params": {
+            "version": 1,
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R965",
+            "recorded_at_ms": 1795478401000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": []
+          }
+        }
+      ]
     }
   ],
   "reviews": [
@@ -17598,6 +18341,172 @@
           },
           "expect": {
             "read_ids": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "review-acknowledge-wrong-target-digest-refused",
+      "fixture": "t-base",
+      "roles": {
+        "p-editor": "editor",
+        "p-rev": "reviewer",
+        "p-rev2": "reviewer",
+        "p-owner": "owner",
+        "p-reader": "reader"
+      },
+      "steps": [
+        {
+          "caller": {
+            "kind": "tool",
+            "actor_id": "tool-9",
+            "grant": {
+              "grant_id": "g9",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000A012"],
+                "classes": ["read", "write"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R971",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000R972",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "ack-a.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 12
+              },
+              "change_set_id": "01K0000000000000000000R978"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R973",
+            "recorded_at_ms": 1795478400000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted"
+          }
+        },
+        {
+          "caller": {
+            "kind": "tool",
+            "actor_id": "tool-9",
+            "grant": {
+              "grant_id": "g9",
+              "grant_revision": "1"
+            },
+            "files": [
+              {
+                "roots": ["01K0000000000000000000A012"],
+                "classes": ["read", "write"],
+                "mode": "apply"
+              }
+            ],
+            "verified_uploads": [
+              "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "descriptor": "files.put",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R974",
+            "context_id": null,
+            "payload": {
+              "operation": {
+                "op": "create",
+                "id": "01K0000000000000000000R975",
+                "kind": "file",
+                "parent_id": "01K0000000000000000000A012",
+                "name": "ack-b.md",
+                "content_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "size": 12
+              },
+              "change_set_id": "01K0000000000000000000R978"
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R976",
+            "recorded_at_ms": 1795478401000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "outcome": "accepted"
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.acknowledge",
+          "params": {
+            "version": 1,
+            "request_id": "01K0000000000000000000R980",
+            "context_id": null,
+            "payload": {
+              "targets": [
+                {
+                  "target_event_id": "01K0000000000000000000R973",
+                  "target_delta_digest": "$delta:01K0000000000000000000R973"
+                },
+                {
+                  "target_event_id": "01K0000000000000000000R976",
+                  "target_delta_digest": "$delta:01K0000000000000000000R973"
+                }
+              ]
+            }
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R981",
+            "recorded_at_ms": 1795478402000,
+            "client_id": "c1",
+            "review_id": "01K0000000000000000000R982",
+            "review_ids": ["01K0000000000000000000R983"]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "code": "invalid_change",
+            "head": {
+              "seq": "5",
+              "event_id": "01K0000000000000000000R976"
+            }
+          }
+        },
+        {
+          "caller": {
+            "kind": "person",
+            "actor_id": "p-rev",
+            "role": "reviewer"
+          },
+          "descriptor": "files.unreviewed",
+          "params": {
+            "version": 1,
+            "after": "0",
+            "limit": 10
+          },
+          "server": {
+            "event_id": "01K0000000000000000000R984",
+            "recorded_at_ms": 1795478403000,
+            "client_id": "c1"
+          },
+          "expect": {
+            "read_ids": ["01K0000000000000000000R973", "01K0000000000000000000R976"]
           }
         }
       ]
