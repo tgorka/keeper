@@ -1,0 +1,596 @@
+{
+  "client": {
+    "$defs": {
+      "Call": {
+        "description": "One query or command, answered by exactly one `reply`.",
+        "properties": {
+          "call_id": {
+            "description": "A ULID the client mints, in its canonical upper-case spelling.",
+            "type": "string"
+          },
+          "deadline_ms": {
+            "description": "Milliseconds; absent or `0` is the kind's ceiling.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Detail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "door": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Door"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "input": {
+            "default": null,
+            "description": "The operation's input, as a JSON value (never a string)."
+          },
+          "operation": {
+            "description": "`<module>.<verb>`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "operation",
+          "deadline_ms"
+        ],
+        "type": "object"
+      },
+      "Cancel": {
+        "description": "Ends a call or a stream in flight on this connection. It has no answer.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id"
+        ],
+        "type": "object"
+      },
+      "ClientHello": {
+        "description": "The client's first line: the versions it speaks, in its order of\npreference, and its name (for the log; it decides nothing).",
+        "properties": {
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wire": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "wire"
+        ],
+        "type": "object"
+      },
+      "Describe": {
+        "description": "The catalogue this caller can see through its door, answered as a query.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "deadline_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Detail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "door": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Door"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "description": "One operation, by id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page_size": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "Words an operation's id or summary must contain.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "call_id"
+        ],
+        "type": "object"
+      },
+      "Detail": {
+        "description": "How much of an answer: absent reads as `full`.",
+        "enum": [
+          "full",
+          "concise"
+        ],
+        "type": "string"
+      },
+      "Door": {
+        "description": "The door a wire caller comes through. Absent reads as `cli`; a value the\nenvelope does not know is refused, never read as `cli`.",
+        "enum": [
+          "cli",
+          "mcp"
+        ],
+        "type": "string"
+      },
+      "Watch": {
+        "description": "One stream, answered by `event` frames and exactly one `end`.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Detail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "door": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Door"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "input": {
+            "default": null
+          },
+          "operation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "operation"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "What a frame from the client is.",
+    "oneOf": [
+      {
+        "$ref": "#/$defs/ClientHello",
+        "properties": {
+          "type": {
+            "const": "hello",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Call",
+        "properties": {
+          "type": {
+            "const": "call",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Watch",
+        "properties": {
+          "type": {
+            "const": "watch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Describe",
+        "properties": {
+          "type": {
+            "const": "describe",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Cancel",
+        "properties": {
+          "type": {
+            "const": "cancel",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ClientFrame"
+  },
+  "describe_output": {
+    "$defs": {
+      "OperationEntry": {
+        "description": "One operation as `describe` lists it to this caller and door.",
+        "properties": {
+          "effect": {
+            "description": "`read` or `write`.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_schema": {
+            "description": "JSON Schema 2020-12; present with detail `full` only."
+          },
+          "kind": {
+            "description": "`query`, `command` or `stream`.",
+            "type": "string"
+          },
+          "output_schema": true,
+          "summary": {
+            "type": "string"
+          },
+          "write_as": {
+            "description": "`proposal`, `change` or `refused`, for a write.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "effect",
+          "summary"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`describe`'s output.",
+    "properties": {
+      "app_version": {
+        "type": "string"
+      },
+      "catalogue_digest": {
+        "type": "string"
+      },
+      "envelope": {
+        "type": "string"
+      },
+      "next_page_token": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "operations": {
+        "items": {
+          "$ref": "#/$defs/OperationEntry"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "envelope",
+      "app_version",
+      "catalogue_digest",
+      "operations"
+    ],
+    "title": "DescribeOutput",
+    "type": "object"
+  },
+  "server": {
+    "$defs": {
+      "Close": {
+        "description": "The server's last line when it closes the connection for a reason of its\nown, with the versions it serves.",
+        "properties": {
+          "error": {
+            "$ref": "#/$defs/WireError"
+          },
+          "wire": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "error",
+          "wire"
+        ],
+        "type": "object"
+      },
+      "Code": {
+        "description": "The codes every door maps to.",
+        "enum": [
+          "NOT_FOUND",
+          "INVALID_ARGUMENT",
+          "REFUSED",
+          "UNAVAILABLE",
+          "CONFLICT",
+          "DEADLINE_EXCEEDED",
+          "CANCELLED",
+          "RESOURCE_EXHAUSTED",
+          "INTERNAL"
+        ],
+        "type": "string"
+      },
+      "End": {
+        "description": "A stream's last frame: no `error` when it simply finished.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "call_id"
+        ],
+        "type": "object"
+      },
+      "Event": {
+        "description": "One event of a stream; `seq` counts 1, 2, 3 … per stream.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "output": true,
+          "seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "call_id",
+          "seq",
+          "output"
+        ],
+        "type": "object"
+      },
+      "Reply": {
+        "description": "The one answer of a `call` or a `describe`: `output` or `error`.",
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output": true
+        },
+        "required": [
+          "call_id"
+        ],
+        "type": "object"
+      },
+      "ServerHello": {
+        "description": "The server's first line: the version chosen, and what a client needs to\nknow before it calls.",
+        "properties": {
+          "app_version": {
+            "type": "string"
+          },
+          "catalogue_digest": {
+            "type": "string"
+          },
+          "max_in_flight": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_line_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wire": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "wire",
+          "app_version",
+          "catalogue_digest",
+          "max_line_bytes",
+          "max_in_flight"
+        ],
+        "type": "object"
+      },
+      "WireError": {
+        "description": "keeper's error as data: a code, keeper's fixed sentence for it, whether\nwaiting helps, the field an `INVALID_ARGUMENT` names and, for a command,\nthe id to ask again with.",
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/Code"
+          },
+          "field": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "What a frame from the server is.",
+    "oneOf": [
+      {
+        "$ref": "#/$defs/ServerHello",
+        "properties": {
+          "type": {
+            "const": "hello",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Reply",
+        "properties": {
+          "type": {
+            "const": "reply",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Event",
+        "properties": {
+          "type": {
+            "const": "event",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/End",
+        "properties": {
+          "type": {
+            "const": "end",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Close",
+        "properties": {
+          "type": {
+            "const": "close",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ServerFrame"
+  },
+  "title": "keeper.wire.v1"
+}

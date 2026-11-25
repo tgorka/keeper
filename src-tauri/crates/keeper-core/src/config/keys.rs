@@ -1199,6 +1199,19 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud.",
         example: "\"stop\"",
     },
+    // ---- wire ------------------------------------------------------------
+    KeySpec {
+        key: "wire.enabled",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "keeper's local socket is switched on only on this device, by you; no file can switch it on",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether keeper's local wire socket is switched on for this device.",
+        example: "",
+    },
 ];
 
 /// Shared reason for the three OS-global accelerators.

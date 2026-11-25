@@ -73,7 +73,9 @@ for name in sorted(members):
             errors.append(f"{name} (contract) reaches forbidden {dependency}")
         if role == "runtime" and re.fullmatch(r"rusqlite|libsqlite3-sys|syncular-.*|tauri.*|matrix-sdk.*", dependency):
             errors.append(f"{name} (runtime) reaches forbidden {dependency}")
-        if role == "transport" and re.fullmatch(r"rusqlite|libsqlite3-sys", dependency):
+        if role == "transport" and re.fullmatch(
+            r"rusqlite|libsqlite3-sys|(?:tonic|prost|hyper|tower)(?:-.*)?", dependency
+        ):
             errors.append(f"{name} (transport) reaches forbidden {dependency}")
     if role in {"implementation", "path-leaf", "folder-leaf", "runtime", "transport", "adapter"}:
         for dependency in sorted(tree(name, direct=True) - {name}):

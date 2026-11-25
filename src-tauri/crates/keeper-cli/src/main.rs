@@ -24,6 +24,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod accounts;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod app_start;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compose;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod debug;
@@ -31,6 +33,10 @@ mod debug;
 mod graph;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod output;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod serve;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod state;
 
 /// Everything went as asked.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
@@ -71,6 +77,8 @@ mod cli {
         /// The person's domains, as a device last showed them.
         #[command(subcommand)]
         Accounts(super::accounts::Args),
+        /// Serve keeper's local socket on this state until Ctrl-C.
+        Serve(super::serve::Args),
         /// Test-only verbs; not part of keeper-cli's surface.
         #[command(subcommand, hide = true)]
         Debug(super::debug::Args),
@@ -87,6 +95,7 @@ fn main() -> std::process::ExitCode {
     let code = match cli.module {
         cli::Module::Graph(args) => graph::main(args, &printer),
         cli::Module::Accounts(args) => accounts::main(args, &printer),
+        cli::Module::Serve(args) => serve::main(args, &printer),
         cli::Module::Debug(args) => debug::main(args, &printer),
     };
     std::process::ExitCode::from(code)

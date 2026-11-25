@@ -72,6 +72,26 @@ pub fn units(database: &str, actor: &str, client: &str) -> Vec<Unit> {
     ]
 }
 
+/// Subscribe the replica of each of `sources` whose database is in `listed`
+/// to the graph's [`units`], through [`keeper_ports::Replica::subscribe`]
+/// (story 123.3, A-5, DR-17): the app follows a domain's graph only once it
+/// is listed. A source that is not listed is not touched, and subscribing a
+/// held unit again changes nothing, so a second start adds no unit. An
+/// unlisted domain keeps what it holds until it is revoked (DW-E123-11).
+/// Each followed database with what its subscription answered.
+pub fn follow(sources: &[Source], listed: &[String]) -> Vec<(String, Result<(), ReplicaError>)> {
+    sources
+        .iter()
+        .filter(|source| listed.contains(&source.database))
+        .map(|source| {
+            let subscribed = units(&source.database, &source.actor, &source.client)
+                .into_iter()
+                .try_for_each(|unit| source.replica.subscribe(unit));
+            (source.database.clone(), subscribed)
+        })
+        .collect()
+}
+
 /// A command with its request id, ready to send (and to persist first).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {

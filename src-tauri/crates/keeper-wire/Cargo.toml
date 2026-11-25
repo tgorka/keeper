@@ -1,0 +1,35 @@
+[package]
+name = "keeper-wire"
+description = "keeper's local socket server: the data directory's place and peer checks, keeper.wire.v1's framing, limits and order, and the wire dispatcher limited to what a wire caller may reach"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Role `transport` (MA-G3, as narrowed by O-123-WIRE-1): first-party edges to
+# keeper-runtime, keeper-runtime-api and keeper-wire-api only; never tonic,
+# prost, hyper or tower.
+[dependencies]
+futures-core = { workspace = true }
+keeper-runtime = { path = "../keeper-runtime" }
+keeper-runtime-api = { path = "../keeper-runtime-api" }
+keeper-wire-api = { path = "../keeper-wire-api" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "time", "sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+keeper-app-api = { path = "../keeper-app-api" }
+schemars = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+keeper-wire = { path = ".", features = ["test-gate"] }
+
+[features]
+# Test compositions only: the start gate before a command's handler (H11)
+# and the uid the peer check expects. No composition root enables it.
+test-gate = []

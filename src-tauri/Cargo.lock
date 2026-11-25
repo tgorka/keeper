@@ -4658,10 +4658,17 @@ dependencies = [
  "fs4",
  "keeper-accounts",
  "keeper-agent",
+ "keeper-app-api",
  "keeper-core",
+ "keeper-graph",
  "keeper-paths",
+ "keeper-ports",
  "keeper-replica",
+ "keeper-runtime",
+ "keeper-runtime-api",
  "keeper-sync",
+ "keeper-wire",
+ "keeper-wire-api",
  "keyring",
  "objc2",
  "objc2-authentication-services",
@@ -4768,11 +4775,16 @@ dependencies = [
  "keeper-runtime",
  "keeper-runtime-api",
  "keeper-testkit",
+ "keeper-wire",
+ "keeper-wire-api",
  "nix",
+ "rusqlite",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5096,6 +5108,38 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "keeper-wire"
+version = "0.12.0"
+dependencies = [
+ "futures-core",
+ "keeper-app-api",
+ "keeper-runtime",
+ "keeper-runtime-api",
+ "keeper-wire",
+ "keeper-wire-api",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "keeper-wire-api"
+version = "0.12.0"
+dependencies = [
+ "rustix",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "ulid 1.2.1",
 ]
 
 [[package]]

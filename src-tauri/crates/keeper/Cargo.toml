@@ -181,6 +181,16 @@ objc2-natural-language = { workspace = true }
 # only from `<data_dir>/models`; the fork has no download path. Building it
 # needs Xcode (Swift 6.2+) and fetches FluidAudio through SwiftPM.
 fluidaudio-rs = { path = "../../../tools/fluidaudio-rs" }
+# keeper's local socket (story 123.3, SR-20, XR-7): macOS only. The data
+# directory's lock, the wire, and the runtime composed with the `graph`
+# module, worker-free (`src/wire.rs`).
+keeper-wire = { path = "../keeper-wire" }
+keeper-wire-api = { path = "../keeper-wire-api" }
+keeper-runtime = { path = "../keeper-runtime" }
+keeper-runtime-api = { path = "../keeper-runtime-api" }
+keeper-app-api = { path = "../keeper-app-api" }
+keeper-ports = { path = "../keeper-ports" }
+keeper-graph = { path = "../keeper-graph", features = ["module"] }
 
 # The turn models (Epic 97, D-36): ONNX Runtime, statically linked, reached
 # only from `voice_turn_models.rs`. Apple silicon only — pyke publishes no

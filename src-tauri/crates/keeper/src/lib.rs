@@ -167,6 +167,9 @@ mod zero_egress;
 mod web_auth;
 #[cfg(target_os = "ios")]
 mod web_auth_apple;
+// keeper's local socket and the data directory's lock (story 123.3).
+#[cfg(target_os = "macos")]
+mod wire;
 
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -323,6 +326,19 @@ pub(crate) fn install_settings_layers(platform: &dyn keeper_core::platform::Plat
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if served_as_lfs_filter() {
+        return;
+    }
+    let context = tauri::generate_context!();
+    // The data directory's lock, before anything opens the data (story 123.3,
+    // A-2, SR-4): before `ipc::AppState::new` opens `archive.db` and the
+    // settings, and before Tauri builds the config windows, whose webviews
+    // start (and may call IPC) ahead of `setup`. Held for the whole run,
+    // whether the local socket is on or off. Held elsewhere: run a keeper with
+    // no window, no webview and no app state that only names the holder and
+    // offers to try again.
+    #[cfg(target_os = "macos")]
+    if let Some(sentence) = wire::take_lock() {
+        wire::run_refused(context, sentence);
         return;
     }
     let builder = tauri::Builder::default()
@@ -491,6 +507,9 @@ pub fn run() {
                 telemetry_ipc::start_problem_export(app);
                 // First, so every line under it can be read as "this build said".
                 build_identity::announce();
+                // The lock's answer, once logging can carry its one WARN.
+                #[cfg(target_os = "macos")]
+                wire::announce();
                 for fault in keeper_core::config::faults() {
                     // `Display`, not `summary()`: the log form keeps `toml`'s
                     // own caret diagram over the offending line, which is the
@@ -538,6 +557,12 @@ pub fn run() {
             // The agents server (AD-418): after the layers, so its address is
             // read through them; opens the replicas this device holds.
             hq_ipc::init(app);
+            // keeper's local socket follows `wire.enabled` from here on
+            // (story 123.3); off unless the person switched it on.
+            #[cfg(target_os = "macos")]
+            if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                wire::start(data_dir);
+            }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
             // starts a turn (Story 63.5, FR-422), an organisation account's
@@ -1782,7 +1807,7 @@ pub fn run() {
         }
     });
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
     // The notification delegate and the token's hooks, before UIKit starts:
     // an action that launches keeper in the background runs no `setup()`
