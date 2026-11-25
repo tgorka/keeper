@@ -15,6 +15,7 @@ description = "Git-protocol folder synchronization engine for keeper (AD-40 … 
 # never name gix or keeper-sync).
 [dependencies]
 keeper-paths = { path = "../keeper-paths" }
+keeper-folder = { path = "../keeper-folder" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -28,8 +29,6 @@ reqwest = { workspace = true }
 # origin tip's tree (`config_repo`). A feature flag with no dependencies of its
 # own: adds no crate.
 gix = { workspace = true, features = ["tree-editor"] }
-notify = { workspace = true }
-notify-debouncer-full = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -68,25 +67,6 @@ toml = { workspace = true }
 # feature is the blocking `std::fs::File` extension. Apache-2.0/MIT — passes
 # `cargo deny check`.
 fs4 = { workspace = true }
-
-# The FIRST platform-conditional dependency in this crate, and it is macOS-only
-# on purpose: AD-40 requires `keeper-syncd` to keep linking this crate on a
-# headless Linux server, which a macOS-gated edge does not disturb.
-#
-# `files_write::finder_trash` (Story 46.14, AD-102, NFR-30) sends an
-# out-of-vault delete to the OS trash rather than an `unlink`. On macOS that is
-# `NSFileManager trashItemAtURL:resultingItemURL:error:`, a SAFE objc2 binding —
-# no `unsafe` block, nothing to add to the audited-FFI inventory in
-# `docs/constraints-and-limitations.md`. Everywhere else the freedesktop.org
-# home trash is implemented in the module itself, which is what makes the
-# removal testable on the Linux box this is written on.
-#
-# Adds no new crate and no new crate version: objc2-foundation 0.3 / objc2 0.6
-# are already resolved in the lock via tao/wry/muda, and the `keeper` crate
-# already names them for the iOS backup-exclusion FFI. Only the dependency edge
-# and the `NSFileManager` feature are new. MIT — passes `cargo deny check`.
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-foundation = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

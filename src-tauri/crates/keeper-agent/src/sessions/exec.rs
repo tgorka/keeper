@@ -1272,7 +1272,7 @@ fn publish_new(tmp: &Path, target: &Path) -> std::io::Result<()> {
 
 /// The lowercase hex SHA-256 of the file at `path`, read as one version.
 fn hash_file(path: &Path) -> std::io::Result<String> {
-    keeper_sync::stability::verify_while_reading(path)
+    keeper_folder::stability::verify_while_reading(path)
         .map(|(sha256, _)| sha256)
         .map_err(std::io::Error::other)
 }

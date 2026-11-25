@@ -3,7 +3,9 @@
 
 Declare every member in module-roles.json. Contracts and provider isolation use
 resolved transitive trees; implementation and leaf rules constrain direct
-first-party edges. All targets and features count. Composition roots alone may
+first-party edges, and neither may reach a legacy or another implementation
+crate through any path (DF/AD-2: keeper-files links no keeper-sync or
+keeper-core). All targets and features count. Composition roots alone may
 reach providers; a provider may reach itself but not another provider.
 
 KEEPER_MODULE_MANIFEST / KEEPER_MODULE_ROLES select isolated acceptance fixtures.
@@ -66,6 +68,8 @@ for name in sorted(members):
             errors.append(f"{name} ({role}) reaches {other} {dependency}")
         if other == "adapter" and role != "composition-root":
             errors.append(f"{name} ({role}) reaches adapter {dependency}")
+        if role in {"implementation", "path-leaf", "folder-leaf"} and other in {"legacy", "implementation"}:
+            errors.append(f"{name} ({role}) reaches {other} {dependency}")
         if role == "contract" and (
             other in {"port", "provider", "implementation", "composition-root", "legacy"}
             or re.fullmatch(r"syncular-.*|rusqlite|libsqlite3-sys|tokio|tauri.*|matrix-sdk.*", dependency)

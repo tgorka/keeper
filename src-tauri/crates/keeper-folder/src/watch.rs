@@ -19,7 +19,7 @@
 //! On Linux, `EventKind::Access(AccessKind::Close(AccessMode::Write))` is
 //! inotify's `IN_CLOSE_WRITE`: a writer that had the file open for writing let
 //! go of it. That is enough to collapse the quiescence window to
-//! [`crate::profile::CLOSE_WRITE_SETTLE_MS`], and not enough for anything else
+//! [`crate::stability::CLOSE_WRITE_SETTLE_MS`], and not enough for anything else
 //! — close-then-reopen is ordinary behaviour for git, `dd conv=notrunc`,
 //! torrent clients and database WALs.
 //!
@@ -83,10 +83,10 @@ use notify_debouncer_full::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::error::{Result, SyncError};
+use crate::error::{FolderError, Result};
 
 /// Default debounce window. Comfortably below the shortest quiescence window
-/// ([`crate::profile::CLOSE_WRITE_SETTLE_MS`], 1 s) so debouncing never becomes
+/// ([`crate::stability::CLOSE_WRITE_SETTLE_MS`], 1 s) so debouncing never becomes
 /// the thing that decides when a file syncs — tier 2 must own that.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 
@@ -167,7 +167,7 @@ impl WatchConfig {
     /// confusing "generic" error into a configuration message.
     pub fn validate(&self) -> Result<()> {
         if self.debounce_ms == 0 {
-            return Err(SyncError::Config(
+            return Err(FolderError::Config(
                 "watch debounce must be greater than zero".into(),
             ));
         }
@@ -547,7 +547,7 @@ impl FolderWatcher {
                         _ => return,
                     }
                 })
-                .map_err(|err| SyncError::io("spawn rescan thread", &root, err))?;
+                .map_err(|err| FolderError::io("spawn rescan thread", &root, err))?;
             (Some(stop_tx), Some(handle))
         } else {
             (None, None)
@@ -699,17 +699,17 @@ const _: fn() = || {
 /// `MaxFilesWatch` gets its own message because it is the one watcher failure a
 /// user can actually fix, and the fix (a sysctl, or this profile's `forcePoll`)
 /// is not guessable from "inotify error".
-fn map_notify_error(operation: &'static str, path: &Path, err: notify::Error) -> SyncError {
+fn map_notify_error(operation: &'static str, path: &Path, err: notify::Error) -> FolderError {
     let rendered = err.to_string();
     match err.kind {
-        notify::ErrorKind::MaxFilesWatch => SyncError::Config(format!(
+        notify::ErrorKind::MaxFilesWatch => FolderError::Config(format!(
             "{operation}: the inotify watch limit is exhausted for {} — raise \
              fs.inotify.max_user_watches (or max_user_instances), or enable \
              forcePoll for this profile",
             path.display()
         )),
-        notify::ErrorKind::Io(source) => SyncError::io(operation, path, source),
-        _ => SyncError::Config(format!(
+        notify::ErrorKind::Io(source) => FolderError::io(operation, path, source),
+        _ => FolderError::Config(format!(
             "{operation} failed for {}: {rendered}",
             path.display()
         )),
@@ -1002,14 +1002,14 @@ mod tests {
         let err = config
             .validate()
             .expect_err("a zero timeout makes the debouncer's timeout/4 tick rate invalid");
-        assert!(matches!(err, SyncError::Config(_)), "got {err:?}");
+        assert!(matches!(err, FolderError::Config(_)), "got {err:?}");
 
         assert!(WatchConfig::default().validate().is_ok());
         assert_eq!(WatchConfig::default().debounce_ms, DEFAULT_DEBOUNCE_MS);
         // Debouncing must never be the thing that decides when a file syncs —
         // the quiescence gate owns that. A const assertion keeps the two in
         // order even if someone retunes one of them.
-        const _: () = assert!(DEFAULT_DEBOUNCE_MS < crate::profile::CLOSE_WRITE_SETTLE_MS);
+        const _: () = assert!(DEFAULT_DEBOUNCE_MS < crate::stability::CLOSE_WRITE_SETTLE_MS);
     }
 
     #[test]

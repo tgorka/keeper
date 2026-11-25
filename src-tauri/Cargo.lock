@@ -4735,6 +4735,7 @@ dependencies = [
  "chrono",
  "fs4",
  "keeper-core",
+ "keeper-folder",
  "keeper-paths",
  "keeper-sync",
  "matrix-sdk",
@@ -4879,6 +4880,27 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "keeper-folder"
+version = "0.12.0"
+dependencies = [
+ "globset",
+ "hex",
+ "keeper-paths",
+ "notify",
+ "notify-debouncer-full",
+ "objc2-foundation",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "ulid 1.2.1",
+ "url",
 ]
 
 [[package]]
@@ -5095,10 +5117,8 @@ dependencies = [
  "globset",
  "hex",
  "http-body",
+ "keeper-folder",
  "keeper-paths",
- "notify",
- "notify-debouncer-full",
- "objc2-foundation",
  "reqwest",
  "rlimit",
  "rusqlite",

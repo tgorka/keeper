@@ -132,12 +132,9 @@ pub const DEFAULT_SETTLE_MS: u64 = 5_000;
 /// Quiescence window on removable and network media, where mtime lags and
 /// HFS+/SMB granularity can be a full second.
 pub const REMOVABLE_SETTLE_MS: u64 = 10_000;
-/// Window after a Linux `IN_CLOSE_WRITE`: the writer demonstrably let go, so
-/// this only has to absorb mtime granularity.
-pub const CLOSE_WRITE_SETTLE_MS: u64 = 1_000;
-/// Hard ceiling. A continuously appended log must eventually sync; Syncthing
-/// caps its own `notifyTimeout` at the same 60 s.
-pub const SETTLE_CEILING_MS: u64 = 60_000;
+/// The close-write window and the hard ceiling belong to the completeness
+/// gate, which moved to `keeper-folder` (story 119.1).
+pub use keeper_folder::stability::{CLOSE_WRITE_SETTLE_MS, SETTLE_CEILING_MS};
 /// Files at or above this size are tracked through LFS by default.
 pub const DEFAULT_LFS_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
 /// Default interval between scheduler ticks.

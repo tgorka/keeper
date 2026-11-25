@@ -51,7 +51,9 @@ use crate::progress::{
 };
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::sparse::SparseCone;
-use crate::stability::{FileSample, StabilityGate, StabilityVerdict};
+use crate::stability::{FileSample, GateForProfile, StabilityGate, StabilityVerdict};
+// `VirtualPolicy::compile` over a profile (story 119.1 moved the grammar).
+use crate::lfs::virtual_policy::CompileForProfile as _;
 use crate::tasks;
 use crate::volume::{self, VolumeMarker, VolumeStatus};
 use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
@@ -655,38 +657,9 @@ pub const LIVE_WATCH_BACKSTOP_MS: i64 = 3_600_000;
 /// second place for it to disagree.
 pub const SWEEP_EVERY_MS: i64 = 24 * 60 * 60 * 1_000;
 
-/// Paths one release sweep may attempt (Story 56.5, AD-126).
-///
-/// Bounded for [`CLAIM_LIMIT`]'s reason: the sweep runs inside the reservation
-/// the sync tick already holds, and a pass that walked forty thousand eligible
-/// paths would hold it for minutes and starve the folder's watcher. Whatever
-/// this pass does not reach, the next successful sync does — which is true
-/// because of [`Engine::release_cursor`] and was false without it: this bounds
-/// ATTEMPTS, and a prefix of candidates that refuses identically on every pass
-/// would otherwise hide the tail of the ledger forever.
-///
-/// `pub` for one reason: `tests/release_sweep.rs` builds its fixture from this
-/// number rather than from a literal, so raising the budget does not silently
-/// turn "more candidates than one pass allows" into "fewer".
-pub const RELEASE_BUDGET_OBJECTS: usize = 32;
+pub use keeper_folder::release::RELEASE_BUDGET_OBJECTS;
 
-/// Bytes one release sweep may put through the content-identity proof.
-///
-/// The second dimension, and it is not decoration: 56.4's proof **reads every
-/// byte** of every candidate before deleting it, so a count ceiling alone
-/// permits 32 four-gigabyte files — 128 GB of hashing in a pass that is
-/// supposed to be housekeeping. A gigabyte is a few seconds of disk and bounds
-/// the actual cost rather than the item count.
-///
-/// The total **stops the pass** at the first candidate that would cross it,
-/// rather than skipping that candidate and carrying on. Skipping would make an
-/// object larger than the whole budget permanently unreleasable; stopping means
-/// it is simply first in line next time and still gets its one attempt.
-///
-/// `pub` for [`RELEASE_BUDGET_OBJECTS`]' reason: this ceiling is a promise about
-/// what one pass costs, and a suite deriving its object sizes from a literal
-/// would stop exercising it the moment the number moved.
-pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+pub use keeper_folder::release::RELEASE_BUDGET_BYTES;
 
 /// How often a folder's release candidates are looked at.
 ///
@@ -18512,67 +18485,9 @@ fn loose_object_count(git_dir: &Path) -> usize {
         .sum()
 }
 
-/// The instant this row becomes releasable, or `None` for *never* (Story 56.5,
-/// FR-341, AD-131; Story 56.17).
-///
-/// A free function with no `self`, no I/O and no clock, because this is where
-/// the whole feature's safety lives: the sweep reads rows, asks this, and
-/// compares the answer to now. That makes both guards one line each,
-/// unit-testable over hand-built rows, and — the property AC 2 asks for — it
-/// makes the sweep's *candidate set* a value a test can assert on. "Was not
-/// released" would also be true of a path that was considered and refused;
-/// "was not a candidate" is the stronger claim, and only a pure predicate can
-/// carry it.
-///
-/// **The pin is checked first, before any clock.** It is an absolute floor, not
-/// a term in an expression, and putting it above the provenance branch means no
-/// future clock can be added below it that a pinned row could reach.
-///
-/// **`row.synced_at_ms?` is FR-341.** For content this clone authored, a `NULL`
-/// there means the remote has never been observed holding these bytes, so they
-/// exist on exactly one machine and are not eligible **at any age** — the `?` is
-/// the whole rule, and no `unwrap_or` may ever appear on that line. Content that
-/// arrived from the remote measures from its last use instead, falling back to
-/// `at_ms`: that column is `NOT NULL` and is a real instant the content was
-/// here, so a folder whose rows predate this story is not inert.
-///
-/// **`row.release_at_ms` replaces the folder's window, in both directions**
-/// (Story 56.17). It is the absolute instant somebody named for this one path
-/// — `keeper-syncd materialize --for 2h`, or the Files row's own choice — and
-/// a chosen hour inside a day-long window goes twenty-three hours sooner while
-/// a chosen week stays six days longer. A replacement and never a `min` or a
-/// `max`: the person said how long they want the file, and a folder-wide knob
-/// they may not even know about must not quietly overrule them either way.
-///
-/// **It is read AFTER the provenance branch, and that ordering is the whole
-/// safety of this story.** The `?` above has already run by the time a chosen
-/// deadline is looked at, so a locally authored path the remote has never been
-/// observed holding is still on no clock at any age — asking for such a file
-/// "for an hour" records the wish and changes nothing about its eligibility.
-/// A deadline read first would turn a duration into a way past FR-341, which
-/// is the one barrier standing between the sweep and bytes that exist on
-/// exactly one machine. Reading it below the pin's early return says the same
-/// thing about the other floor.
-///
-/// `pub` rather than `pub(crate)` because AC 2 asks for the candidate set to be
-/// asserted *as a set*, over the rows a real repository and a real sync
-/// actually produced — and `tests/release_sweep.rs` cannot do that without
-/// asking the predicate. Exposing a pure function with no `self`, no I/O and no
-/// clock costs nothing: there is no state a caller could corrupt with it.
-pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
-    if row.pinned {
-        return None;
-    }
-    let since = if row.local_origin {
-        row.synced_at_ms?
-    } else {
-        row.last_used_ms.unwrap_or(row.at_ms)
-    };
-    Some(
-        row.release_at_ms
-            .unwrap_or_else(|| since.saturating_add(ttl_ms as i64)),
-    )
-}
+/// Which clock applies to a ledger row (FR-341, Story 56.17), moved to
+/// `keeper-folder` with the ledger's columns (story 119.1).
+pub use keeper_folder::release::release_due_at;
 
 /// Why a materialized row will or will not be released, in the shape a surface
 /// can draw (Story 56.9, FR-343).

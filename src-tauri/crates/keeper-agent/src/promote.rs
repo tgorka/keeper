@@ -36,10 +36,10 @@ use keeper_core::sessions::offer as offers;
 use keeper_core::sessions::plan::{sha256_hex, Plan, PlanStep};
 use keeper_core::sessions::promote::{self, KnowledgeFile, PanelFacts, SessionPromoteVm};
 
+use keeper_folder::files_write::collides;
+use keeper_folder::stability::{read_verified, verify_while_reading, FileSample};
 use keeper_paths::{WriteRefusal, WriteRoute, WriteScope};
-use keeper_sync::files_write::collides;
 use keeper_sync::git::history;
-use keeper_sync::stability::{read_verified, verify_while_reading, FileSample};
 use keeper_sync::SyncProfile;
 
 use crate::sessions::exec::{self, ExecError};

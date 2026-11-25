@@ -50,9 +50,9 @@ use serde_json::Value;
 
 use super::{accepted_profile_keys, canonical_key, canonical_profile_fields, SyncProfile};
 
-/// The per-folder directory both config files live in. The same name
-/// [`crate::exclude`] excludes and carves `*.toml` out of.
-pub const FOLDER_CONFIG_DIR: &str = ".keeper";
+/// The per-folder directory both config files live in, defined with the
+/// machinery that reads it (story 119.1).
+pub use keeper_folder::control::FOLDER_CONFIG_DIR;
 
 /// The shared file: this folder, on every machine.
 const SHARED_FILE: &str = "keeper.toml";
