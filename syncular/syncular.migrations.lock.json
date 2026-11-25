@@ -55,6 +55,11 @@
       "name": "0011_settings",
       "sha256": "af8f2c82c9938684ff89c78c19625bcdd58d0b6a18cad76cd3f7cf0e54b4bdec",
       "schemaVersion": 11
+    },
+    {
+      "name": "0012_jobs",
+      "sha256": "f9e7d3bac1a3f06ec3d2f10454b9549052d1428fd9a759f5f8d22a57610969a0",
+      "schemaVersion": 12
     }
   ],
   "head": {
@@ -1059,6 +1064,289 @@
           },
           {
             "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "job_capabilities",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "actor_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "client_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "capabilities",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "declared_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "job_claims",
+        "primaryKey": "job_id",
+        "columns": [
+          {
+            "name": "job_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "holder_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "holder_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "attempt_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "epoch",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "lease_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "acquired_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "renewed_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "released",
+            "type": "boolean",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "jobs",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "domain",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "input",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "input_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "input_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "runs_on",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "attempt",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "max_attempts",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "not_before_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "plan_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "plan_attempt_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "note",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "result",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "result_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "effects",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "error_code",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "error_sentence",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "submitter_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "submitter_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "submitter_context",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "submitted_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "ended_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "cancel_requested_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "revision",
             "type": "integer",
             "nullable": false
           },

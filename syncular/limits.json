@@ -5,5 +5,15 @@
   "graphMaxEvents": 100000,
   "graphMaxEntities": 1000000,
   "graphExportMaxBytes": 1073741824,
-  "settingValueMaxBytes": 16384
+  "settingValueMaxBytes": 16384,
+  "jobRowMaxBytes": 65536,
+  "jobInlineMaxBytes": 16384,
+  "jobNoteMaxBytes": 1024,
+  "jobRefsMax": 64,
+  "jobEffectsMax": 256,
+  "jobPlanMaxBytes": 1048576,
+  "jobOpenMaxPerDomain": 10000,
+  "jobAttemptsMax": 10,
+  "jobLeaseMinMs": 10000,
+  "jobLeaseMaxMs": 600000
 }

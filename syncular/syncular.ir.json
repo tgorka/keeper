@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 11,
+  "schemaVersion": 12,
   "schemaVersions": [
     {
       "version": 1,
@@ -66,6 +66,12 @@
       "version": 11,
       "migrations": [
         "0011_settings"
+      ]
+    },
+    {
+      "version": 12,
+      "migrations": [
+        "0012_jobs"
       ]
     }
   ],
@@ -3625,6 +3631,343 @@
         }
       ],
       "extensions": {}
+    },
+    {
+      "name": "jobs",
+      "generation": "925781626d9a587178229905ba95674f",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "input",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "input_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "input_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "runs_on",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "attempt",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "max_attempts",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "not_before_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "plan_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "plan_attempt_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "note",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "result",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "result_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "effects",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "error_code",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "error_sentence",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "submitter_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "submitter_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "submitter_context",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "submitted_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "ended_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "cancel_requested_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "jobs_page:{jobs_page}",
+          "variable": "jobs_page",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "jobs_domain_state",
+          "columns": [
+            "domain",
+            "state",
+            "not_before_ms"
+          ],
+          "unique": false
+        },
+        {
+          "name": "jobs_page_key",
+          "columns": [
+            "page_key"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "job_claims",
+      "generation": "f2a05040d2be7cdb86934ac48c7dcb16",
+      "primaryKey": "job_id",
+      "columns": [
+        {
+          "name": "job_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "holder_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "holder_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "attempt_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "lease_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "acquired_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "renewed_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "released",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "jobs_page:{jobs_page}",
+          "variable": "jobs_page",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "job_claims_page_key",
+          "columns": [
+            "page_key"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "job_capabilities",
+      "generation": "02e3072ba2d0333e68eae7ee1439a496",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "capabilities",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "declared_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "jobs_nodes:{jobs_nodes}",
+          "variable": "jobs_nodes",
+          "column": "domain"
+        }
+      ],
+      "extensions": {}
     }
   ],
   "subscriptions": [
@@ -3852,6 +4195,30 @@
           "value": {
             "kind": "parameter",
             "name": "actorId"
+          }
+        }
+      ]
+    },
+    {
+      "name": "jobsPage",
+      "scopes": [
+        {
+          "variable": "jobs_page",
+          "value": {
+            "kind": "parameter",
+            "name": "pageKey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "jobsNodes",
+      "scopes": [
+        {
+          "variable": "jobs_nodes",
+          "value": {
+            "kind": "parameter",
+            "name": "database"
           }
         }
       ]
