@@ -417,6 +417,43 @@
       }
     },
     {
+      "name": "an explicit profile grant for the root Collection",
+      "json": {
+        "request_id": "req-h12-1",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "profile": true
+          }
+        }
+      }
+    },
+    {
+      "name": "the same profile tool grant without reserved-name authority",
+      "json": {
+        "request_id": "req-h12-2",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": []
+          }
+        }
+      }
+    },
+    {
       "name": "give an agent a graph capability in a domain",
       "json": {
         "request_id": "req-ag-01",
@@ -2182,6 +2219,133 @@
             "collectionRoots": [],
             "guidanceRoots": [],
             "files": []
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "false is not a profile flag",
+      "json": {
+        "request_id": "req-h12-3",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "profile": false
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a null profile flag",
+      "json": {
+        "request_id": "req-h12-4",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "profile": null
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a string profile flag",
+      "json": {
+        "request_id": "req-h12-5",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "profile": "true"
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a profile flag with content but no vocabulary",
+      "json": {
+        "request_id": "req-h12-6",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "content"],
+            "allowedKinds": ["Collection"],
+            "collectionRoots": ["01JD0000000000000000000ROOT"],
+            "guidanceRoots": [],
+            "profile": true
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a profile flag on a files-only grant",
+      "json": {
+        "request_id": "req-h12-7",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": [],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "profile": true,
+            "files": [
+              {
+                "roots": ["01JF00000000000000000DIR01"],
+                "classes": ["read"],
+                "mode": "apply"
+              }
+            ]
+          }
+        }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a profile flag does not satisfy the collection root requirement",
+      "json": {
+        "request_id": "req-h12-8",
+        "expected_revision": 4,
+        "command": {
+          "op": "set_agent_grant",
+          "domain": "tgdrive",
+          "agent_id": "okf-profile",
+          "capability": {
+            "classes": ["read", "vocabulary", "content"],
+            "allowedKinds": [],
+            "collectionRoots": [],
+            "guidanceRoots": [],
+            "profile": true
           }
         }
       },
