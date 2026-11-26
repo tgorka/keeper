@@ -3,7 +3,8 @@
 //! ([`AgentGrantRecord`]) (stories 114.3, 114.6).
 //!
 //! The graph part is the knowledge graph's capability grammar: six classes,
-//! the reserved kinds, collection and guidance roots, `domainWideContent`.
+//! the reserved kinds, collection and guidance roots, `domainWideContent`
+//! and the explicit `profile` flag.
 //! `classes` is empty only beside a non-empty `files`, every other graph
 //! member then empty or absent: a files-only grant, which gives no graph
 //! change, so no graph event's grant basis cites it. Two members ride
@@ -123,6 +124,14 @@ pub struct CapabilityFields {
         skip_serializing_if = "Option::is_none"
     )]
     pub domain_wide_content: Option<bool>,
+    /// Only literal `true`, and only with `vocabulary`. The server checks
+    /// the holder's credential kind at issuance and reload.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub profile: Option<bool>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -161,6 +170,8 @@ pub enum CapabilityError {
     GuidanceRoots,
     /// `domainWideContent` without `content`.
     DomainWideContent,
+    /// `profile` given as `false` or without `vocabulary`.
+    Profile,
     /// `rootModes` given empty, or a key that is not one of
     /// `collectionRoots`.
     RootModes,
@@ -178,6 +189,7 @@ impl std::fmt::Display for CapabilityError {
             Self::CollectionRoots => "collectionRoots",
             Self::GuidanceRoots => "guidanceRoots",
             Self::DomainWideContent => "domainWideContent",
+            Self::Profile => "profile",
             Self::RootModes => "rootModes",
             Self::Files => "files",
         };
@@ -258,6 +270,11 @@ fn check(c: &CapabilityFields) -> Result<(), CapabilityError> {
     let has_files = c.files.as_ref().is_some_and(|files| !files.is_empty());
     if (c.classes.is_empty() && !has_files) || !distinct(&c.classes) {
         return Err(E::Classes);
+    }
+    if let Some(profile) = c.profile {
+        if !profile || !has(CapabilityClass::Vocabulary) {
+            return Err(E::Profile);
+        }
     }
     let writes = c.classes.iter().any(|class| class.writes());
     if !distinct(&c.allowed_kinds)

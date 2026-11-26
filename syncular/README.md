@@ -340,13 +340,18 @@ The capability is the graph's grammar, stored as given — an optional member ab
 none is ever `null` — and anything the grammar does not admit is `hq.admin.malformed`: `classes`
 (up to 6 distinct of `capability_classes`: `read`, `content`, `vocabulary`, `guidance_body`,
 `guidance_scope`, `reverse_own`; none only beside a non-empty `files`, with `allowedKinds` and
-both root lists empty, `rootModes` absent and `domainWideContent` absent or `false` — a files-only
+both root lists empty, `profile` and `rootModes` absent and `domainWideContent` absent or `false` — a files-only
 grant, which gives no graph change, so no graph event's grant basis cites it), `allowedKinds`
 (distinct reserved kinds, never `Vocabulary`, empty without a write class), `collectionRoots`
 (content or `reverse_own` only) and `guidanceRoots` (needed by, and only with, a guidance class) —
 each at most 256 distinct node ids of at most 128 bytes with no control character, `/` or `:` —
 and `domainWideContent?` (a boolean, `true` only with `content`; `content` needs it or a
-collection root). Two members ride beside them, each non-empty when given. `rootModes?` maps a
+collection root). `profile?` admits only literal `true` and requires the `vocabulary` class.
+The server checks the holder's credential kind on issuance and reload: only a tool of kind
+`okf-profile` may hold the flag. Neither that kind, the actor id nor `vocabulary` implies the
+flag. Without it a grant gives no authority to define reserved names or write `okf:profile_version`
+or `okf:profile_nodes`; with it, all ordinary class, kind and root checks still apply.
+Two members ride beside them, each non-empty when given. `rootModes?` maps a
 collection root to the mode its `content`-class changes land by, one of `grant_modes` (`ask`,
 `propose`, `apply`); a key that is not a collection root is refused. These modes are an agent
 instance's: in an agent instance's grant a root not named is `ask`, and guidance, vocabulary and
