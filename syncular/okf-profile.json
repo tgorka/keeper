@@ -125,13 +125,13 @@
       "name": "okf:index",
       "of": "property",
       "on": "node",
-      "meaning": "On a bundle's Collection, the bundle's index file as the config names it."
+      "meaning": "On a bundle's Collection, the parsed boolean index setting, including false. It does not name a file or assert that one exists."
     },
     {
       "name": "okf:log",
       "of": "property",
       "on": "node",
-      "meaning": "On a bundle's Collection, the bundle's log file as the config names it."
+      "meaning": "On a bundle's Collection, the parsed boolean log setting, including false. It does not name a file or assert that one exists."
     },
     {
       "name": "okf:listed",
