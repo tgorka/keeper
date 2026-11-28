@@ -56,6 +56,14 @@ struct FileDigest {
 enum PlanPhase {
     #[default]
     Uploading,
+    Staged {
+        bytes_sent: u64,
+        parts_sent: u32,
+        parts_skipped: u32,
+    },
+    Ready {
+        bytes_sent: u64,
+    },
     Completing,
     // The owner completion was ambiguous, and a target-bound grant did not attest presence.
     // Do not mint another upload plan every time this queued operation is retried.
@@ -128,7 +136,7 @@ impl PlanFile {
 
 pub(super) enum Scope<'a> {
     Generic,
-    Put(UploadTarget<'a>),
+    Put(UploadTarget<'a>, Option<&'a Path>),
     Proposal(UploadTarget<'a>),
 }
 
@@ -147,10 +155,14 @@ pub(super) fn run(
 
     let target = match scope {
         Scope::Generic => None,
-        Scope::Put(t) | Scope::Proposal(t) => Some(t),
+        Scope::Put(t, _) | Scope::Proposal(t) => Some(t),
     };
     let proposal = matches!(scope, Scope::Proposal(_));
-    let put = matches!(scope, Scope::Put(_));
+    let put = matches!(scope, Scope::Put(..));
+    let handoff = match scope {
+        Scope::Put(_, path) => path,
+        _ => None,
+    };
     let ask = UploadAsk {
         target,
         content_id: &digest.content_id,
@@ -159,13 +171,29 @@ pub(super) fn run(
         part_bytes,
         parts: &digest.parts,
     };
-    let plan_path = (part_bytes > 0 || proposal)
+    let mut plan_path = (part_bytes > 0 || proposal)
         .then(|| plan_file_path(&t.config.plan_dir, &digest.hex, target));
+    // Adopt an interrupted foreground plan, if any. From here the queued request owns
+    // its sidecar. No other put at the same target can replace this plan identity.
+    if let (Some(path), Some(shared)) = (handoff, &plan_path) {
+        if !path
+            .try_exists()
+            .map_err(|e| ReplicaError::Client(format!("check handoff: {e}")))?
+        {
+            if let Some(plan) = load_matching_plan(shared, &digest, part_bytes) {
+                write_plan_file(path, &plan)?;
+                remove_plan_file(shared);
+            }
+        }
+        plan_path = Some(path.to_owned());
+    }
     if let Some(path) = plan_path.as_deref() {
         if let Some(mut plan) = load_matching_plan(path, &digest, part_bytes) {
             if plan.phase != PlanPhase::Uploading {
                 let placement = if put {
-                    remove_plan_file(path);
+                    if handoff.is_none() {
+                        remove_plan_file(path);
+                    }
                     Some(plan.into_placement())
                 } else {
                     confirm_placement(t, &ask, &mut plan, path)?;
@@ -212,7 +240,18 @@ pub(super) fn run(
                     }
 
                     return finish_multipart(
-                        t, file, &digest, &ask, plan, path, &held_set, done, url_map, progress, put,
+                        t,
+                        file,
+                        &digest,
+                        &ask,
+                        plan,
+                        path,
+                        &held_set,
+                        done,
+                        url_map,
+                        progress,
+                        put,
+                        handoff.is_some(),
                     );
                 }
                 Err(ReplicaError::Remote { ref code, .. }) if code == PLAN_UNKNOWN => {
@@ -223,7 +262,7 @@ pub(super) fn run(
         }
     }
 
-    match t.grants.grant_upload(&ask)? {
+    let stage = match t.grants.grant_upload(&ask)? {
         UploadGrant::Present => Ok(StagedPut {
             upload: Uploaded {
                 content_id: digest.content_id,
@@ -258,7 +297,7 @@ pub(super) fn run(
             let completion =
                 if let (true, Some(id), Some(path)) = (proposal, plan_id, plan_path.as_deref()) {
                     let mut plan = PlanFile::new(&digest, 0, id, PlanPhase::Completing);
-                    write_plan_file(&t.config.plan_dir, path, &plan)?;
+                    write_plan_file(path, &plan)?;
                     confirm_placement(t, &ask, &mut plan, path)?;
                     Some(Completion::Placed)
                 } else {
@@ -281,7 +320,7 @@ pub(super) fn run(
                 ReplicaError::Client("unexpected multipart grant for single PUT".to_owned())
             })?;
             let plan = PlanFile::new(&digest, part_bytes, plan_id, PlanPhase::Uploading);
-            write_plan_file(&t.config.plan_dir, &plan_path, &plan)?;
+            write_plan_file(&plan_path, &plan)?;
 
             let mut url_map: HashMap<u32, SignedUrl> =
                 urls.into_iter().map(|p| (p.number, p.url)).collect();
@@ -299,10 +338,38 @@ pub(super) fn run(
 
             let held_set = HashSet::new();
             finish_multipart(
-                t, file, &digest, &ask, plan, &plan_path, &held_set, 0, url_map, progress, put,
+                t,
+                file,
+                &digest,
+                &ask,
+                plan,
+                &plan_path,
+                &held_set,
+                0,
+                url_map,
+                progress,
+                put,
+                handoff.is_some(),
             )
         }
+    }?;
+    if let (Some(path), None) = (handoff, &stage.placement) {
+        // Single PUT and already-present uploads have nothing left to confirm.
+        let ready = PlanFile {
+            phase: PlanPhase::Ready {
+                bytes_sent: stage.upload.bytes_sent,
+            },
+            content_id: stage.upload.content_id.clone(),
+            size: stage.upload.size,
+            part_bytes: 0,
+            plan_id: String::new(),
+            parts: Vec::new(),
+            file_len: stage.upload.size,
+            file_modified_ms: 0,
+        };
+        write_plan_file(path, &ready)?;
     }
+    Ok(stage)
 }
 
 /// Send remaining multipart parts, complete the plan, and remove the plan file.
@@ -319,6 +386,7 @@ fn finish_multipart(
     url_map: HashMap<u32, SignedUrl>,
     progress: &mut dyn FnMut(Progress),
     put: bool,
+    keep_handoff: bool,
 ) -> Result<StagedPut, ReplicaError> {
     let part_bytes = ask.part_bytes;
     let plan_id = &plan.plan_id;
@@ -384,13 +452,21 @@ fn finish_multipart(
     }
 
     let (completion, placement) = if put {
-        // The queue takes ownership of the exact plan before issuing its first complete.
-        remove_plan_file(plan_path);
+        if keep_handoff {
+            plan.phase = PlanPhase::Staged {
+                bytes_sent,
+                parts_sent,
+                parts_skipped,
+            };
+            write_plan_file(plan_path, &plan)?;
+        } else {
+            remove_plan_file(plan_path);
+        }
         (None, Some(plan.into_placement()))
     } else if ask.target.is_some() {
         // Persist before sending complete: a lost response must resume confirmation, not the PUTs.
         plan.phase = PlanPhase::Completing;
-        write_plan_file(&t.config.plan_dir, plan_path, &plan)?;
+        write_plan_file(plan_path, &plan)?;
         confirm_placement(t, ask, &mut plan, plan_path)?;
         (Some(Completion::Placed), None)
     } else {
@@ -412,6 +488,67 @@ fn finish_multipart(
     })
 }
 
+/// A published handoff belongs to a single queue request. If interrupted before its
+/// final counter checkpoint, the store's complete set of held parts is recoverable too.
+pub(super) fn recover(
+    t: &StoreTransfer,
+    path: &Path,
+    content_id: &str,
+    size: u64,
+) -> Result<Option<StagedPut>, ReplicaError> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ReplicaError::Client(format!("read staged handoff: {e}"))),
+    };
+    let plan: PlanFile = serde_json::from_slice(&raw)
+        .map_err(|e| ReplicaError::Client(format!("decode staged handoff: {e}")))?;
+    if plan.content_id != content_id || plan.size != size {
+        return Err(ReplicaError::Client(
+            "staged handoff does not match queued bytes".into(),
+        ));
+    }
+    let (bytes_sent, parts_sent, parts_skipped) = match plan.phase {
+        PlanPhase::Ready { bytes_sent } => (bytes_sent, 0, 0),
+        PlanPhase::Staged {
+            bytes_sent,
+            parts_sent,
+            parts_skipped,
+        } => (bytes_sent, parts_sent, parts_skipped),
+        PlanPhase::Completing | PlanPhase::Unconfirmed => (0, 0, plan.parts.len() as u32),
+        PlanPhase::Uploading => {
+            let mut held = match t.grants.held_parts(&plan.plan_id) {
+                Ok(held) => held,
+                Err(ReplicaError::Remote { code, .. }) if code == PLAN_UNKNOWN => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            held.sort_unstable_by_key(|p| p.number);
+            if held.is_empty()
+                || held.len() != plan.parts.len()
+                || !held.iter().enumerate().all(|(i, p)| {
+                    p.number as usize == i + 1
+                        && p.size == part_range(size, plan.part_bytes, p.number).1
+                })
+            {
+                return Ok(None);
+            }
+            (0, 0, held.len() as u32)
+        }
+    };
+    let placement = (!matches!(plan.phase, PlanPhase::Ready { .. })).then(|| plan.into_placement());
+    Ok(Some(StagedPut {
+        upload: Uploaded {
+            content_id: content_id.to_owned(),
+            size,
+            bytes_sent,
+            parts_sent,
+            parts_skipped,
+            completion: None,
+        },
+        placement,
+    }))
+}
+
 /// `verifying` is not permission to name the bytes. Once placed, some servers hide the
 /// plan with the same 404 as an absent plan. Only an authorized `present` can disambiguate it.
 fn confirm_placement(
@@ -426,7 +563,7 @@ fn confirm_placement(
         remove_plan_file(path);
     } else if unconfirmed && plan.phase != PlanPhase::Unconfirmed {
         plan.phase = PlanPhase::Unconfirmed;
-        write_plan_file(&t.config.plan_dir, path, plan)?;
+        write_plan_file(path, plan)?;
     }
     result
 }
@@ -653,22 +790,35 @@ fn load_matching_plan(plan_path: &Path, digest: &FileDigest, part_bytes: u64) ->
     Some(plan)
 }
 
-fn write_plan_file(plan_dir: &Path, plan_path: &Path, plan: &PlanFile) -> Result<(), ReplicaError> {
+fn write_plan_file(plan_path: &Path, plan: &PlanFile) -> Result<(), ReplicaError> {
+    use std::io::Write as _;
+    let plan_dir = plan_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(plan_dir).map_err(|error| {
         ReplicaError::Client(format!("create plan dir {}: {error}", plan_dir.display()))
     })?;
-    let bytes = serde_json::to_vec(plan)
-        .map_err(|error| ReplicaError::Client(format!("encode upload plan: {error}")))?;
     let tmp_path = plan_path.with_extension("json.tmp");
-    fs::write(&tmp_path, bytes).map_err(|error| {
-        ReplicaError::Client(format!("write upload plan {}: {error}", tmp_path.display()))
-    })?;
+    let fail = |error: io::Error| {
+        ReplicaError::Client(format!("write plan {}: {error}", plan_path.display()))
+    };
+    let mut out = io::BufWriter::new(File::create(&tmp_path).map_err(fail)?);
+    serde_json::to_writer(&mut out, plan)
+        .map_err(|error| ReplicaError::Client(format!("encode upload plan: {error}")))?;
+    out.flush().map_err(fail)?;
+    out.get_ref().sync_all().map_err(fail)?;
+    drop(out);
     fs::rename(&tmp_path, plan_path).map_err(|error| {
         ReplicaError::Client(format!(
             "commit upload plan {}: {error}",
             plan_path.display()
         ))
     })?;
+    #[cfg(unix)]
+    File::open(plan_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(fail)?;
     Ok(())
 }
 

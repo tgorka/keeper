@@ -157,7 +157,7 @@ fn identical_bytes_for_another_target_need_their_own_grant() {
         parent_id: "p",
         name: "first",
     };
-    let cut = transfer.stage_put(&src, None, first, &mut |progress| {
+    let cut = transfer.stage_put(&src, None, first, None, &mut |progress| {
         if progress.done == PART_BYTES {
             s.cut_next(100);
         }
@@ -168,7 +168,7 @@ fn identical_bytes_for_another_target_need_their_own_grant() {
         name: "second",
     };
     let uploaded = transfer
-        .stage_put(&src, None, second, &mut |_| {})
+        .stage_put(&src, None, second, None, &mut |_| {})
         .expect("new target");
     assert_eq!(uploaded.upload.parts_skipped, 0);
     assert_eq!(

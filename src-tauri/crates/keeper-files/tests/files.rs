@@ -318,6 +318,98 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
 }
 
 #[test]
+fn interrupted_source_to_placement_handoff_recovers_before_opening_the_missing_source() {
+    interrupt_staged_put(false);
+}
+
+#[test]
+fn interrupted_final_handoff_checkpoint_recovers_all_held_parts() {
+    interrupt_staged_put(true);
+}
+
+fn interrupt_staged_put(block_counter_checkpoint: bool) {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    let layout = Layout::under(dev.dir.path());
+    let offline =
+        Files::new(SERVER_URL, dev.replica.source(DOMAIN), None, &layout).expect("offline");
+    let bytes = pattern(150_000, 42);
+    let source = write_local(dev.dir.path(), "body", &bytes);
+    let original = offline
+        .put(&source, &path_target("Docs/original"), &mut |_| {})
+        .expect("acknowledged source");
+    drop(offline);
+    let before = world.server.commands();
+    let blocked = if block_counter_checkpoint {
+        // Pause the first PUT after its body arrived. The request-bound open plan
+        // already exists; fail only the later replacement with final counters.
+        let held = world.store.hold_next_part();
+        std::thread::scope(|scope| {
+            let flush = scope.spawn(|| dev.files.flush());
+            assert!(held.wait_held(Duration::from_secs(5)));
+            let handoff = fs::read_dir(dev.dir.path())
+                .expect("state dir")
+                .map(|item| item.expect("entry").path())
+                .find(|p| p.extension().is_some_and(|ext| ext == "handoff"))
+                .expect("request handoff");
+            let blocked = handoff.with_extension("json.tmp");
+            fs::create_dir(&blocked).expect("block final counters");
+            held.release();
+            assert!(matches!(
+                flush.join().expect("flush thread"),
+                Err(FilesError::Replica(_))
+            ));
+            blocked
+        })
+    } else {
+        // The queue is readable; only its atomic replacement fails after staging.
+        let blocked = layout.queue_file.with_added_extension("tmp");
+        fs::create_dir(&blocked).expect("block queue staging file");
+        assert!(matches!(dev.files.flush(), Err(FilesError::Storage(_))));
+        blocked
+    };
+    assert_eq!(world.store.store_bytes_received(), bytes.len() as u64);
+    assert_eq!(world.server.commands(), before);
+    fs::remove_dir(&blocked).expect("restore queue writer");
+    fs::remove_file(&source).expect("remove original source");
+    let Device {
+        dir,
+        files,
+        replica,
+    } = dev;
+    drop((files, replica));
+    let reopened = open_device(&world, "ana", "ana.1", dir);
+    let recovered = reopened
+        .files
+        .flush()
+        .expect("recover staged handoff")
+        .remove(0);
+    assert_eq!(recovered.outcome, PutOutcome::Accepted);
+    assert_eq!(recovered.request_id, original.request_id);
+    assert_eq!(recovered.content_id, sha(&bytes));
+    assert_eq!(recovered.bytes_sent, 0);
+    assert_eq!(world.store.store_bytes_received(), bytes.len() as u64);
+    assert_eq!(
+        world
+            .store
+            .grant_requests()
+            .iter()
+            .filter(|r| r.ends_with("/upload-grant"))
+            .count(),
+        1
+    );
+    assert_eq!(world.server.commands(), before + 1);
+    assert!(!fs::read_dir(reopened.dir.path())
+        .expect("state dir")
+        .any(|item| item
+            .expect("entry")
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "handoff")));
+    assert!(reopened.files.pending().expect("queue").is_empty());
+}
+
+#[test]
 fn placement_replay_after_reopen_ignores_a_changed_source() {
     placement_replay_after_reopen(false, false, |source| {
         fs::write(source, b"later contents").expect("edit source")

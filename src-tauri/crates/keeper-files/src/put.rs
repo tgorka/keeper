@@ -119,6 +119,7 @@ impl Files {
                 file,
                 Some(keeper_files_api::names::media_type(place(&op).1)),
                 op.upload_target(),
+                None,
                 progress,
             ) {
                 Ok(uploaded) => Some(uploaded),
@@ -169,6 +170,8 @@ impl Files {
         waiting.retain(|earlier| {
             !matches!(earlier.body, Some(PendingBody::Source(_)))
                 || !same_place(&earlier.op, &pending.op)
+                // Preserve a started handoff even when offline or its directory is unreadable.
+                || !matches!(self.queue.handoff(&earlier.request_id).try_exists(), Ok(false))
         });
         self.queue
             .save(waiting.iter().chain(std::iter::once(&pending)))?;
@@ -265,6 +268,22 @@ impl Files {
             parts_skipped: 0,
         };
         for _ in 0..COPY_ATTEMPTS {
+            let handoff = self.queue.handoff(&pending.request_id);
+            if matches!(pending.body, Some(PendingBody::Source(_))) {
+                let Some(transfer) = &self.transfer else {
+                    return Ok(report);
+                };
+                match transfer.recover_put(&handoff, &pending.content_id, pending.size) {
+                    Ok(Some(staged)) => {
+                        // Historic send counters belong to the handoff, not to this replay call.
+                        pending.body = PendingBody::after_stage(staged).2;
+                        self.queue.settle(&pending.request_id, Some(&pending))?;
+                    }
+                    Ok(None) => {}
+                    Err(error) if unreachable(&error) => return Ok(report),
+                    Err(error) => return Err(error.into()),
+                }
+            }
             if let Some(PendingBody::Source(body)) = pending.body.as_ref() {
                 let Some(transfer) = &self.transfer else {
                     return Ok(report);
@@ -273,12 +292,14 @@ impl Files {
                     Ok((hex, _)) if format!("sha256:{hex}") == pending.content_id => {}
                     Ok(_) => {
                         self.queue.settle(&pending.request_id, None)?;
+                        crate::queue::Queue::release_handoff(&handoff)?;
                         report.outcome = PutOutcome::Dropped(Dropped::SourceChanged);
                         return Ok(report);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         self.queue.settle(&pending.request_id, None)?;
                         report.outcome = PutOutcome::Dropped(Dropped::SourceGone);
+                        crate::queue::Queue::release_handoff(&handoff)?;
                         return Ok(report);
                     }
                     Err(error) => return Err(FilesError::storage("put", &error)),
@@ -287,11 +308,13 @@ impl Files {
                     body,
                     Some(keeper_files_api::names::media_type(pending.place().1)),
                     pending.op.upload_target(),
+                    Some(&handoff),
                     &mut |_| {},
                 ) {
                     Ok(stage) => {
                         if stage.upload.content_id != pending.content_id {
                             self.queue.settle(&pending.request_id, None)?;
+                            crate::queue::Queue::release_handoff(&handoff)?;
                             report.outcome = PutOutcome::Dropped(Dropped::SourceChanged);
                             return Ok(report);
                         }
@@ -305,6 +328,9 @@ impl Files {
                     Err(error) => return Err(error.into()),
                 }
             }
+            // Source is no longer authoritative on disk. A crash before this unlink
+            // leaves a harmless receipt; replay of Placement/ready retires it too.
+            crate::queue::Queue::release_handoff(&handoff)?;
             if let Some(PendingBody::Placement { plan, .. }) = pending.body.as_mut() {
                 let Some(transfer) = &self.transfer else {
                     return Ok(report);

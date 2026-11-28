@@ -263,8 +263,17 @@ pub trait ScopedFileTransfer: Send + Sync {
         file: &Path,
         media_type: Option<&str>,
         target: UploadTarget<'_>,
+        handoff: Option<&Path>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<StagedPut, ReplicaError>;
+
+    /// Recover a queued request's staged bytes without touching its mutable source.
+    fn recover_put(
+        &self,
+        handoff: &Path,
+        content_id: &str,
+        size: u64,
+    ) -> Result<Option<StagedPut>, ReplicaError>;
 
     fn confirm_put(
         &self,

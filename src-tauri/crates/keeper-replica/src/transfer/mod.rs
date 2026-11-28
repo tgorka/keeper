@@ -174,9 +174,25 @@ impl ScopedFileTransfer for StoreTransfer {
         file: &std::path::Path,
         media_type: Option<&str>,
         target: UploadTarget<'_>,
+        handoff: Option<&std::path::Path>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<StagedPut, ReplicaError> {
-        upload::run(self, file, media_type, upload::Scope::Put(target), progress)
+        upload::run(
+            self,
+            file,
+            media_type,
+            upload::Scope::Put(target, handoff),
+            progress,
+        )
+    }
+
+    fn recover_put(
+        &self,
+        handoff: &std::path::Path,
+        content_id: &str,
+        size: u64,
+    ) -> Result<Option<StagedPut>, ReplicaError> {
+        upload::recover(self, handoff, content_id, size)
     }
 
     fn confirm_put(

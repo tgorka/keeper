@@ -121,6 +121,24 @@ impl Queue {
         Self { file }
     }
 
+    /// Kept beside the queue, including offline, and isolated from other requests
+    /// for the same bytes or target. A queue field is never a pathname component.
+    pub(crate) fn handoff(&self, request_id: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        self.file.with_added_extension(format!(
+            "{:x}.handoff",
+            Sha256::digest(request_id.as_bytes())
+        ))
+    }
+
+    pub(crate) fn release_handoff(path: &std::path::Path) -> Result<(), FilesError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FilesError::storage("release staged handoff", &e)),
+        }
+    }
+
     /// Every waiting put, oldest first.
     pub fn load(&self) -> Result<Vec<Pending>, FilesError> {
         match std::fs::read(&self.file) {
@@ -153,7 +171,17 @@ impl Queue {
             file.flush().map_err(fail)?;
             file.get_ref().sync_all().map_err(fail)?;
         }
-        std::fs::rename(&staging, &self.file).map_err(fail)
+        std::fs::rename(&staging, &self.file).map_err(fail)?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            self.file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )
+        .and_then(|dir| dir.sync_all())
+        .map_err(fail)?;
+        Ok(())
     }
 
     /// Replace the put whose request id is `request_id` with `next`
