@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use keeper_ports::transfer::UploadTarget;
 use serde::{Deserialize, Serialize};
 
 use crate::FilesError;
@@ -29,6 +30,17 @@ pub enum PendingOp {
         parent_id: String,
         name: String,
     },
+}
+
+impl PendingOp {
+    pub(crate) fn upload_target(&self) -> UploadTarget<'_> {
+        match self {
+            Self::Create {
+                parent_id, name, ..
+            } => UploadTarget::Create { parent_id, name },
+            Self::Replace { entry_id, .. } => UploadTarget::Replace { entry_id },
+        }
+    }
 }
 
 /// One put waiting for its commit.

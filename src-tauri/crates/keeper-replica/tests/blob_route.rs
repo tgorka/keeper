@@ -154,11 +154,12 @@ fn blob_route_grants_refuses_all_upload_methods_without_requests() {
         BlobRouteGrants::new(&s.base_url(), s.token(), REQUEST_TIMEOUT).expect("blob route grants");
 
     let ask = UploadAsk {
-        content_id: format!("sha256:{}", "a".repeat(64)),
+        target: None,
+        content_id: &format!("sha256:{}", "a".repeat(64)),
         size: 16,
         media_type: None,
         part_bytes: 0,
-        parts: Vec::new(),
+        parts: &[],
     };
     assert!(matches!(
         grants.grant_upload(&ask),

@@ -17,7 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use keeper_ports::transfer::{Downloaded, FileTransfer, Progress, TransferGrants, Uploaded};
+use keeper_ports::transfer::{
+    DownloadReference, Downloaded, FileTransfer, Progress, ScopedFileTransfer, TransferGrants,
+    UploadTarget, Uploaded,
+};
 use keeper_ports::{ReplicaError, StoreOrigin, StoreSlot};
 
 use crate::limits::{FILE_PART_BYTES, FILE_PART_THRESHOLD_BYTES};
@@ -150,7 +153,7 @@ impl FileTransfer for StoreTransfer {
         media_type: Option<&str>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Uploaded, ReplicaError> {
-        upload::run(self, file, media_type, progress)
+        upload::run(self, file, media_type, None, progress)
     }
 
     fn download(
@@ -160,6 +163,29 @@ impl FileTransfer for StoreTransfer {
         dest: &std::path::Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Downloaded, ReplicaError> {
-        download::run(self, content_id, size, dest, progress)
+        download::run(self, content_id, None, size, dest, progress)
+    }
+}
+
+impl ScopedFileTransfer for StoreTransfer {
+    fn upload_file(
+        &self,
+        file: &std::path::Path,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Uploaded, ReplicaError> {
+        upload::run(self, file, media_type, Some(target), progress)
+    }
+
+    fn download_file(
+        &self,
+        content_id: &str,
+        reference: DownloadReference<'_>,
+        size: u64,
+        dest: &std::path::Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Downloaded, ReplicaError> {
+        download::run(self, content_id, Some(reference), size, dest, progress)
     }
 }

@@ -112,12 +112,12 @@ impl Files {
         progress: &mut dyn FnMut(Progress),
     ) -> Result<PutReport, FilesError> {
         let (drive, op) = self.plan(target)?;
-        let name = place(&op).1.to_owned();
         let mut sent = (0, 0, 0);
         let uploaded = match &self.transfer {
-            Some(transfer) => match transfer.upload(
+            Some(transfer) => match transfer.upload_file(
                 file,
-                Some(keeper_files_api::names::media_type(&name)),
+                Some(keeper_files_api::names::media_type(place(&op).1)),
+                op.upload_target(),
                 progress,
             ) {
                 Ok(uploaded) => Some(uploaded),
@@ -257,11 +257,11 @@ impl Files {
             parts_skipped: 0,
         };
         for _ in 0..COPY_ATTEMPTS {
-            if let Some(body) = pending.body.clone() {
+            if let Some(body) = pending.body.as_deref() {
                 let Some(transfer) = &self.transfer else {
                     return Ok(report);
                 };
-                match crate::cache::digest_file(&body) {
+                match crate::cache::digest_file(body) {
                     Ok((hex, _)) if format!("sha256:{hex}") == pending.content_id => {}
                     Ok(_) => {
                         self.queue.settle(&pending.request_id, None)?;
@@ -275,10 +275,10 @@ impl Files {
                     }
                     Err(error) => return Err(FilesError::storage("put", &error)),
                 }
-                let name = pending.place().1.to_owned();
-                match transfer.upload(
-                    &body,
-                    Some(keeper_files_api::names::media_type(&name)),
+                match transfer.upload_file(
+                    body,
+                    Some(keeper_files_api::names::media_type(pending.place().1)),
+                    pending.op.upload_target(),
                     &mut |_| {},
                 ) {
                     Ok(uploaded) => {

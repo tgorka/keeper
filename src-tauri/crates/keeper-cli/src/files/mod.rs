@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keeper_files::{Files, FilesError, Layout, PutOutcome, PutReport, Target};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Link, LinkState, ReplicaError, ReplicaSpec, Source, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_replica::SyncularReplica;
@@ -374,7 +374,7 @@ fn open(args: &Args, token: &str) -> Result<Source, Value> {
 
 /// The transfer, once the server has announced its store; `None` when it
 /// cannot be reached (offline: reads and the cache still answer).
-fn transfer(args: &Args, token: &str) -> Result<Option<Arc<dyn FileTransfer>>, Value> {
+fn transfer(args: &Args, token: &str) -> Result<Option<Arc<dyn ScopedFileTransfer>>, Value> {
     let url = args.url.trim_end_matches('/');
     let store = match announced_store(url, &args.database, token, REQUEST_TIMEOUT) {
         Ok(store) => store,

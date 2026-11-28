@@ -19,7 +19,7 @@ use keeper_files_api::rows::{
     ApprovalBasis, EntityType, OriginClass, Outcome, ProposalStatus, ReviewKind,
 };
 use keeper_files_api::wire::{Decision, ReviewerRole, Reviewers, RoleReviewers, Verdict};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::files::{FilesReplica, FilesServer};
@@ -87,7 +87,7 @@ fn attach(world: &World, replica: Arc<FilesReplica>, actor: &str, client: &str) 
     let mut config = TransferConfig::contract(dir.path().join("plans"));
     config.threshold = PART_BYTES;
     config.part_bytes = PART_BYTES;
-    let transfer: Arc<dyn FileTransfer> = Arc::new(
+    let transfer: Arc<dyn ScopedFileTransfer> = Arc::new(
         StoreTransfer::new(grants, &world.store.base_url(), slot, config).expect("store transfer"),
     );
 
@@ -230,6 +230,10 @@ fn tool_propose_put_open_approve_and_reject_lifecycle() {
         )
         .expect("tool propose put");
 
+    assert_eq!(
+        world.store.last_grant_body().expect("proposal upload")["target"],
+        serde_json::json!({"parent_id": world.folder_a, "name": "p.txt"})
+    );
     let server_proposals = world.server.proposals();
     assert_eq!(server_proposals.len(), 1);
     assert_eq!(server_proposals[0].proposal_id, proposed.detail.proposal_id);
@@ -278,6 +282,14 @@ fn tool_propose_put_open_approve_and_reject_lifecycle() {
     assert_eq!(opened.len(), 1);
     assert_eq!(fs::read(&opened[0].file).expect("read opened"), put_bytes);
 
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(serde_json::json!({
+            "proposal_id": proposed.detail.proposal_id,
+            "proposal_revision": proposed.detail.proposal_revision,
+            "content_id": opened[0].content_id,
+        }))
+    );
     let approved = reviewer
         .files
         .decide(vec![Decision {

@@ -77,24 +77,49 @@ pub struct Progress {
 
 /// A part of an upload in parts: its number (from 1) and its SHA-256,
 /// standard base64 (as `x-amz-checksum-sha256` carries it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PartDigest {
     pub number: u32,
     pub sha256: String,
 }
 
+/// The location checked before granting an upload of file bytes.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(untagged)]
+pub enum UploadTarget<'a> {
+    Create { parent_id: &'a str, name: &'a str },
+    Replace { entry_id: &'a str },
+}
+
+/// The existing reference authorizing a file download, including renewals.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(untagged)]
+pub enum DownloadReference<'a> {
+    Entry {
+        entry_id: &'a str,
+    },
+    Proposal {
+        proposal_id: &'a str,
+        proposal_revision: &'a str,
+    },
+}
+
 /// What the client asks the server to grant for an upload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadAsk {
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadAsk<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<UploadTarget<'a>>,
     /// `sha256:<hex>` of the whole file.
-    pub content_id: String,
+    pub content_id: &'a str,
     pub size: u64,
-    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<&'a str>,
     /// `0` when the file goes in one `PUT` (size at most
     /// `filePartThresholdBytes`); else every part but the last has this size.
     pub part_bytes: u64,
     /// Empty for one `PUT`.
-    pub parts: Vec<PartDigest>,
+    pub parts: &'a [PartDigest],
 }
 
 /// One presigned URL and when it stops working.
@@ -144,7 +169,7 @@ pub enum Completion {
 /// the caller is. Every call is one request with its own deadline.
 pub trait TransferGrants: Send + Sync {
     /// Ask to upload a file.
-    fn grant_upload(&self, ask: &UploadAsk) -> Result<UploadGrant, ReplicaError>;
+    fn grant_upload(&self, ask: &UploadAsk<'_>) -> Result<UploadGrant, ReplicaError>;
     /// Fresh URLs for these parts of a plan.
     fn part_urls(&self, plan_id: &str, numbers: &[u32]) -> Result<Vec<PartUrl>, ReplicaError>;
     /// The parts the store holds for a plan.
@@ -152,7 +177,11 @@ pub trait TransferGrants: Send + Sync {
     /// Complete a plan, from the server's plan, never from the client.
     fn complete(&self, plan_id: &str) -> Result<Completion, ReplicaError>;
     /// A presigned `GET` of a content id the caller may read.
-    fn grant_download(&self, content_id: &str) -> Result<SignedUrl, ReplicaError>;
+    fn grant_download(
+        &self,
+        content_id: &str,
+        reference: Option<DownloadReference<'_>>,
+    ) -> Result<SignedUrl, ReplicaError>;
 }
 
 /// What an upload did. `bytes_sent` counts body bytes put on the wire,
@@ -199,6 +228,26 @@ pub trait FileTransfer: Send + Sync {
     fn download(
         &self,
         content_id: &str,
+        size: u64,
+        dest: &Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Downloaded, ReplicaError>;
+}
+
+/// File operations cannot ask for bytes without naming the target or reference.
+pub trait ScopedFileTransfer: Send + Sync {
+    fn upload_file(
+        &self,
+        file: &Path,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Uploaded, ReplicaError>;
+
+    fn download_file(
+        &self,
+        content_id: &str,
+        reference: DownloadReference<'_>,
         size: u64,
         dest: &Path,
         progress: &mut dyn FnMut(Progress),

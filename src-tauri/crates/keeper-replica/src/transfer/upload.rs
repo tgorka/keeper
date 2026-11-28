@@ -14,7 +14,9 @@ use std::time::UNIX_EPOCH;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use keeper_ports::transfer::{PartDigest, Progress, SignedUrl, UploadAsk, UploadGrant, Uploaded};
+use keeper_ports::transfer::{
+    PartDigest, Progress, SignedUrl, UploadAsk, UploadGrant, UploadTarget, Uploaded,
+};
 use keeper_ports::ReplicaError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,6 +82,7 @@ pub(super) fn run(
     t: &StoreTransfer,
     file: &Path,
     media_type: Option<&str>,
+    target: Option<UploadTarget<'_>>,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Uploaded, ReplicaError> {
     let meta = fs::metadata(file)
@@ -87,9 +90,10 @@ pub(super) fn run(
     let part_bytes = t.config.part_size(meta.len());
     let digest = digest_file(file, part_bytes)?;
 
-    if part_bytes > 0 {
-        let plan_path = plan_file_path(&t.config.plan_dir, &digest.hex);
-        if let Some(plan) = load_matching_plan(&plan_path, &digest, part_bytes) {
+    let plan_path =
+        (part_bytes > 0).then(|| plan_file_path(&t.config.plan_dir, &digest.hex, target));
+    if let Some(path) = plan_path.as_deref() {
+        if let Some(plan) = load_matching_plan(path, &digest, part_bytes) {
             match t.grants.held_parts(&plan.plan_id) {
                 Ok(held) => {
                     let mut held_set = HashSet::new();
@@ -124,7 +128,7 @@ pub(super) fn run(
                         &digest,
                         part_bytes,
                         &plan.plan_id,
-                        &plan_path,
+                        path,
                         &held_set,
                         done,
                         url_map,
@@ -132,7 +136,7 @@ pub(super) fn run(
                     );
                 }
                 Err(ReplicaError::Remote { ref code, .. }) if code == PLAN_UNKNOWN => {
-                    remove_plan_file(&plan_path);
+                    remove_plan_file(path);
                 }
                 Err(error) => return Err(error),
             }
@@ -140,11 +144,12 @@ pub(super) fn run(
     }
 
     let ask = UploadAsk {
-        content_id: digest.content_id.clone(),
+        target,
+        content_id: &digest.content_id,
         size: digest.size,
-        media_type: media_type.map(str::to_owned),
+        media_type,
         part_bytes,
-        parts: digest.parts.clone(),
+        parts: &digest.parts,
     };
 
     match t.grants.grant_upload(&ask)? {
@@ -180,7 +185,9 @@ pub(super) fn run(
             })
         }
         UploadGrant::Parts { plan_id, urls } => {
-            let plan_path = plan_file_path(&t.config.plan_dir, &digest.hex);
+            let plan_path = plan_path.ok_or_else(|| {
+                ReplicaError::Client("unexpected multipart grant for single PUT".to_owned())
+            })?;
             let plan = PlanFile {
                 content_id: digest.content_id.clone(),
                 size: digest.size,
@@ -438,8 +445,25 @@ fn modified_ms(meta: &fs::Metadata) -> Result<i64, ReplicaError> {
     Ok(ms)
 }
 
-fn plan_file_path(plan_dir: &Path, hex: &str) -> PathBuf {
-    plan_dir.join(format!("{hex}.plan.json"))
+fn plan_file_path(plan_dir: &Path, hex: &str, target: Option<UploadTarget<'_>>) -> PathBuf {
+    // A plan belongs to the grant issued for its target, not just to the bytes.
+    let Some(target) = target else {
+        return plan_dir.join(format!("{hex}.plan.json"));
+    };
+    let mut key = Sha256::new();
+    match target {
+        UploadTarget::Create { parent_id, name } => {
+            key.update(b"create");
+            key.update((parent_id.len() as u64).to_be_bytes());
+            key.update(parent_id);
+            key.update(name);
+        }
+        UploadTarget::Replace { entry_id } => {
+            key.update(b"replace");
+            key.update(entry_id);
+        }
+    }
+    plan_dir.join(format!("{hex}.{:x}.plan.json", key.finalize()))
 }
 
 /// Load a persisted plan if it exists and still matches the file on disk.

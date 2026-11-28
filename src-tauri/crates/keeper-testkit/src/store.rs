@@ -88,6 +88,7 @@ struct State {
     plan_seq: u64,
     foreign: bool,
     grant_requests: Vec<String>,
+    last_grant_body: Vec<u8>,
     parts_accepted: Vec<u32>,
     cut_next: Option<u64>,
     silence_next: Option<(u64, Duration)>,
@@ -155,6 +156,7 @@ impl StandIn {
                 plan_seq: 0,
                 foreign: false,
                 grant_requests: Vec::new(),
+                last_grant_body: Vec::new(),
                 parts_accepted: Vec::new(),
                 cut_next: None,
                 silence_next: None,
@@ -351,6 +353,19 @@ impl StandIn {
             .expect("state lock")
             .grant_requests
             .clone()
+    }
+
+    /// The last authenticated byte-grant request, excluding plan and store requests.
+    pub fn last_grant_body(&self) -> Option<Value> {
+        serde_json::from_slice(
+            &self
+                .shared
+                .state
+                .lock()
+                .expect("state lock")
+                .last_grant_body,
+        )
+        .ok()
     }
 
     /// Assemble and place a plan's held parts directly on the store, if complete and valid.
@@ -643,6 +658,14 @@ fn handle_server_conn(mut stream: TcpStream, shared: &Shared) {
         return;
     };
 
+    if req.method == "POST" && matches!(subpath, "/files/upload-grant" | "/files/download-grant") {
+        shared
+            .state
+            .lock()
+            .expect("state lock")
+            .last_grant_body
+            .clone_from(&body);
+    }
     if req.method == "POST" && subpath == "/files/upload-grant" {
         handle_upload_grant(&mut stream, shared, &body);
         return;
@@ -929,7 +952,11 @@ fn handle_download_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
         );
         return;
     };
-    let Some(content_id) = val.get("contentId").and_then(Value::as_str) else {
+    let Some(content_id) = val
+        .get("content_id")
+        .or_else(|| val.get("contentId"))
+        .and_then(Value::as_str)
+    else {
         write_json(
             stream,
             400,

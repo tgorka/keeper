@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use keeper_accounts_api::Role;
 use keeper_files::{Dropped, Files, FilesError, Layout, Listing, PutOutcome, Target};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::files::{FilesReplica, FilesServer};
@@ -82,7 +82,7 @@ fn device(world: &World, actor: &str, client: &str) -> Device {
     let mut config = TransferConfig::contract(dir.path().join("plans"));
     config.threshold = PART_BYTES;
     config.part_bytes = PART_BYTES;
-    let transfer: Arc<dyn FileTransfer> = Arc::new(
+    let transfer: Arc<dyn ScopedFileTransfer> = Arc::new(
         StoreTransfer::new(grants, &world.store.base_url(), slot, config).expect("store transfer"),
     );
 
@@ -222,7 +222,7 @@ fn get_fetches_once_then_serves_the_cache_and_refetches_a_changed_copy() {
     let body = pattern(200_000, 3);
     let cid = world.store.seed(&body);
     let size = u64::try_from(body.len()).expect("size fits u64");
-    world
+    let entry_id = world
         .server
         .create_file("owner", &world.docs, "report.bin", &cid, size);
 
@@ -231,6 +231,10 @@ fn get_fetches_once_then_serves_the_cache_and_refetches_a_changed_copy() {
 
     let first = dev.files.get(&target, &mut |_| {}).expect("first get");
     assert!(first.fetched);
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(json!({"entry_id": entry_id, "content_id": cid}))
+    );
     let cached_bytes = fs::read(&first.file).expect("read cached");
     assert_eq!(sha(&cached_bytes), cid);
     assert_eq!(world.store.store_gets(), 1);
@@ -271,6 +275,10 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
     assert_eq!(first.outcome, PutOutcome::Accepted);
     assert_eq!(first.content_id, expected_cid);
     assert!(world.store.object(&first.content_id).is_some());
+    assert_eq!(
+        world.store.last_grant_body().expect("create upload")["target"],
+        json!({"parent_id": world.docs, "name": "new.bin"})
+    );
 
     dev.replica.pull();
     let listing = dev
@@ -317,20 +325,35 @@ fn an_offline_put_waits_and_commits_on_reconnect() {
     dev.replica.set_online(false);
     let cmds_before = world.server.commands();
 
-    let report = dev
-        .files
+    let offline = Files::new(
+        SERVER_URL,
+        dev.replica.source(DOMAIN),
+        None,
+        &Layout::under(dev.dir.path()),
+    )
+    .expect("open offline files");
+    let report = offline
         .put(&local, &path_target("Docs/offline.txt"), &mut |_| {})
         .expect("offline put");
     assert_eq!(report.outcome, PutOutcome::Queued);
     assert_eq!(dev.files.pending().expect("pending").len(), 1);
     assert_eq!(world.server.commands(), cmds_before);
 
+    drop(offline);
+    assert!(world.store.last_grant_body().is_none());
     dev.replica.set_online(true);
     let flushed = dev.files.flush().expect("flush");
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].outcome, PutOutcome::Accepted);
     assert!(dev.files.pending().expect("pending after flush").is_empty());
 
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(json!({
+            "target": {"parent_id": world.docs, "name": "offline.txt"},
+            "contentId": expected_cid, "size": body.len(), "mediaType": "text/plain", "partBytes": 0, "parts": []
+        }))
+    );
     dev.replica.pull();
     let listing = dev.files.list(&path_target("Docs")).expect("list");
     assert_eq!(listing.entries.len(), 1);
@@ -453,6 +476,10 @@ fn two_devices_offline_end_with_one_path_and_one_conflict_copy() {
         .put(&file_b, &plan_target, &mut |_| {})
         .expect("B put");
     assert_eq!(put_a.outcome, PutOutcome::Queued);
+    assert_eq!(
+        world.store.last_grant_body().expect("replacement upload")["target"],
+        json!({"entry_id": plan_id})
+    );
     assert_eq!(put_b.outcome, PutOutcome::Queued);
 
     dev_a.replica.set_online(true);

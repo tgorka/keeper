@@ -8,7 +8,7 @@ use keeper_accounts_api::grant::FileItem;
 use keeper_accounts_api::Role;
 use keeper_files::{Files, Layout};
 use keeper_files_api::caller::{Caller, GrantRef};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::files::{FilesReplica, FilesServer};
@@ -105,7 +105,7 @@ fn open_device(world: &World, replica: Arc<FilesReplica>, actor: &str, client: &
     let mut config = TransferConfig::contract(dir.path().join("plans"));
     config.threshold = PART_BYTES;
     config.part_bytes = PART_BYTES;
-    let transfer: Arc<dyn FileTransfer> = Arc::new(
+    let transfer: Arc<dyn ScopedFileTransfer> = Arc::new(
         StoreTransfer::new(grants, &world.store.base_url(), slot, config).expect("store transfer"),
     );
 

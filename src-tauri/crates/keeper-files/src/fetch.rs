@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use keeper_files_api::ids::EMPTY_CONTENT_ID;
 use keeper_files_api::rows::Kind;
-use keeper_ports::transfer::Progress;
+use keeper_ports::transfer::{DownloadReference, Progress};
 
 use crate::tree::Listed;
 use crate::{Files, FilesError, Target};
@@ -66,7 +66,15 @@ impl Files {
             .as_ref()
             .ok_or_else(|| FilesError::Offline(format!("{content_id} is not cached")))?;
         let file = self.cache.path(content_id)?;
-        let downloaded = transfer.download(content_id, size, &file, progress)?;
+        let downloaded = transfer.download_file(
+            content_id,
+            DownloadReference::Entry {
+                entry_id: &entry.id,
+            },
+            size,
+            &file,
+            progress,
+        )?;
         Ok(Fetched {
             entry: listed,
             file,
