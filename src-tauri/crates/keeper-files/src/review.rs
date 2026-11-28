@@ -115,9 +115,13 @@ impl Files {
                     file,
                     Some(keeper_files_api::names::media_type(place(&op).1)),
                     op.upload_target(),
+                    keeper_ports::transfer::UploadUse::Proposal,
                     &mut |_| {},
                 ) {
                     Ok(uploaded) => uploaded,
+                    Err(error) if matches!(&error, keeper_ports::ReplicaError::Remote { code, .. } if code == keeper_ports::transfer::PLACEMENT_PENDING) => {
+                        return Err(error.into())
+                    }
                     Err(error) if unreachable(&error) => {
                         return Err(FilesError::Offline(error.to_string()));
                     }

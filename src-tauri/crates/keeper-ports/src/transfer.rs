@@ -142,7 +142,10 @@ pub enum UploadGrant {
     /// The space already holds these bytes: nothing to send.
     Present,
     /// One presigned `PUT` of the whole file.
-    Single(SignedUrl),
+    Single {
+        signed: SignedUrl,
+        plan_id: Option<String>,
+    },
     /// A plan in parts: its id, and URLs for the parts the client should
     /// send (the server may sign only some; the client asks for the rest).
     Parts { plan_id: String, urls: Vec<PartUrl> },
@@ -234,6 +237,17 @@ pub trait FileTransfer: Send + Sync {
     ) -> Result<Downloaded, ReplicaError>;
 }
 
+/// The plan has not positively confirmed placement; retry without submitting the change.
+pub const PLACEMENT_PENDING: &str = "files.placement_pending";
+
+/// Direct put admission reads back a staged single PUT. A proposal names bytes
+/// inside a nested change and therefore needs placement before submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadUse {
+    Put,
+    Proposal,
+}
+
 /// File operations cannot ask for bytes without naming the target or reference.
 pub trait ScopedFileTransfer: Send + Sync {
     fn upload_file(
@@ -241,6 +255,7 @@ pub trait ScopedFileTransfer: Send + Sync {
         file: &Path,
         media_type: Option<&str>,
         target: UploadTarget<'_>,
+        usage: UploadUse,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Uploaded, ReplicaError>;
 

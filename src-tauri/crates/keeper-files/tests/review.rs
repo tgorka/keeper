@@ -42,7 +42,7 @@ impl World {
         let store = Arc::new(StandIn::start(DOMAIN));
         let server = FilesServer::new(DOMAIN);
         let store_check = Arc::clone(&store);
-        server.set_objects(move |cid| store_check.object(cid).is_some());
+        server.set_objects(move |cid| store_check.prepare_naming(cid));
         let root = server.create_drive("owner", DRIVE);
         let folder_a = server.mkdir("owner", &root, "A");
         Self {
@@ -175,6 +175,14 @@ fn editor_put_create_and_replace_records_direct_human_events_unlisted_by_unrevie
     assert_eq!(replace.outcome, PutOutcome::Accepted);
     assert_eq!(replace.entry_id, create.entry_id);
 
+    assert!(
+        !world
+            .store
+            .grant_requests()
+            .iter()
+            .any(|req| req.ends_with("/complete")),
+        "direct single puts must leave the plan open for the naming command"
+    );
     let events = world.server.events();
     assert_eq!(events.len(), events_before + 2);
     let added = &events[events_before..];
@@ -205,6 +213,60 @@ fn editor_put_create_and_replace_records_direct_human_events_unlisted_by_unrevie
         .unreviewed("0", 100, None)
         .expect("reviewer unreviewed");
     assert!(unreviewed.events.is_empty());
+}
+
+#[test]
+fn an_ambiguous_completion_does_not_submit_or_reupload_a_proposal() {
+    let world = World::new();
+    let tool = tool_device(&world, "propose");
+    world.store.hide_presence();
+    world.store.defer_placement(true);
+    let body = b"new proposal bytes";
+    let change = Change::Put {
+        file: write_local(tool.dir.path(), "p.txt", body),
+        target: path_target("A/p.txt"),
+    };
+    let before = world.server.commands();
+    let attempt = || {
+        let error = tool
+            .files
+            .propose(
+                &change,
+                &Reviewers::Actors(vec!["r".to_owned()]),
+                None,
+                None,
+            )
+            .expect_err("no placement witness");
+        assert!(
+            matches!(error, FilesError::Replica(keeper_ports::ReplicaError::Remote { code, retryable: true, .. }) if code == "files.placement_pending")
+        );
+        assert_eq!(world.server.commands(), before);
+    };
+    attempt();
+    let plan_id = world
+        .store
+        .grant_requests()
+        .iter()
+        .find_map(|req| {
+            req.strip_suffix("/complete")?
+                .rsplit('/')
+                .next()
+                .map(str::to_owned)
+        })
+        .expect("completed single PUT");
+    world.store.complete_plan_on_store(&plan_id);
+    attempt(); // 404 is not a witness; the rooted grant doesn't attest presence either.
+    attempt();
+    assert_eq!(
+        world
+            .store
+            .grant_requests()
+            .iter()
+            .filter(|req| req.ends_with("/upload-grant"))
+            .count(),
+        2
+    );
+    assert_eq!(world.store.store_bytes_received(), body.len() as u64);
 }
 
 #[test]

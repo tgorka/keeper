@@ -408,6 +408,22 @@ fn parse_upload_grant(value: Value) -> Result<UploadGrant, ReplicaError> {
     if value.get("present").and_then(Value::as_bool) == Some(true) {
         return Ok(UploadGrant::Present);
     }
+    if value.get("url").is_some() && value.get("parts").is_none() {
+        let plan_id = value
+            .get("planId")
+            .map(|id| {
+                let id = id
+                    .as_str()
+                    .ok_or_else(|| ReplicaError::Client("invalid upload plan id".to_owned()))?;
+                validate_plan_id(id)?;
+                Ok::<_, ReplicaError>(id.to_owned())
+            })
+            .transpose()?;
+        return Ok(UploadGrant::Single {
+            signed: parse_signed_url(value)?,
+            plan_id,
+        });
+    }
     if value.get("planId").is_some() {
         let wire: PartsGrantWire = serde_json::from_value(value)
             .map_err(|err| ReplicaError::Client(format!("invalid parts upload grant: {err}")))?;
@@ -417,9 +433,6 @@ fn parse_upload_grant(value: Value) -> Result<UploadGrant, ReplicaError> {
             plan_id: wire.plan_id,
             urls,
         });
-    }
-    if value.get("url").is_some() {
-        return parse_signed_url(value).map(UploadGrant::Single);
     }
     Err(ReplicaError::Client(
         "unrecognized upload grant response".to_owned(),
@@ -539,10 +552,13 @@ mod tests {
         .expect("single grant should parse");
         assert_eq!(
             grant,
-            UploadGrant::Single(SignedUrl {
-                url: "https://store.example/files/db/sha256/abc?sig=1".to_owned(),
-                expires_at_ms: 1_700_000_000_000,
-            })
+            UploadGrant::Single {
+                plan_id: None,
+                signed: SignedUrl {
+                    url: "https://store.example/files/db/sha256/abc?sig=1".to_owned(),
+                    expires_at_ms: 1_700_000_000_000,
+                }
+            }
         );
     }
 

@@ -12,6 +12,11 @@
 //! name the parent and leaf; replacements name the existing entry. Queue replay
 //! uses the stored operation. Cold reads name the entry or the proposal revision
 //! together with the content id, including when a signed URL is renewed.
+//! A direct put leaves its single staging plan open for verification by the
+//! naming command. A proposal or multipart upload needs confirmed placement:
+//! `verifying` retains the plan and never submits the command. If the server
+//! hides a completed plan and does not attest presence to this caller, the
+//! client reports `files.placement_pending` rather than treating 404 as success.
 //!
 //! - [`tree`]: the listing view model, drives, folders, paths.
 //! - [`cache`]: the content-addressed cache and its digest check.

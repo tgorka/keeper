@@ -173,9 +173,10 @@ impl ScopedFileTransfer for StoreTransfer {
         file: &std::path::Path,
         media_type: Option<&str>,
         target: UploadTarget<'_>,
+        usage: keeper_ports::transfer::UploadUse,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Uploaded, ReplicaError> {
-        upload::run(self, file, media_type, Some(target), progress)
+        upload::run(self, file, media_type, Some((target, usage)), progress)
     }
 
     fn download_file(

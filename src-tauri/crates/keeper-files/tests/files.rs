@@ -35,7 +35,7 @@ impl World {
         let store = Arc::new(StandIn::start(DOMAIN));
         let server = FilesServer::new(DOMAIN);
         let store_check = Arc::clone(&store);
-        server.set_objects(move |cid| store_check.object(cid).is_some());
+        server.set_objects(move |cid| store_check.prepare_naming(cid));
         let root = server.create_drive("owner", DRIVE);
         let docs = server.mkdir("owner", &root, "Docs");
         Self {
@@ -312,6 +312,45 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
             Some(expected_cid.as_str())
         );
     }
+}
+
+#[test]
+fn verifying_multipart_put_stays_queued_until_placement() {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    world.store.defer_placement(true);
+    let body = pattern(150_000, 5);
+    let local = write_local(dev.dir.path(), "large.bin", &body);
+    let before = world.server.commands();
+    let pending = dev
+        .files
+        .put(&local, &path_target("Docs/large.bin"), &mut |_| {})
+        .expect("queue pending placement");
+    assert_eq!(pending.outcome, PutOutcome::Queued);
+    assert_eq!(world.server.commands(), before);
+    assert_eq!(
+        dev.files.flush().expect("still verifying")[0].outcome,
+        PutOutcome::Queued
+    );
+    assert_eq!(world.server.commands(), before);
+    assert!(world.store.object(&pending.content_id).is_none());
+    let plan_id = world
+        .store
+        .grant_requests()
+        .iter()
+        .find_map(|req| {
+            req.strip_suffix("/complete")?
+                .rsplit('/')
+                .next()
+                .map(str::to_owned)
+        })
+        .expect("completed plan");
+    world.store.complete_plan_on_store(&plan_id);
+    let replay = dev.files.flush().expect("flush once placed");
+    assert_eq!(replay[0].outcome, PutOutcome::Accepted);
+    assert_eq!(replay[0].request_id, pending.request_id);
+    assert!(dev.files.pending().expect("queue").is_empty());
+    assert_eq!(world.store.store_bytes_received(), body.len() as u64);
 }
 
 #[test]

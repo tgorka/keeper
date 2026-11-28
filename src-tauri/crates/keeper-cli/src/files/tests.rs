@@ -58,7 +58,7 @@ impl World {
         let store = Arc::new(StandIn::start(DOMAIN));
         let server = FilesServer::new(DOMAIN);
         let store_check = Arc::clone(&store);
-        server.set_objects(move |cid| store_check.object(cid).is_some());
+        server.set_objects(move |cid| store_check.prepare_naming(cid));
         server.set_role("ed", Role::Editor);
         server.set_role("r", Role::Reviewer);
         let root = server.create_drive("owner", DRIVE);

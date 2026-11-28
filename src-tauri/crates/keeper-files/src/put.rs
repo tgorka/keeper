@@ -118,6 +118,7 @@ impl Files {
                 file,
                 Some(keeper_files_api::names::media_type(place(&op).1)),
                 op.upload_target(),
+                keeper_ports::transfer::UploadUse::Put,
                 progress,
             ) {
                 Ok(uploaded) => Some(uploaded),
@@ -279,6 +280,7 @@ impl Files {
                     body,
                     Some(keeper_files_api::names::media_type(pending.place().1)),
                     pending.op.upload_target(),
+                    keeper_ports::transfer::UploadUse::Put,
                     &mut |_| {},
                 ) {
                     Ok(uploaded) => {
