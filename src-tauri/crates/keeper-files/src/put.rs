@@ -14,7 +14,7 @@ use keeper_ports::transfer::Progress;
 use serde_json::json;
 
 use crate::command::{refusal, unreachable, Delivered, ReceiptRow};
-use crate::queue::{Pending, PendingOp};
+use crate::queue::{Pending, PendingBody, PendingOp};
 use crate::{Files, FilesError, Target};
 
 /// How many conflict copies one put may need before it gives up (each is
@@ -113,12 +113,12 @@ impl Files {
     ) -> Result<PutReport, FilesError> {
         let (drive, op) = self.plan(target)?;
         let mut sent = (0, 0, 0);
+        let modified = mtime_ms(file);
         let uploaded = match &self.transfer {
-            Some(transfer) => match transfer.upload_file(
+            Some(transfer) => match transfer.stage_put(
                 file,
                 Some(keeper_files_api::names::media_type(place(&op).1)),
                 op.upload_target(),
-                keeper_ports::transfer::UploadUse::Put,
                 progress,
             ) {
                 Ok(uploaded) => Some(uploaded),
@@ -128,13 +128,13 @@ impl Files {
             None => None,
         };
         let (content_id, size, body) = match uploaded {
-            Some(uploaded) => {
+            Some(stage) => {
                 sent = (
-                    uploaded.bytes_sent,
-                    uploaded.parts_sent,
-                    uploaded.parts_skipped,
+                    stage.upload.bytes_sent,
+                    stage.upload.parts_sent,
+                    stage.upload.parts_skipped,
                 );
-                (uploaded.content_id, uploaded.size, None)
+                PendingBody::after_stage(stage)
             }
             None => {
                 // The file itself waits for the store: its plan file (if a
@@ -145,7 +145,11 @@ impl Files {
                     .map_err(|error| FilesError::storage("put", &error))?;
                 let body = std::path::absolute(file)
                     .map_err(|error| FilesError::storage("put", &error))?;
-                (format!("sha256:{hex}"), size, Some(body))
+                (
+                    format!("sha256:{hex}"),
+                    size,
+                    Some(PendingBody::Source(body)),
+                )
             }
         };
         let pending = Pending {
@@ -154,7 +158,7 @@ impl Files {
             op,
             content_id,
             size,
-            mtime_ms: mtime_ms(file),
+            mtime_ms: modified,
             body,
             conflict_of: None,
         };
@@ -162,9 +166,12 @@ impl Files {
         // cut, or made offline) was never sent: this put replaces it rather
         // than racing it into a conflict copy of the person's own bytes.
         let mut waiting = self.queue.load()?;
-        waiting.retain(|earlier| earlier.body.is_none() || !same_place(&earlier.op, &pending.op));
-        waiting.push(pending.clone());
-        self.queue.save(&waiting)?;
+        waiting.retain(|earlier| {
+            !matches!(earlier.body, Some(PendingBody::Source(_)))
+                || !same_place(&earlier.op, &pending.op)
+        });
+        self.queue
+            .save(waiting.iter().chain(std::iter::once(&pending)))?;
         let mut report = self.commit(pending)?;
         report.bytes_sent += sent.0;
         report.parts_sent += sent.1;
@@ -258,7 +265,7 @@ impl Files {
             parts_skipped: 0,
         };
         for _ in 0..COPY_ATTEMPTS {
-            if let Some(body) = pending.body.as_deref() {
+            if let Some(PendingBody::Source(body)) = pending.body.as_ref() {
                 let Some(transfer) = &self.transfer else {
                     return Ok(report);
                 };
@@ -276,28 +283,56 @@ impl Files {
                     }
                     Err(error) => return Err(FilesError::storage("put", &error)),
                 }
-                match transfer.upload_file(
+                match transfer.stage_put(
                     body,
                     Some(keeper_files_api::names::media_type(pending.place().1)),
                     pending.op.upload_target(),
-                    keeper_ports::transfer::UploadUse::Put,
                     &mut |_| {},
                 ) {
-                    Ok(uploaded) => {
-                        if uploaded.content_id != pending.content_id {
+                    Ok(stage) => {
+                        if stage.upload.content_id != pending.content_id {
                             self.queue.settle(&pending.request_id, None)?;
                             report.outcome = PutOutcome::Dropped(Dropped::SourceChanged);
                             return Ok(report);
                         }
-                        report.bytes_sent += uploaded.bytes_sent;
-                        report.parts_sent += uploaded.parts_sent;
-                        report.parts_skipped += uploaded.parts_skipped;
-                        pending.body = None;
-                        self.queue
-                            .settle(&pending.request_id, Some(pending.clone()))?;
+                        report.bytes_sent += stage.upload.bytes_sent;
+                        report.parts_sent += stage.upload.parts_sent;
+                        report.parts_skipped += stage.upload.parts_skipped;
+                        pending.body = PendingBody::after_stage(stage).2;
+                        self.queue.settle(&pending.request_id, Some(&pending))?;
                     }
                     Err(error) if unreachable(&error) => return Ok(report),
                     Err(error) => return Err(error.into()),
+                }
+            }
+            if let Some(PendingBody::Placement { plan, .. }) = pending.body.as_mut() {
+                let Some(transfer) = &self.transfer else {
+                    return Ok(report);
+                };
+                let was_unconfirmed = plan.presence_unconfirmed;
+                let target = pending.op.upload_target();
+                let result = transfer.confirm_put(
+                    plan,
+                    &pending.content_id,
+                    pending.size,
+                    Some(keeper_files_api::names::media_type(place(&pending.op).1)),
+                    target,
+                );
+                let probe_changed = was_unconfirmed != plan.presence_unconfirmed;
+                match result {
+                    Ok(()) => {
+                        pending.body = None;
+                        self.queue.settle(&pending.request_id, Some(&pending))?;
+                    }
+                    Err(error) => {
+                        if probe_changed {
+                            self.queue.settle(&pending.request_id, Some(&pending))?;
+                        }
+                        if unreachable(&error) {
+                            return Ok(report);
+                        }
+                        return Err(error.into());
+                    }
                 }
             }
             match self.send(&pending)? {
@@ -327,7 +362,7 @@ impl Files {
                     }
                     Outcome::Conflict => {
                         let copy = self.conflict_copy(&pending)?;
-                        self.queue.settle(&pending.request_id, Some(copy.clone()))?;
+                        self.queue.settle(&pending.request_id, Some(&copy))?;
                         pending = copy;
                     }
                     Outcome::Proposed => {

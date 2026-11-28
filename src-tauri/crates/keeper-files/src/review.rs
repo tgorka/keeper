@@ -111,11 +111,10 @@ impl Files {
                     .transfer
                     .as_ref()
                     .ok_or_else(|| FilesError::Offline("no transfer for upload".to_owned()))?;
-                let uploaded = match transfer.upload_file(
+                let uploaded = match transfer.upload_proposal(
                     file,
                     Some(keeper_files_api::names::media_type(place(&op).1)),
                     op.upload_target(),
-                    keeper_ports::transfer::UploadUse::Proposal,
                     &mut |_| {},
                 ) {
                     Ok(uploaded) => uploaded,

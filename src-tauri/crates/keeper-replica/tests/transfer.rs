@@ -157,32 +157,20 @@ fn identical_bytes_for_another_target_need_their_own_grant() {
         parent_id: "p",
         name: "first",
     };
-    let cut = transfer.upload_file(
-        &src,
-        None,
-        first,
-        keeper_ports::transfer::UploadUse::Put,
-        &mut |progress| {
-            if progress.done == PART_BYTES {
-                s.cut_next(100);
-            }
-        },
-    );
+    let cut = transfer.stage_put(&src, None, first, &mut |progress| {
+        if progress.done == PART_BYTES {
+            s.cut_next(100);
+        }
+    });
     assert!(cut.is_err(), "first target must have an unfinished plan");
     let second = UploadTarget::Create {
         parent_id: "p",
         name: "second",
     };
     let uploaded = transfer
-        .upload_file(
-            &src,
-            None,
-            second,
-            keeper_ports::transfer::UploadUse::Put,
-            &mut |_| {},
-        )
+        .stage_put(&src, None, second, &mut |_| {})
         .expect("new target");
-    assert_eq!(uploaded.parts_skipped, 0);
+    assert_eq!(uploaded.upload.parts_skipped, 0);
     assert_eq!(
         s.last_grant_body().expect("new grant")["target"],
         serde_json::json!({"parent_id":"p","name":"second"})

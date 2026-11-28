@@ -77,7 +77,7 @@ pub struct Progress {
 
 /// A part of an upload in parts: its number (from 1) and its SHA-256,
 /// standard base64 (as `x-amz-checksum-sha256` carries it).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartDigest {
     pub number: u32,
     pub sha256: String,
@@ -240,22 +240,46 @@ pub trait FileTransfer: Send + Sync {
 /// The plan has not positively confirmed placement; retry without submitting the change.
 pub const PLACEMENT_PENDING: &str = "files.placement_pending";
 
-/// Direct put admission reads back a staged single PUT. A proposal names bytes
-/// inside a nested change and therefore needs placement before submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UploadUse {
-    Put,
-    Proposal,
+/// Originals of the grant fields needed to confirm placement after the local source is gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlacementPlan {
+    pub plan_id: String,
+    pub part_bytes: u64,
+    pub parts: Vec<PartDigest>,
+    pub presence_unconfirmed: bool,
+}
+
+/// Body transfer finished. A put with a plan must durably queue it before confirming placement.
+#[derive(Debug)]
+pub struct StagedPut {
+    pub upload: Uploaded,
+    pub placement: Option<PlacementPlan>,
 }
 
 /// File operations cannot ask for bytes without naming the target or reference.
 pub trait ScopedFileTransfer: Send + Sync {
-    fn upload_file(
+    fn stage_put(
         &self,
         file: &Path,
         media_type: Option<&str>,
         target: UploadTarget<'_>,
-        usage: UploadUse,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<StagedPut, ReplicaError>;
+
+    fn confirm_put(
+        &self,
+        plan: &mut PlacementPlan,
+        content_id: &str,
+        size: u64,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+    ) -> Result<(), ReplicaError>;
+
+    fn upload_proposal(
+        &self,
+        file: &Path,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Uploaded, ReplicaError>;
 

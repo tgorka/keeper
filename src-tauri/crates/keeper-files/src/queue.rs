@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use keeper_ports::transfer::UploadTarget;
+use keeper_ports::transfer::{PlacementPlan, StagedPut, UploadTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::FilesError;
@@ -43,6 +43,33 @@ impl PendingOp {
     }
 }
 
+/// Older queues used a path here (or null once ready to name). A placement
+/// record is distinct: its source may no longer exist and must never be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PendingBody {
+    Source(PathBuf),
+    Placement {
+        plan: PlacementPlan,
+        bytes_sent: u64,
+        parts_sent: u32,
+        parts_skipped: u32,
+    },
+}
+
+impl PendingBody {
+    pub(crate) fn after_stage(stage: StagedPut) -> (String, u64, Option<Self>) {
+        let upload = stage.upload;
+        let body = stage.placement.map(|plan| Self::Placement {
+            plan,
+            bytes_sent: upload.bytes_sent,
+            parts_sent: upload.parts_sent,
+            parts_skipped: upload.parts_skipped,
+        });
+        (upload.content_id, upload.size, body)
+    }
+}
+
 /// One put waiting for its commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -52,9 +79,8 @@ pub struct Pending {
     pub content_id: String,
     pub size: u64,
     pub mtime_ms: Option<i64>,
-    /// The file put, by absolute path, while the store does not have its
-    /// bytes yet; `None` once uploaded.
-    pub body: Option<PathBuf>,
+    /// `None` only once ready for command submission.
+    pub body: Option<PendingBody>,
     /// The entry this put is a conflict copy of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_of: Option<String>,
@@ -106,7 +132,10 @@ impl Queue {
     }
 
     /// Replace the queue with `pending`, durably.
-    pub fn save(&self, pending: &[Pending]) -> Result<(), FilesError> {
+    pub fn save<'a>(
+        &self,
+        pending: impl IntoIterator<Item = &'a Pending>,
+    ) -> Result<(), FilesError> {
         let fail = |error: std::io::Error| FilesError::storage("queue", &error);
         if let Some(dir) = self.file.parent() {
             std::fs::create_dir_all(dir).map_err(fail)?;
@@ -114,33 +143,28 @@ impl Queue {
         let mut staging = self.file.clone().into_os_string();
         staging.push(".tmp");
         let staging = PathBuf::from(staging);
-        let bytes = serde_json::to_vec_pretty(pending)
-            .map_err(|error| FilesError::Storage(format!("queue: {error}")))?;
+        use serde::Serializer as _;
         {
-            use std::io::Write as _;
-            let mut file = std::fs::File::create(&staging).map_err(fail)?;
-            file.write_all(&bytes).map_err(fail)?;
-            file.sync_all().map_err(fail)?;
+            use std::io::{BufWriter, Write as _};
+            let mut file = BufWriter::new(std::fs::File::create(&staging).map_err(fail)?);
+            serde_json::Serializer::pretty(&mut file)
+                .collect_seq(pending)
+                .map_err(|error| FilesError::Storage(format!("queue: {error}")))?;
+            file.flush().map_err(fail)?;
+            file.get_ref().sync_all().map_err(fail)?;
         }
         std::fs::rename(&staging, &self.file).map_err(fail)
     }
 
     /// Replace the put whose request id is `request_id` with `next`
     /// (`None` removes it).
-    pub fn settle(&self, request_id: &str, next: Option<Pending>) -> Result<(), FilesError> {
-        let mut all = self.load()?;
-        match all
+    pub fn settle(&self, request_id: &str, next: Option<&Pending>) -> Result<(), FilesError> {
+        let all = self.load()?;
+        let index = all
             .iter()
             .position(|pending| pending.request_id == request_id)
-        {
-            Some(index) => match next {
-                Some(next) => all[index] = next,
-                None => {
-                    all.remove(index);
-                }
-            },
-            None => all.extend(next),
-        }
-        self.save(&all)
+            .unwrap_or(all.len());
+        let (before, after) = all.split_at(index);
+        self.save(before.iter().chain(next).chain(after.iter().skip(1)))
     }
 }

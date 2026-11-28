@@ -14,7 +14,10 @@
 //! together with the content id, including when a signed URL is renewed.
 //! A direct put leaves its single staging plan open for verification by the
 //! naming command. A proposal or multipart upload needs confirmed placement:
-//! `verifying` retains the plan and never submits the command. If the server
+//! `verifying` retains the plan and never submits the command.
+//! Once a put finishes sending parts, its queue record holds the plan ID and original
+//! grant metadata rather than a source path. A later flush confirms those same bytes
+//! even if the source was edited or deleted. If the server
 //! hides a completed plan and does not attest presence to this caller, the
 //! client reports `files.placement_pending` rather than treating 404 as success.
 //!

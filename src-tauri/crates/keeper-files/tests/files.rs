@@ -54,7 +54,10 @@ struct Device {
 }
 
 fn device(world: &World, actor: &str, client: &str) -> Device {
-    let dir = TempDir::new().expect("tempdir");
+    open_device(world, actor, client, TempDir::new().expect("tempdir"))
+}
+
+fn open_device(world: &World, actor: &str, client: &str, dir: TempDir) -> Device {
     let replica = FilesReplica::new(Arc::clone(&world.server), actor, client, Role::Editor);
     for unit in keeper_files::units(DOMAIN, actor, client) {
         replica.subscribe(unit).expect("subscribe unit");
@@ -315,19 +318,76 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
 }
 
 #[test]
-fn verifying_multipart_put_stays_queued_until_placement() {
+fn placement_replay_after_reopen_ignores_a_changed_source() {
+    placement_replay_after_reopen(false, false, |source| {
+        fs::write(source, b"later contents").expect("edit source")
+    });
+}
+
+#[test]
+fn placement_replay_after_reopen_ignores_a_deleted_source() {
+    placement_replay_after_reopen(false, false, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+#[test]
+fn source_only_queue_transitions_to_placement_before_the_source_disappears() {
+    placement_replay_after_reopen(true, false, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+#[test]
+fn placement_replay_after_reopen_with_hidden_presence_never_names_the_body() {
+    placement_replay_after_reopen(false, true, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+fn placement_replay_after_reopen(
+    start_offline: bool,
+    hide_presence: bool,
+    change: impl FnOnce(&Path),
+) {
     let world = World::new();
     let dev = device(&world, "ana", "ana.1");
     world.store.defer_placement(true);
     let body = pattern(150_000, 5);
     let local = write_local(dev.dir.path(), "large.bin", &body);
     let before = world.server.commands();
-    let pending = dev
-        .files
-        .put(&local, &path_target("Docs/large.bin"), &mut |_| {})
-        .expect("queue pending placement");
+    let target = path_target("Docs/large.bin");
+    let pending = if start_offline {
+        let offline = Files::new(
+            SERVER_URL,
+            dev.replica.source(DOMAIN),
+            None,
+            &Layout::under(dev.dir.path()),
+        )
+        .expect("offline");
+        let original = offline
+            .put(&local, &target, &mut |_| {})
+            .expect("queue source");
+        drop(offline);
+        assert_eq!(original.bytes_sent, 0);
+        let staged = dev.files.flush().expect("stage queued source").remove(0);
+        assert_eq!(staged.request_id, original.request_id);
+        staged
+    } else {
+        dev.files
+            .put(&local, &target, &mut |_| {})
+            .expect("stage put")
+    };
     assert_eq!(pending.outcome, PutOutcome::Queued);
     assert_eq!(world.server.commands(), before);
+    change(&local);
+    let Device {
+        dir,
+        files,
+        replica,
+    } = dev;
+    drop((files, replica));
+    let dev = open_device(&world, "ana", "ana.1", dir);
     assert_eq!(
         dev.files.flush().expect("still verifying")[0].outcome,
         PutOutcome::Queued
@@ -345,12 +405,89 @@ fn verifying_multipart_put_stays_queued_until_placement() {
                 .map(str::to_owned)
         })
         .expect("completed plan");
+    let record = dev.files.pending().expect("reopened queue").remove(0);
+    let Some(keeper_files::queue::PendingBody::Placement {
+        plan,
+        bytes_sent,
+        parts_sent,
+        parts_skipped,
+    }) = record.body
+    else {
+        panic!("queue lost the placement ticket")
+    };
+    assert_eq!(plan.plan_id, plan_id);
+    assert_eq!(
+        (bytes_sent, parts_sent, parts_skipped),
+        (body.len() as u64, 3, 0)
+    );
+    assert_eq!(record.size, body.len() as u64);
+    assert_eq!(record.content_id, sha(&body));
+    assert_eq!(record.request_id, pending.request_id);
+    assert!(
+        matches!(record.op, keeper_files::queue::PendingOp::Create { parent_id, name, entry_id } if parent_id == world.docs && name == "large.bin" && entry_id == pending.entry_id)
+    );
     world.store.complete_plan_on_store(&plan_id);
+    if hide_presence {
+        world.store.hide_presence();
+        for _ in 0..2 {
+            let waiting = dev.files.flush().expect("ambiguous placement");
+            assert_eq!(waiting[0].outcome, PutOutcome::Queued);
+            assert_eq!(waiting[0].bytes_sent, 0);
+        }
+        assert_eq!(world.server.commands(), before);
+        assert_eq!(world.store.store_bytes_received(), body.len() as u64);
+        assert_eq!(
+            world
+                .store
+                .grant_requests()
+                .iter()
+                .filter(|req| req.ends_with("/upload-grant"))
+                .count(),
+            2
+        );
+        return;
+    }
     let replay = dev.files.flush().expect("flush once placed");
     assert_eq!(replay[0].outcome, PutOutcome::Accepted);
     assert_eq!(replay[0].request_id, pending.request_id);
+    assert_eq!(replay[0].content_id, sha(&body));
+    assert_eq!(replay[0].entry_id, pending.entry_id);
+    assert_eq!(
+        world.store.object(&pending.content_id).as_deref(),
+        Some(body.as_slice())
+    );
+    assert_eq!(world.server.commands(), before + 1);
+    assert_eq!(
+        (
+            pending.bytes_sent,
+            pending.parts_sent,
+            pending.parts_skipped
+        ),
+        (body.len() as u64, 3, 0)
+    );
+    assert_eq!((replay[0].bytes_sent, replay[0].parts_sent), (0, 0));
     assert!(dev.files.pending().expect("queue").is_empty());
     assert_eq!(world.store.store_bytes_received(), body.len() as u64);
+}
+
+#[test]
+fn staging_the_last_part_never_rereads_the_source_for_a_queued_put() {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    world.store.defer_placement(true);
+    let bytes = pattern(150_000, 5);
+    let local = write_local(dev.dir.path(), "original.bin", &bytes);
+    let report = dev
+        .files
+        .put(&local, &path_target("Docs/original.bin"), &mut |progress| {
+            if progress.done == progress.total {
+                fs::remove_file(&local).expect("remove after final part");
+            }
+        })
+        .expect("stage the original bytes without reopening the file");
+    assert_eq!(report.outcome, PutOutcome::Queued);
+    assert_eq!(report.content_id, sha(&bytes));
+    assert_eq!(report.bytes_sent, bytes.len() as u64);
 }
 
 #[test]

@@ -15,8 +15,8 @@ use std::time::UNIX_EPOCH;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use keeper_ports::transfer::{
-    Completion, PartDigest, Progress, SignedUrl, UploadAsk, UploadGrant, UploadTarget, UploadUse,
-    Uploaded,
+    Completion, PartDigest, PlacementPlan, Progress, SignedUrl, StagedPut, UploadAsk, UploadGrant,
+    UploadTarget, Uploaded,
 };
 use keeper_ports::ReplicaError;
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,28 @@ impl PlanFile {
             file_modified_ms: digest.file_modified_ms,
         }
     }
+    fn into_placement(self) -> PlacementPlan {
+        PlacementPlan {
+            plan_id: self.plan_id,
+            part_bytes: self.part_bytes,
+            parts: self
+                .parts
+                .into_iter()
+                .enumerate()
+                .map(|(index, sha256)| PartDigest {
+                    number: (index + 1) as u32,
+                    sha256,
+                })
+                .collect(),
+            presence_unconfirmed: self.phase == PlanPhase::Unconfirmed,
+        }
+    }
+}
+
+pub(super) enum Scope<'a> {
+    Generic,
+    Put(UploadTarget<'a>),
+    Proposal(UploadTarget<'a>),
 }
 
 /// Upload `file` to the database's object store using presigned URLs.
@@ -115,16 +137,20 @@ pub(super) fn run(
     t: &StoreTransfer,
     file: &Path,
     media_type: Option<&str>,
-    scope: Option<(UploadTarget<'_>, UploadUse)>,
+    scope: Scope<'_>,
     progress: &mut dyn FnMut(Progress),
-) -> Result<Uploaded, ReplicaError> {
+) -> Result<StagedPut, ReplicaError> {
     let meta = fs::metadata(file)
         .map_err(|error| ReplicaError::Client(format!("stat {}: {error}", file.display())))?;
     let part_bytes = t.config.part_size(meta.len());
     let digest = digest_file(file, part_bytes)?;
 
-    let target = scope.map(|(target, _)| target);
-    let proposal = scope.is_some_and(|(_, usage)| usage == UploadUse::Proposal);
+    let target = match scope {
+        Scope::Generic => None,
+        Scope::Put(t) | Scope::Proposal(t) => Some(t),
+    };
+    let proposal = matches!(scope, Scope::Proposal(_));
+    let put = matches!(scope, Scope::Put(_));
     let ask = UploadAsk {
         target,
         content_id: &digest.content_id,
@@ -138,14 +164,23 @@ pub(super) fn run(
     if let Some(path) = plan_path.as_deref() {
         if let Some(mut plan) = load_matching_plan(path, &digest, part_bytes) {
             if plan.phase != PlanPhase::Uploading {
-                confirm_placement(t, &ask, &mut plan, path)?;
-                return Ok(Uploaded {
-                    content_id: digest.content_id,
-                    size: digest.size,
-                    bytes_sent: 0,
-                    parts_sent: 0,
-                    parts_skipped: u32::try_from(digest.parts.len()).unwrap_or(u32::MAX),
-                    completion: Some(Completion::Placed),
+                let placement = if put {
+                    remove_plan_file(path);
+                    Some(plan.into_placement())
+                } else {
+                    confirm_placement(t, &ask, &mut plan, path)?;
+                    None
+                };
+                return Ok(StagedPut {
+                    upload: Uploaded {
+                        content_id: digest.content_id,
+                        size: digest.size,
+                        bytes_sent: 0,
+                        parts_sent: 0,
+                        parts_skipped: u32::try_from(digest.parts.len()).unwrap_or(u32::MAX),
+                        completion: (!put).then_some(Completion::Placed),
+                    },
+                    placement,
                 });
             }
             match t.grants.held_parts(&plan.plan_id) {
@@ -177,7 +212,7 @@ pub(super) fn run(
                     }
 
                     return finish_multipart(
-                        t, file, &digest, &ask, &mut plan, path, &held_set, done, url_map, progress,
+                        t, file, &digest, &ask, plan, path, &held_set, done, url_map, progress, put,
                     );
                 }
                 Err(ReplicaError::Remote { ref code, .. }) if code == PLAN_UNKNOWN => {
@@ -189,13 +224,16 @@ pub(super) fn run(
     }
 
     match t.grants.grant_upload(&ask)? {
-        UploadGrant::Present => Ok(Uploaded {
-            content_id: digest.content_id,
-            size: digest.size,
-            bytes_sent: 0,
-            parts_sent: 0,
-            parts_skipped: 0,
-            completion: None,
+        UploadGrant::Present => Ok(StagedPut {
+            upload: Uploaded {
+                content_id: digest.content_id,
+                size: digest.size,
+                bytes_sent: 0,
+                parts_sent: 0,
+                parts_skipped: 0,
+                completion: None,
+            },
+            placement: None,
         }),
         UploadGrant::Single { signed, plan_id } => {
             if proposal && plan_id.is_none() {
@@ -226,20 +264,23 @@ pub(super) fn run(
                 } else {
                     None
                 };
-            Ok(Uploaded {
-                content_id: digest.content_id,
-                size: digest.size,
-                bytes_sent,
-                parts_sent: 0,
-                parts_skipped: 0,
-                completion,
+            Ok(StagedPut {
+                upload: Uploaded {
+                    content_id: digest.content_id,
+                    size: digest.size,
+                    bytes_sent,
+                    parts_sent: 0,
+                    parts_skipped: 0,
+                    completion,
+                },
+                placement: None,
             })
         }
         UploadGrant::Parts { plan_id, urls } => {
             let plan_path = plan_path.ok_or_else(|| {
                 ReplicaError::Client("unexpected multipart grant for single PUT".to_owned())
             })?;
-            let mut plan = PlanFile::new(&digest, part_bytes, plan_id, PlanPhase::Uploading);
+            let plan = PlanFile::new(&digest, part_bytes, plan_id, PlanPhase::Uploading);
             write_plan_file(&t.config.plan_dir, &plan_path, &plan)?;
 
             let mut url_map: HashMap<u32, SignedUrl> =
@@ -258,7 +299,7 @@ pub(super) fn run(
 
             let held_set = HashSet::new();
             finish_multipart(
-                t, file, &digest, &ask, &mut plan, &plan_path, &held_set, 0, url_map, progress,
+                t, file, &digest, &ask, plan, &plan_path, &held_set, 0, url_map, progress, put,
             )
         }
     }
@@ -271,13 +312,14 @@ fn finish_multipart(
     file: &Path,
     digest: &FileDigest,
     ask: &UploadAsk<'_>,
-    plan: &mut PlanFile,
+    mut plan: PlanFile,
     plan_path: &Path,
     held_set: &HashSet<u32>,
     mut done: u64,
     url_map: HashMap<u32, SignedUrl>,
     progress: &mut dyn FnMut(Progress),
-) -> Result<Uploaded, ReplicaError> {
+    put: bool,
+) -> Result<StagedPut, ReplicaError> {
     let part_bytes = ask.part_bytes;
     let plan_id = &plan.plan_id;
     let mut bytes_sent = 0u64;
@@ -341,25 +383,32 @@ fn finish_multipart(
         });
     }
 
-    let completion = if ask.target.is_some() {
+    let (completion, placement) = if put {
+        // The queue takes ownership of the exact plan before issuing its first complete.
+        remove_plan_file(plan_path);
+        (None, Some(plan.into_placement()))
+    } else if ask.target.is_some() {
         // Persist before sending complete: a lost response must resume confirmation, not the PUTs.
         plan.phase = PlanPhase::Completing;
-        write_plan_file(&t.config.plan_dir, plan_path, plan)?;
-        confirm_placement(t, ask, plan, plan_path)?;
-        Completion::Placed
+        write_plan_file(&t.config.plan_dir, plan_path, &plan)?;
+        confirm_placement(t, ask, &mut plan, plan_path)?;
+        (Some(Completion::Placed), None)
     } else {
         let completion = t.grants.complete(plan_id)?;
         remove_plan_file(plan_path);
-        completion
+        (Some(completion), None)
     };
 
-    Ok(Uploaded {
-        content_id: digest.content_id.clone(),
-        size: digest.size,
-        bytes_sent,
-        parts_sent,
-        parts_skipped,
-        completion: Some(completion),
+    Ok(StagedPut {
+        upload: Uploaded {
+            content_id: digest.content_id.clone(),
+            size: digest.size,
+            bytes_sent,
+            parts_sent,
+            parts_skipped,
+            completion,
+        },
+        placement,
     })
 }
 
@@ -371,24 +420,36 @@ fn confirm_placement(
     plan: &mut PlanFile,
     path: &Path,
 ) -> Result<(), ReplicaError> {
+    let mut unconfirmed = plan.phase == PlanPhase::Unconfirmed;
+    let result = confirm(t, ask, &plan.plan_id, &mut unconfirmed);
+    if result.is_ok() {
+        remove_plan_file(path);
+    } else if unconfirmed && plan.phase != PlanPhase::Unconfirmed {
+        plan.phase = PlanPhase::Unconfirmed;
+        write_plan_file(&t.config.plan_dir, path, plan)?;
+    }
+    result
+}
+
+pub(super) fn confirm(
+    t: &StoreTransfer,
+    ask: &UploadAsk<'_>,
+    plan_id: &str,
+    unconfirmed: &mut bool,
+) -> Result<(), ReplicaError> {
     for delay_ms in [0, 25, 100, 250] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        match t.grants.complete(&plan.plan_id) {
-            Ok(Completion::Placed) => {
-                remove_plan_file(path);
-                return Ok(());
-            }
+        match t.grants.complete(plan_id) {
+            Ok(Completion::Placed) => return Ok(()),
             Ok(Completion::Verifying) => continue,
             Err(ReplicaError::Remote { code, .. }) if code == PLAN_UNKNOWN => {
-                if plan.phase != PlanPhase::Unconfirmed {
+                if !*unconfirmed {
                     if matches!(t.grants.grant_upload(ask)?, UploadGrant::Present) {
-                        remove_plan_file(path);
                         return Ok(());
                     }
-                    plan.phase = PlanPhase::Unconfirmed;
-                    write_plan_file(&t.config.plan_dir, path, plan)?;
+                    *unconfirmed = true;
                 }
                 break;
             }
@@ -397,7 +458,7 @@ fn confirm_placement(
     }
     Err(ReplicaError::Remote {
         code: keeper_ports::transfer::PLACEMENT_PENDING.to_owned(),
-        message: format!("placement of upload plan {} is not confirmed", plan.plan_id),
+        message: format!("placement of upload plan {plan_id} is not confirmed"),
         retryable: true,
     })
 }
