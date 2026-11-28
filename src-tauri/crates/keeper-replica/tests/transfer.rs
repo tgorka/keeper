@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::{FileTransfer, ScopedFileTransfer, UploadTarget};
 use keeper_ports::{ReplicaError, StoreOrigin, StoreSlot};
 use keeper_replica::transfer::{HttpGrants, StoreTransfer, TransferConfig, FOREIGN};
 use keeper_testkit::store::StandIn;
@@ -84,6 +84,12 @@ fn a_small_file_goes_in_one_put_and_comes_back() {
         .upload(&src, Some("application/octet-stream"), &mut |_| {})
         .expect("small upload");
 
+    assert_eq!(
+        s.last_grant_body(),
+        Some(
+            serde_json::json!({"contentId": uploaded.content_id, "size": size, "mediaType": "application/octet-stream", "partBytes": 0, "parts": []})
+        )
+    );
     assert_eq!(uploaded.size, size);
     assert_eq!(uploaded.parts_sent, 0);
     assert!(s.parts_accepted().is_empty());
@@ -97,6 +103,10 @@ fn a_small_file_goes_in_one_put_and_comes_back() {
         .download(&uploaded.content_id, size, &dest, &mut |_| {})
         .expect("small download");
 
+    assert_eq!(
+        s.last_grant_body(),
+        Some(serde_json::json!({"contentId": uploaded.content_id}))
+    );
     assert_eq!(downloaded.size, size);
     assert_eq!(fs::read(&dest).expect("read dest"), bytes);
     assert!(plan_files(&plan_dir).is_empty());
@@ -134,6 +144,37 @@ fn a_large_file_goes_in_parts_and_comes_back_by_hash() {
     assert_eq!(downloaded.size, size);
     assert_eq!(fs::read(&dest).expect("read dest"), bytes);
     assert!(plan_files(&plan_dir).is_empty());
+}
+
+#[test]
+fn identical_bytes_for_another_target_need_their_own_grant() {
+    let s = StandIn::start("alpha");
+    let dir = TempDir::new().expect("tempdir");
+    let src = dir.path().join("body");
+    fs::write(&src, xorshift_bytes(42, LARGE_LEN)).expect("source");
+    let transfer = make_transfer(&s, slot_for(&s), dir.path().join("plans"));
+    let first = UploadTarget::Create {
+        parent_id: "p",
+        name: "first",
+    };
+    let cut = transfer.stage_put(&src, None, first, None, &mut |progress| {
+        if progress.done == PART_BYTES {
+            s.cut_next(100);
+        }
+    });
+    assert!(cut.is_err(), "first target must have an unfinished plan");
+    let second = UploadTarget::Create {
+        parent_id: "p",
+        name: "second",
+    };
+    let uploaded = transfer
+        .stage_put(&src, None, second, None, &mut |_| {})
+        .expect("new target");
+    assert_eq!(uploaded.upload.parts_skipped, 0);
+    assert_eq!(
+        s.last_grant_body().expect("new grant")["target"],
+        serde_json::json!({"parent_id":"p","name":"second"})
+    );
 }
 
 #[test]

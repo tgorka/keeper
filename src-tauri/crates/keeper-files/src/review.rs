@@ -18,6 +18,7 @@ use keeper_files_api::review::{
 };
 use keeper_files_api::rows::{Kind, Outcome, Proposal};
 use keeper_files_api::wire::{Decision, ProposedChange, Reviewers, WireOp};
+use keeper_ports::transfer::DownloadReference;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -106,17 +107,20 @@ impl Files {
         match change {
             Change::Put { file, target } => {
                 let (_, op) = self.plan(target)?;
-                let name = place(&op).1.to_owned();
                 let transfer = self
                     .transfer
                     .as_ref()
                     .ok_or_else(|| FilesError::Offline("no transfer for upload".to_owned()))?;
-                let uploaded = match transfer.upload(
+                let uploaded = match transfer.upload_proposal(
                     file,
-                    Some(keeper_files_api::names::media_type(&name)),
+                    Some(keeper_files_api::names::media_type(place(&op).1)),
+                    op.upload_target(),
                     &mut |_| {},
                 ) {
                     Ok(uploaded) => uploaded,
+                    Err(error) if matches!(&error, keeper_ports::ReplicaError::Remote { code, .. } if code == keeper_ports::transfer::PLACEMENT_PENDING) => {
+                        return Err(error.into())
+                    }
                     Err(error) if unreachable(&error) => {
                         return Err(FilesError::Offline(error.to_string()));
                     }
@@ -374,7 +378,11 @@ impl Files {
                 .as_ref()
                 .ok_or_else(|| FilesError::Offline(format!("{content_id} is not cached")))?;
             let file = self.cache.path(&content_id)?;
-            match transfer.download(&content_id, size, &file, &mut |_| {}) {
+            let reference = DownloadReference::Proposal {
+                proposal_id: &revision.proposal_id,
+                proposal_revision: &revision.revision,
+            };
+            match transfer.download_file(&content_id, reference, size, &file, &mut |_| {}) {
                 Ok(_) => {}
                 Err(error) if unreachable(&error) => {
                     return Err(FilesError::Offline(error.to_string()));

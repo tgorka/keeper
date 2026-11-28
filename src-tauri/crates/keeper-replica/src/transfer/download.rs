@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use keeper_ports::transfer::{Downloaded, Progress};
+use keeper_ports::transfer::{DownloadReference, Downloaded, Progress};
 use keeper_ports::ReplicaError;
 use sha2::{Digest, Sha256};
 
@@ -20,6 +20,7 @@ const MAX_STALLED_ATTEMPTS: u32 = 5;
 pub(super) fn run(
     t: &StoreTransfer,
     content_id: &str,
+    reference: Option<DownloadReference<'_>>,
     size: u64,
     dest: &Path,
     progress: &mut dyn FnMut(Progress),
@@ -48,7 +49,7 @@ pub(super) fn run(
         file.seek(SeekFrom::End(0)).map_err(io_client_err)?;
     }
 
-    let grant = t.grants.grant_download(content_id)?;
+    let grant = t.grants.grant_download(content_id, reference)?;
     let mut grants: u32 = 1;
     let mut url = t.checked(&grant.url)?;
 
@@ -92,7 +93,7 @@ pub(super) fn run(
                     ));
                 }
                 tracing::debug!(%content_id, grants, "presigned download URL expired; renewing");
-                let fresh = t.grants.grant_download(content_id)?;
+                let fresh = t.grants.grant_download(content_id, reference)?;
                 grants += 1;
                 url = t.checked(&fresh.url)?;
                 continue;

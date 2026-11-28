@@ -17,7 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use keeper_ports::transfer::{Downloaded, FileTransfer, Progress, TransferGrants, Uploaded};
+use keeper_ports::transfer::{
+    DownloadReference, Downloaded, FileTransfer, PlacementPlan, Progress, ScopedFileTransfer,
+    StagedPut, TransferGrants, UploadAsk, UploadTarget, Uploaded,
+};
 use keeper_ports::{ReplicaError, StoreOrigin, StoreSlot};
 
 use crate::limits::{FILE_PART_BYTES, FILE_PART_THRESHOLD_BYTES};
@@ -150,7 +153,8 @@ impl FileTransfer for StoreTransfer {
         media_type: Option<&str>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Uploaded, ReplicaError> {
-        upload::run(self, file, media_type, progress)
+        upload::run(self, file, media_type, upload::Scope::Generic, progress)
+            .map(|stage| stage.upload)
     }
 
     fn download(
@@ -160,6 +164,81 @@ impl FileTransfer for StoreTransfer {
         dest: &std::path::Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Downloaded, ReplicaError> {
-        download::run(self, content_id, size, dest, progress)
+        download::run(self, content_id, None, size, dest, progress)
+    }
+}
+
+impl ScopedFileTransfer for StoreTransfer {
+    fn stage_put(
+        &self,
+        file: &std::path::Path,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+        handoff: Option<&std::path::Path>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<StagedPut, ReplicaError> {
+        upload::run(
+            self,
+            file,
+            media_type,
+            upload::Scope::Put(target, handoff),
+            progress,
+        )
+    }
+
+    fn recover_put(
+        &self,
+        handoff: &std::path::Path,
+        content_id: &str,
+        size: u64,
+    ) -> Result<Option<StagedPut>, ReplicaError> {
+        upload::recover(self, handoff, content_id, size)
+    }
+
+    fn confirm_put(
+        &self,
+        plan: &mut PlacementPlan,
+        content_id: &str,
+        size: u64,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+    ) -> Result<(), ReplicaError> {
+        let ask = UploadAsk {
+            content_id,
+            size,
+            target: Some(target),
+            media_type,
+            part_bytes: plan.part_bytes,
+            parts: &plan.parts,
+        };
+        upload::confirm(self, &ask, &plan.plan_id, &mut plan.presence_unconfirmed)
+    }
+
+    fn upload_proposal(
+        &self,
+        file: &std::path::Path,
+        media_type: Option<&str>,
+        target: UploadTarget<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Uploaded, ReplicaError> {
+        upload::run(
+            self,
+            file,
+            media_type,
+            upload::Scope::Proposal(target),
+            progress,
+        )
+        .map(|stage| stage.upload)
+    }
+
+    fn download_file(
+        &self,
+        content_id: &str,
+        reference: DownloadReference<'_>,
+        size: u64,
+        dest: &std::path::Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Downloaded, ReplicaError> {
+        download::run(self, content_id, Some(reference), size, dest, progress)
     }
 }

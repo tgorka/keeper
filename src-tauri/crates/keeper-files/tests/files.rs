@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use keeper_accounts_api::Role;
 use keeper_files::{Dropped, Files, FilesError, Layout, Listing, PutOutcome, Target};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::files::{FilesReplica, FilesServer};
@@ -35,7 +35,7 @@ impl World {
         let store = Arc::new(StandIn::start(DOMAIN));
         let server = FilesServer::new(DOMAIN);
         let store_check = Arc::clone(&store);
-        server.set_objects(move |cid| store_check.object(cid).is_some());
+        server.set_objects(move |cid| store_check.prepare_naming(cid));
         let root = server.create_drive("owner", DRIVE);
         let docs = server.mkdir("owner", &root, "Docs");
         Self {
@@ -54,7 +54,10 @@ struct Device {
 }
 
 fn device(world: &World, actor: &str, client: &str) -> Device {
-    let dir = TempDir::new().expect("tempdir");
+    open_device(world, actor, client, TempDir::new().expect("tempdir"))
+}
+
+fn open_device(world: &World, actor: &str, client: &str, dir: TempDir) -> Device {
     let replica = FilesReplica::new(Arc::clone(&world.server), actor, client, Role::Editor);
     for unit in keeper_files::units(DOMAIN, actor, client) {
         replica.subscribe(unit).expect("subscribe unit");
@@ -82,7 +85,7 @@ fn device(world: &World, actor: &str, client: &str) -> Device {
     let mut config = TransferConfig::contract(dir.path().join("plans"));
     config.threshold = PART_BYTES;
     config.part_bytes = PART_BYTES;
-    let transfer: Arc<dyn FileTransfer> = Arc::new(
+    let transfer: Arc<dyn ScopedFileTransfer> = Arc::new(
         StoreTransfer::new(grants, &world.store.base_url(), slot, config).expect("store transfer"),
     );
 
@@ -222,7 +225,7 @@ fn get_fetches_once_then_serves_the_cache_and_refetches_a_changed_copy() {
     let body = pattern(200_000, 3);
     let cid = world.store.seed(&body);
     let size = u64::try_from(body.len()).expect("size fits u64");
-    world
+    let entry_id = world
         .server
         .create_file("owner", &world.docs, "report.bin", &cid, size);
 
@@ -231,6 +234,10 @@ fn get_fetches_once_then_serves_the_cache_and_refetches_a_changed_copy() {
 
     let first = dev.files.get(&target, &mut |_| {}).expect("first get");
     assert!(first.fetched);
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(json!({"entry_id": entry_id, "content_id": cid}))
+    );
     let cached_bytes = fs::read(&first.file).expect("read cached");
     assert_eq!(sha(&cached_bytes), cid);
     assert_eq!(world.store.store_gets(), 1);
@@ -271,6 +278,10 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
     assert_eq!(first.outcome, PutOutcome::Accepted);
     assert_eq!(first.content_id, expected_cid);
     assert!(world.store.object(&first.content_id).is_some());
+    assert_eq!(
+        world.store.last_grant_body().expect("create upload")["target"],
+        json!({"parent_id": world.docs, "name": "new.bin"})
+    );
 
     dev.replica.pull();
     let listing = dev
@@ -307,6 +318,271 @@ fn put_uploads_then_commits_and_one_content_is_one_blob() {
 }
 
 #[test]
+fn interrupted_source_to_placement_handoff_recovers_before_opening_the_missing_source() {
+    interrupt_staged_put(false);
+}
+
+#[test]
+fn interrupted_final_handoff_checkpoint_recovers_all_held_parts() {
+    interrupt_staged_put(true);
+}
+
+fn interrupt_staged_put(block_counter_checkpoint: bool) {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    let layout = Layout::under(dev.dir.path());
+    let offline =
+        Files::new(SERVER_URL, dev.replica.source(DOMAIN), None, &layout).expect("offline");
+    let bytes = pattern(150_000, 42);
+    let source = write_local(dev.dir.path(), "body", &bytes);
+    let original = offline
+        .put(&source, &path_target("Docs/original"), &mut |_| {})
+        .expect("acknowledged source");
+    drop(offline);
+    let before = world.server.commands();
+    let blocked = if block_counter_checkpoint {
+        // Pause the first PUT after its body arrived. The request-bound open plan
+        // already exists; fail only the later replacement with final counters.
+        let held = world.store.hold_next_part();
+        std::thread::scope(|scope| {
+            let flush = scope.spawn(|| dev.files.flush());
+            assert!(held.wait_held(Duration::from_secs(5)));
+            let handoff = fs::read_dir(dev.dir.path())
+                .expect("state dir")
+                .map(|item| item.expect("entry").path())
+                .find(|p| p.extension().is_some_and(|ext| ext == "handoff"))
+                .expect("request handoff");
+            let blocked = handoff.with_extension("json.tmp");
+            fs::create_dir(&blocked).expect("block final counters");
+            held.release();
+            assert!(matches!(
+                flush.join().expect("flush thread"),
+                Err(FilesError::Replica(_))
+            ));
+            blocked
+        })
+    } else {
+        // The queue is readable; only its atomic replacement fails after staging.
+        let blocked = layout.queue_file.with_added_extension("tmp");
+        fs::create_dir(&blocked).expect("block queue staging file");
+        assert!(matches!(dev.files.flush(), Err(FilesError::Storage(_))));
+        blocked
+    };
+    assert_eq!(world.store.store_bytes_received(), bytes.len() as u64);
+    assert_eq!(world.server.commands(), before);
+    fs::remove_dir(&blocked).expect("restore queue writer");
+    fs::remove_file(&source).expect("remove original source");
+    let Device {
+        dir,
+        files,
+        replica,
+    } = dev;
+    drop((files, replica));
+    let reopened = open_device(&world, "ana", "ana.1", dir);
+    let recovered = reopened
+        .files
+        .flush()
+        .expect("recover staged handoff")
+        .remove(0);
+    assert_eq!(recovered.outcome, PutOutcome::Accepted);
+    assert_eq!(recovered.request_id, original.request_id);
+    assert_eq!(recovered.content_id, sha(&bytes));
+    assert_eq!(recovered.bytes_sent, 0);
+    assert_eq!(world.store.store_bytes_received(), bytes.len() as u64);
+    assert_eq!(
+        world
+            .store
+            .grant_requests()
+            .iter()
+            .filter(|r| r.ends_with("/upload-grant"))
+            .count(),
+        1
+    );
+    assert_eq!(world.server.commands(), before + 1);
+    assert!(!fs::read_dir(reopened.dir.path())
+        .expect("state dir")
+        .any(|item| item
+            .expect("entry")
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "handoff")));
+    assert!(reopened.files.pending().expect("queue").is_empty());
+}
+
+#[test]
+fn placement_replay_after_reopen_ignores_a_changed_source() {
+    placement_replay_after_reopen(false, false, |source| {
+        fs::write(source, b"later contents").expect("edit source")
+    });
+}
+
+#[test]
+fn placement_replay_after_reopen_ignores_a_deleted_source() {
+    placement_replay_after_reopen(false, false, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+#[test]
+fn source_only_queue_transitions_to_placement_before_the_source_disappears() {
+    placement_replay_after_reopen(true, false, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+#[test]
+fn placement_replay_after_reopen_with_hidden_presence_never_names_the_body() {
+    placement_replay_after_reopen(false, true, |source| {
+        fs::remove_file(source).expect("delete source")
+    });
+}
+
+fn placement_replay_after_reopen(
+    start_offline: bool,
+    hide_presence: bool,
+    change: impl FnOnce(&Path),
+) {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    world.store.defer_placement(true);
+    let body = pattern(150_000, 5);
+    let local = write_local(dev.dir.path(), "large.bin", &body);
+    let before = world.server.commands();
+    let target = path_target("Docs/large.bin");
+    let pending = if start_offline {
+        let offline = Files::new(
+            SERVER_URL,
+            dev.replica.source(DOMAIN),
+            None,
+            &Layout::under(dev.dir.path()),
+        )
+        .expect("offline");
+        let original = offline
+            .put(&local, &target, &mut |_| {})
+            .expect("queue source");
+        drop(offline);
+        assert_eq!(original.bytes_sent, 0);
+        let staged = dev.files.flush().expect("stage queued source").remove(0);
+        assert_eq!(staged.request_id, original.request_id);
+        staged
+    } else {
+        dev.files
+            .put(&local, &target, &mut |_| {})
+            .expect("stage put")
+    };
+    assert_eq!(pending.outcome, PutOutcome::Queued);
+    assert_eq!(world.server.commands(), before);
+    change(&local);
+    let Device {
+        dir,
+        files,
+        replica,
+    } = dev;
+    drop((files, replica));
+    let dev = open_device(&world, "ana", "ana.1", dir);
+    assert_eq!(
+        dev.files.flush().expect("still verifying")[0].outcome,
+        PutOutcome::Queued
+    );
+    assert_eq!(world.server.commands(), before);
+    assert!(world.store.object(&pending.content_id).is_none());
+    let plan_id = world
+        .store
+        .grant_requests()
+        .iter()
+        .find_map(|req| {
+            req.strip_suffix("/complete")?
+                .rsplit('/')
+                .next()
+                .map(str::to_owned)
+        })
+        .expect("completed plan");
+    let record = dev.files.pending().expect("reopened queue").remove(0);
+    let Some(keeper_files::queue::PendingBody::Placement {
+        plan,
+        bytes_sent,
+        parts_sent,
+        parts_skipped,
+    }) = record.body
+    else {
+        panic!("queue lost the placement ticket")
+    };
+    assert_eq!(plan.plan_id, plan_id);
+    assert_eq!(
+        (bytes_sent, parts_sent, parts_skipped),
+        (body.len() as u64, 3, 0)
+    );
+    assert_eq!(record.size, body.len() as u64);
+    assert_eq!(record.content_id, sha(&body));
+    assert_eq!(record.request_id, pending.request_id);
+    assert!(
+        matches!(record.op, keeper_files::queue::PendingOp::Create { parent_id, name, entry_id } if parent_id == world.docs && name == "large.bin" && entry_id == pending.entry_id)
+    );
+    world.store.complete_plan_on_store(&plan_id);
+    if hide_presence {
+        world.store.hide_presence();
+        for _ in 0..2 {
+            let waiting = dev.files.flush().expect("ambiguous placement");
+            assert_eq!(waiting[0].outcome, PutOutcome::Queued);
+            assert_eq!(waiting[0].bytes_sent, 0);
+        }
+        assert_eq!(world.server.commands(), before);
+        assert_eq!(world.store.store_bytes_received(), body.len() as u64);
+        assert_eq!(
+            world
+                .store
+                .grant_requests()
+                .iter()
+                .filter(|req| req.ends_with("/upload-grant"))
+                .count(),
+            2
+        );
+        return;
+    }
+    let replay = dev.files.flush().expect("flush once placed");
+    assert_eq!(replay[0].outcome, PutOutcome::Accepted);
+    assert_eq!(replay[0].request_id, pending.request_id);
+    assert_eq!(replay[0].content_id, sha(&body));
+    assert_eq!(replay[0].entry_id, pending.entry_id);
+    assert_eq!(
+        world.store.object(&pending.content_id).as_deref(),
+        Some(body.as_slice())
+    );
+    assert_eq!(world.server.commands(), before + 1);
+    assert_eq!(
+        (
+            pending.bytes_sent,
+            pending.parts_sent,
+            pending.parts_skipped
+        ),
+        (body.len() as u64, 3, 0)
+    );
+    assert_eq!((replay[0].bytes_sent, replay[0].parts_sent), (0, 0));
+    assert!(dev.files.pending().expect("queue").is_empty());
+    assert_eq!(world.store.store_bytes_received(), body.len() as u64);
+}
+
+#[test]
+fn staging_the_last_part_never_rereads_the_source_for_a_queued_put() {
+    let world = World::new();
+    let dev = device(&world, "ana", "ana.1");
+    world.store.defer_placement(true);
+    let bytes = pattern(150_000, 5);
+    let local = write_local(dev.dir.path(), "original.bin", &bytes);
+    let report = dev
+        .files
+        .put(&local, &path_target("Docs/original.bin"), &mut |progress| {
+            if progress.done == progress.total {
+                fs::remove_file(&local).expect("remove after final part");
+            }
+        })
+        .expect("stage the original bytes without reopening the file");
+    assert_eq!(report.outcome, PutOutcome::Queued);
+    assert_eq!(report.content_id, sha(&bytes));
+    assert_eq!(report.bytes_sent, bytes.len() as u64);
+}
+
+#[test]
 fn an_offline_put_waits_and_commits_on_reconnect() {
     let world = World::new();
     let dev = device(&world, "ana", "ana.1");
@@ -317,20 +593,35 @@ fn an_offline_put_waits_and_commits_on_reconnect() {
     dev.replica.set_online(false);
     let cmds_before = world.server.commands();
 
-    let report = dev
-        .files
+    let offline = Files::new(
+        SERVER_URL,
+        dev.replica.source(DOMAIN),
+        None,
+        &Layout::under(dev.dir.path()),
+    )
+    .expect("open offline files");
+    let report = offline
         .put(&local, &path_target("Docs/offline.txt"), &mut |_| {})
         .expect("offline put");
     assert_eq!(report.outcome, PutOutcome::Queued);
     assert_eq!(dev.files.pending().expect("pending").len(), 1);
     assert_eq!(world.server.commands(), cmds_before);
 
+    drop(offline);
+    assert!(world.store.last_grant_body().is_none());
     dev.replica.set_online(true);
     let flushed = dev.files.flush().expect("flush");
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].outcome, PutOutcome::Accepted);
     assert!(dev.files.pending().expect("pending after flush").is_empty());
 
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(json!({
+            "target": {"parent_id": world.docs, "name": "offline.txt"},
+            "contentId": expected_cid, "size": body.len(), "mediaType": "text/plain", "partBytes": 0, "parts": []
+        }))
+    );
     dev.replica.pull();
     let listing = dev.files.list(&path_target("Docs")).expect("list");
     assert_eq!(listing.entries.len(), 1);
@@ -453,6 +744,10 @@ fn two_devices_offline_end_with_one_path_and_one_conflict_copy() {
         .put(&file_b, &plan_target, &mut |_| {})
         .expect("B put");
     assert_eq!(put_a.outcome, PutOutcome::Queued);
+    assert_eq!(
+        world.store.last_grant_body().expect("replacement upload")["target"],
+        json!({"entry_id": plan_id})
+    );
     assert_eq!(put_b.outcome, PutOutcome::Queued);
 
     dev_a.replica.set_online(true);

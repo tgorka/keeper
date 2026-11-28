@@ -19,7 +19,7 @@ use keeper_files_api::rows::{
     ApprovalBasis, EntityType, OriginClass, Outcome, ProposalStatus, ReviewKind,
 };
 use keeper_files_api::wire::{Decision, ReviewerRole, Reviewers, RoleReviewers, Verdict};
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{Replica, StoreSlot};
 use keeper_replica::transfer::{announced_store, HttpGrants, StoreTransfer, TransferConfig};
 use keeper_testkit::files::{FilesReplica, FilesServer};
@@ -42,7 +42,7 @@ impl World {
         let store = Arc::new(StandIn::start(DOMAIN));
         let server = FilesServer::new(DOMAIN);
         let store_check = Arc::clone(&store);
-        server.set_objects(move |cid| store_check.object(cid).is_some());
+        server.set_objects(move |cid| store_check.prepare_naming(cid));
         let root = server.create_drive("owner", DRIVE);
         let folder_a = server.mkdir("owner", &root, "A");
         Self {
@@ -87,7 +87,7 @@ fn attach(world: &World, replica: Arc<FilesReplica>, actor: &str, client: &str) 
     let mut config = TransferConfig::contract(dir.path().join("plans"));
     config.threshold = PART_BYTES;
     config.part_bytes = PART_BYTES;
-    let transfer: Arc<dyn FileTransfer> = Arc::new(
+    let transfer: Arc<dyn ScopedFileTransfer> = Arc::new(
         StoreTransfer::new(grants, &world.store.base_url(), slot, config).expect("store transfer"),
     );
 
@@ -175,6 +175,14 @@ fn editor_put_create_and_replace_records_direct_human_events_unlisted_by_unrevie
     assert_eq!(replace.outcome, PutOutcome::Accepted);
     assert_eq!(replace.entry_id, create.entry_id);
 
+    assert!(
+        !world
+            .store
+            .grant_requests()
+            .iter()
+            .any(|req| req.ends_with("/complete")),
+        "direct single puts must leave the plan open for the naming command"
+    );
     let events = world.server.events();
     assert_eq!(events.len(), events_before + 2);
     let added = &events[events_before..];
@@ -208,6 +216,60 @@ fn editor_put_create_and_replace_records_direct_human_events_unlisted_by_unrevie
 }
 
 #[test]
+fn an_ambiguous_completion_does_not_submit_or_reupload_a_proposal() {
+    let world = World::new();
+    let tool = tool_device(&world, "propose");
+    world.store.hide_presence();
+    world.store.defer_placement(true);
+    let body = b"new proposal bytes";
+    let change = Change::Put {
+        file: write_local(tool.dir.path(), "p.txt", body),
+        target: path_target("A/p.txt"),
+    };
+    let before = world.server.commands();
+    let attempt = || {
+        let error = tool
+            .files
+            .propose(
+                &change,
+                &Reviewers::Actors(vec!["r".to_owned()]),
+                None,
+                None,
+            )
+            .expect_err("no placement witness");
+        assert!(
+            matches!(error, FilesError::Replica(keeper_ports::ReplicaError::Remote { code, retryable: true, .. }) if code == "files.placement_pending")
+        );
+        assert_eq!(world.server.commands(), before);
+    };
+    attempt();
+    let plan_id = world
+        .store
+        .grant_requests()
+        .iter()
+        .find_map(|req| {
+            req.strip_suffix("/complete")?
+                .rsplit('/')
+                .next()
+                .map(str::to_owned)
+        })
+        .expect("completed single PUT");
+    world.store.complete_plan_on_store(&plan_id);
+    attempt(); // 404 is not a witness; the rooted grant doesn't attest presence either.
+    attempt();
+    assert_eq!(
+        world
+            .store
+            .grant_requests()
+            .iter()
+            .filter(|req| req.ends_with("/upload-grant"))
+            .count(),
+        2
+    );
+    assert_eq!(world.store.store_bytes_received(), body.len() as u64);
+}
+
+#[test]
 fn tool_propose_put_open_approve_and_reject_lifecycle() {
     let world = World::new();
     let tool = tool_device(&world, "propose");
@@ -230,6 +292,10 @@ fn tool_propose_put_open_approve_and_reject_lifecycle() {
         )
         .expect("tool propose put");
 
+    assert_eq!(
+        world.store.last_grant_body().expect("proposal upload")["target"],
+        serde_json::json!({"parent_id": world.folder_a, "name": "p.txt"})
+    );
     let server_proposals = world.server.proposals();
     assert_eq!(server_proposals.len(), 1);
     assert_eq!(server_proposals[0].proposal_id, proposed.detail.proposal_id);
@@ -278,6 +344,14 @@ fn tool_propose_put_open_approve_and_reject_lifecycle() {
     assert_eq!(opened.len(), 1);
     assert_eq!(fs::read(&opened[0].file).expect("read opened"), put_bytes);
 
+    assert_eq!(
+        world.store.last_grant_body(),
+        Some(serde_json::json!({
+            "proposal_id": proposed.detail.proposal_id,
+            "proposal_revision": proposed.detail.proposal_revision,
+            "content_id": opened[0].content_id,
+        }))
+    );
     let approved = reviewer
         .files
         .decide(vec![Decision {

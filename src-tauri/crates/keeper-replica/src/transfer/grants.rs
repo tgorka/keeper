@@ -4,7 +4,8 @@ use std::fmt;
 use std::time::Duration;
 
 use keeper_ports::transfer::{
-    Completion, HeldPart, PartUrl, SignedUrl, StoreOrigin, TransferGrants, UploadAsk, UploadGrant,
+    Completion, DownloadReference, HeldPart, PartUrl, SignedUrl, StoreOrigin, TransferGrants,
+    UploadAsk, UploadGrant,
 };
 use keeper_ports::{ReplicaError, CREDENTIAL_REFUSED};
 use serde::{Deserialize, Serialize};
@@ -70,22 +71,8 @@ impl fmt::Debug for HttpGrants {
 }
 
 impl TransferGrants for HttpGrants {
-    fn grant_upload(&self, ask: &UploadAsk) -> Result<UploadGrant, ReplicaError> {
-        let body = UploadGrantRequest {
-            content_id: &ask.content_id,
-            size: ask.size,
-            media_type: ask.media_type.as_deref(),
-            part_bytes: ask.part_bytes,
-            parts: ask
-                .parts
-                .iter()
-                .map(|part| PartDigestWire {
-                    number: part.number,
-                    sha256: &part.sha256,
-                })
-                .collect(),
-        };
-        let value = self.post_json("/files/upload-grant", &body)?;
+    fn grant_upload(&self, ask: &UploadAsk<'_>) -> Result<UploadGrant, ReplicaError> {
+        let value = self.post_json("/files/upload-grant", ask)?;
         parse_upload_grant(value)
     }
 
@@ -108,9 +95,24 @@ impl TransferGrants for HttpGrants {
         parse_completion(value)
     }
 
-    fn grant_download(&self, content_id: &str) -> Result<SignedUrl, ReplicaError> {
-        let body = DownloadGrantRequest { content_id };
-        let value = self.post_json("/files/download-grant", &body)?;
+    fn grant_download(
+        &self,
+        content_id: &str,
+        reference: Option<DownloadReference<'_>>,
+    ) -> Result<SignedUrl, ReplicaError> {
+        let value = match reference {
+            Some(reference) => self.post_json(
+                "/files/download-grant",
+                &FileDownloadRequest {
+                    content_id,
+                    reference,
+                },
+            )?,
+            None => self.post_json(
+                "/files/download-grant",
+                &DownloadGrantRequest { content_id },
+            )?,
+        };
         parse_signed_url(value)
     }
 }
@@ -154,7 +156,7 @@ impl fmt::Debug for BlobRouteGrants {
 }
 
 impl TransferGrants for BlobRouteGrants {
-    fn grant_upload(&self, _ask: &UploadAsk) -> Result<UploadGrant, ReplicaError> {
+    fn grant_upload(&self, _ask: &UploadAsk<'_>) -> Result<UploadGrant, ReplicaError> {
         Err(ReplicaError::Client(
             "model blobs are only downloaded".to_owned(),
         ))
@@ -178,7 +180,16 @@ impl TransferGrants for BlobRouteGrants {
         ))
     }
 
-    fn grant_download(&self, content_id: &str) -> Result<SignedUrl, ReplicaError> {
+    fn grant_download(
+        &self,
+        content_id: &str,
+        reference: Option<DownloadReference<'_>>,
+    ) -> Result<SignedUrl, ReplicaError> {
+        if reference.is_some() {
+            return Err(ReplicaError::Client(
+                "file references require a files grant".to_owned(),
+            ));
+        }
         validate_blob_id(content_id)?;
         let url = format!("{}/blobs/{content_id}", self.base);
         let response = self
@@ -322,29 +333,19 @@ fn parse_error_body(text: &str) -> Option<ErrorBody> {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UploadGrantRequest<'a> {
-    content_id: &'a str,
-    size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    media_type: Option<&'a str>,
-    part_bytes: u64,
-    parts: Vec<PartDigestWire<'a>>,
-}
-
-#[derive(Serialize)]
-struct PartDigestWire<'a> {
-    number: u32,
-    sha256: &'a str,
-}
-
-#[derive(Serialize)]
 struct PartUrlsRequest<'a> {
     numbers: &'a [u32],
 }
 
 #[derive(Serialize)]
 struct EmptyBody {}
+
+#[derive(Serialize)]
+struct FileDownloadRequest<'a> {
+    content_id: &'a str,
+    #[serde(flatten)]
+    reference: DownloadReference<'a>,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -407,6 +408,22 @@ fn parse_upload_grant(value: Value) -> Result<UploadGrant, ReplicaError> {
     if value.get("present").and_then(Value::as_bool) == Some(true) {
         return Ok(UploadGrant::Present);
     }
+    if value.get("url").is_some() && value.get("parts").is_none() {
+        let plan_id = value
+            .get("planId")
+            .map(|id| {
+                let id = id
+                    .as_str()
+                    .ok_or_else(|| ReplicaError::Client("invalid upload plan id".to_owned()))?;
+                validate_plan_id(id)?;
+                Ok::<_, ReplicaError>(id.to_owned())
+            })
+            .transpose()?;
+        return Ok(UploadGrant::Single {
+            signed: parse_signed_url(value)?,
+            plan_id,
+        });
+    }
     if value.get("planId").is_some() {
         let wire: PartsGrantWire = serde_json::from_value(value)
             .map_err(|err| ReplicaError::Client(format!("invalid parts upload grant: {err}")))?;
@@ -416,9 +433,6 @@ fn parse_upload_grant(value: Value) -> Result<UploadGrant, ReplicaError> {
             plan_id: wire.plan_id,
             urls,
         });
-    }
-    if value.get("url").is_some() {
-        return parse_signed_url(value).map(UploadGrant::Single);
     }
     Err(ReplicaError::Client(
         "unrecognized upload grant response".to_owned(),
@@ -538,10 +552,13 @@ mod tests {
         .expect("single grant should parse");
         assert_eq!(
             grant,
-            UploadGrant::Single(SignedUrl {
-                url: "https://store.example/files/db/sha256/abc?sig=1".to_owned(),
-                expires_at_ms: 1_700_000_000_000,
-            })
+            UploadGrant::Single {
+                plan_id: None,
+                signed: SignedUrl {
+                    url: "https://store.example/files/db/sha256/abc?sig=1".to_owned(),
+                    expires_at_ms: 1_700_000_000_000,
+                }
+            }
         );
     }
 

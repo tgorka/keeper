@@ -83,11 +83,14 @@ struct State {
     blobs: BTreeMap<String, Arc<Vec<u8>>>,
     refuse_blobs: bool,
     plans: BTreeMap<String, Plan>,
+    defer_placement: bool,
+    hide_presence: bool,
     mint_seq: u64,
     expired_up_to: u64,
     plan_seq: u64,
     foreign: bool,
     grant_requests: Vec<String>,
+    last_grant_body: Vec<u8>,
     parts_accepted: Vec<u32>,
     cut_next: Option<u64>,
     silence_next: Option<(u64, Duration)>,
@@ -99,6 +102,7 @@ struct State {
 struct Plan {
     content_id: String,
     size: u64,
+    staged_single: bool,
     declared: BTreeMap<u32, DeclaredPart>,
     held: BTreeMap<u32, Vec<u8>>,
 }
@@ -150,11 +154,14 @@ impl StandIn {
                 blobs: BTreeMap::new(),
                 refuse_blobs: false,
                 plans: BTreeMap::new(),
+                defer_placement: false,
+                hide_presence: false,
                 mint_seq: 0,
                 expired_up_to: 0,
                 plan_seq: 0,
                 foreign: false,
                 grant_requests: Vec::new(),
+                last_grant_body: Vec::new(),
                 parts_accepted: Vec::new(),
                 cut_next: None,
                 silence_next: None,
@@ -351,6 +358,55 @@ impl StandIn {
             .expect("state lock")
             .grant_requests
             .clone()
+    }
+
+    /// The last authenticated byte-grant request, excluding plan and store requests.
+    pub fn last_grant_body(&self) -> Option<Value> {
+        serde_json::from_slice(
+            &self
+                .shared
+                .state
+                .lock()
+                .expect("state lock")
+                .last_grant_body,
+        )
+        .ok()
+    }
+
+    /// Hold completed multipart uploads in verification until the test places them.
+    pub fn defer_placement(&self, on: bool) {
+        self.shared
+            .state
+            .lock()
+            .expect("state lock")
+            .defer_placement = on;
+    }
+
+    /// Rooted callers receive a fresh staged grant even when the content is held.
+    pub fn hide_presence(&self) {
+        self.shared.state.lock().expect("state lock").hide_presence = true;
+    }
+
+    /// The naming command reads back a staged single PUT before evaluating the change.
+    pub fn prepare_naming(&self, id: &str) -> bool {
+        let mut state = self.shared.state.lock().expect("state lock");
+        if state.objects.contains_key(id) {
+            return true;
+        }
+        let staged = state.plans.iter().find_map(|(key, p)| {
+            if !p.staged_single || p.content_id != id {
+                return None;
+            }
+            assemble_plan(p)
+                .ok()
+                .map(|(id, bytes)| (key.clone(), id, bytes))
+        });
+        if let Some((key, id, bytes)) = staged {
+            state.objects.insert(id, Arc::new(bytes));
+            state.plans.remove(&key);
+            return true;
+        }
+        false
     }
 
     /// Assemble and place a plan's held parts directly on the store, if complete and valid.
@@ -643,6 +699,14 @@ fn handle_server_conn(mut stream: TcpStream, shared: &Shared) {
         return;
     };
 
+    if req.method == "POST" && matches!(subpath, "/files/upload-grant" | "/files/download-grant") {
+        shared
+            .state
+            .lock()
+            .expect("state lock")
+            .last_grant_body
+            .clone_from(&body);
+    }
     if req.method == "POST" && subpath == "/files/upload-grant" {
         handle_upload_grant(&mut stream, shared, &body);
         return;
@@ -720,7 +784,7 @@ fn handle_upload_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
         .unwrap_or_default();
 
     let mut state = shared.state.lock().expect("state lock");
-    if state.objects.contains_key(content_id) {
+    if !state.hide_presence && state.objects.contains_key(content_id) {
         write_json(stream, 200, &json!({"present": true}));
         return;
     }
@@ -729,6 +793,35 @@ fn handle_upload_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
 
     if parts.is_empty() {
         let sig = state.mint_sig();
+        if val.get("target").is_some() {
+            let plan_id = state.next_plan_id();
+            let Ok(digest) = hex::decode(hex_digest) else {
+                write_json(
+                    stream,
+                    400,
+                    &json!({"code":"files.invalid_request", "message":"invalid digest"}),
+                );
+                return;
+            };
+            let sha256_b64 = BASE64.encode(digest);
+            state.plans.insert(
+                plan_id.clone(),
+                Plan {
+                    content_id: content_id.to_owned(),
+                    size,
+                    staged_single: true,
+                    declared: BTreeMap::from([(1, DeclaredPart { sha256_b64, size })]),
+                    held: BTreeMap::new(),
+                },
+            );
+            let url = format!("{origin}/up/{plan_id}/1?sig={sig}");
+            write_json(
+                stream,
+                200,
+                &json!({"url": url, "expiresAtMs": expires_at_ms, "planId": plan_id}),
+            );
+            return;
+        }
         let url = format!("{origin}/put/{hex_digest}?sig={sig}");
         write_json(
             stream,
@@ -790,6 +883,7 @@ fn handle_upload_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
         Plan {
             content_id: content_id.to_owned(),
             size,
+            staged_single: false,
             declared,
             held: BTreeMap::new(),
         },
@@ -897,6 +991,10 @@ fn handle_complete_plan(stream: &mut TcpStream, shared: &Shared, plan_id: &str) 
         );
         return;
     };
+    if state.defer_placement {
+        write_json(stream, 200, &json!({"status":"verifying"}));
+        return;
+    }
     match assemble_plan(plan) {
         Ok((content_id, bytes)) => {
             state.objects.insert(content_id, Arc::new(bytes));
@@ -929,7 +1027,11 @@ fn handle_download_grant(stream: &mut TcpStream, shared: &Shared, body: &[u8]) {
         );
         return;
     };
-    let Some(content_id) = val.get("contentId").and_then(Value::as_str) else {
+    let Some(content_id) = val
+        .get("content_id")
+        .or_else(|| val.get("contentId"))
+        .and_then(Value::as_str)
+    else {
         write_json(
             stream,
             400,

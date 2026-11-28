@@ -8,6 +8,20 @@
 //! and a put uploads its bytes, then commits `files.put`; offline it waits
 //! in a device-local queue and is committed on the next flush.
 //!
+//! A byte grant names the operation's location, not just its digest. Creates
+//! name the parent and leaf; replacements name the existing entry. Queue replay
+//! uses the stored operation. Cold reads name the entry or the proposal revision
+//! together with the content id, including when a signed URL is renewed.
+//! A direct put leaves its single staging plan open for verification by the
+//! naming command. A proposal or multipart upload needs confirmed placement:
+//! `verifying` retains the plan and never submits the command.
+//! A queued source keeps its multipart plan in a request-specific handoff until
+//! the queue durably records placement. If that write fails, a later flush
+//! recovers the same plan before opening the source, even after deletion.
+//! If the server
+//! hides a completed plan and does not attest presence to this caller, the
+//! client reports `files.placement_pending` rather than treating 404 as success.
+//!
 //! - [`tree`]: the listing view model, drives, folders, paths.
 //! - [`cache`]: the content-addressed cache and its digest check.
 //! - [`queue`]: the puts waiting for their commit.
@@ -34,7 +48,7 @@ use std::time::Duration;
 
 use keeper_files_api::refusal::Code;
 use keeper_files_api::DomainRef;
-use keeper_ports::transfer::FileTransfer;
+use keeper_ports::transfer::ScopedFileTransfer;
 use keeper_ports::{ReplicaError, Source, Unit};
 use serde_json::Value;
 
@@ -162,7 +176,7 @@ impl Layout {
 pub struct Files {
     at: DomainRef,
     source: Source,
-    transfer: Option<Arc<dyn FileTransfer>>,
+    transfer: Option<Arc<dyn ScopedFileTransfer>>,
     cache: Cache,
     queue: Queue,
     receipt_wait: Duration,
@@ -175,7 +189,7 @@ impl Files {
     pub fn new(
         server: &str,
         source: Source,
-        transfer: Option<Arc<dyn FileTransfer>>,
+        transfer: Option<Arc<dyn ScopedFileTransfer>>,
         layout: &Layout,
     ) -> Result<Self, FilesError> {
         Ok(Self {
