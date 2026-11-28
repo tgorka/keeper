@@ -8,14 +8,18 @@
 //! - `KEEPER_HQ_LIVE_ACTOR`: actor identifier.
 //! - `KEEPER_HQ_LIVE_CLIENT`: base client identifier.
 //! - `KEEPER_FILES_LIVE_DRIVE`: drive name the actor may write.
+//! - Run only against a disposable, freshly provisioned domain (one test thread).
+//!   `files_live/scenarios.rs` documents the extra principals and folders for those cases.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
+
+#[path = "files_live/scenarios.rs"]
+mod scenarios;
 
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -30,32 +34,40 @@ struct Live {
     actor: String,
     client: String,
     drive: String,
+    run: String,
 }
 
-fn read_env(key: &str) -> Option<String> {
-    match std::env::var(key) {
-        Ok(val) if !val.trim().is_empty() => Some(val),
-        _ => {
-            eprintln!("skipping files_live: {key} is unset or empty");
-            None
-        }
-    }
+fn required(key: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| panic!("files_live requires {key}"))
 }
 
-fn live() -> Option<Live> {
-    let url = read_env("KEEPER_HQ_LIVE_URL")?;
-    let _token = read_env("KEEPER_HQ_LIVE_TOKEN_1")?;
-    let database = read_env("KEEPER_HQ_LIVE_DATABASE")?;
-    let actor = read_env("KEEPER_HQ_LIVE_ACTOR")?;
-    let client = read_env("KEEPER_HQ_LIVE_CLIENT")?;
-    let drive = read_env("KEEPER_FILES_LIVE_DRIVE")?;
-    Some(Live {
-        url,
+fn live() -> Live {
+    let run = required("KEEPER_FILES_LIVE_RUN");
+    assert!(
+        run.len() == 32
+            && run
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "expected fresh 32-character lowercase hex run id"
+    );
+    let database = required("KEEPER_HQ_LIVE_DATABASE");
+    assert!(
+        database == format!("fileslive{run}"),
+        "not this run's scratch database"
+    );
+    let cfg = Live {
+        run,
+        url: required("KEEPER_HQ_LIVE_URL"),
         database,
-        actor,
-        client,
-        drive,
-    })
+        actor: required("KEEPER_HQ_LIVE_ACTOR"),
+        client: required("KEEPER_HQ_LIVE_CLIENT"),
+        drive: required("KEEPER_FILES_LIVE_DRIVE"),
+    };
+    scenarios::verify_fixture(&cfg);
+    cfg
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -99,75 +111,28 @@ fn hash_file(path: &Path) -> (u64, String) {
     (total, format!("sha256:{}", hex_digest(&hasher.finalize())))
 }
 
-fn run_files_cli(cfg: &Live, state_dir: &Path, client: &str, verb_args: &[&str]) -> Value {
-    let out = Command::new(BIN)
-        .args(["files", "--json", "--state"])
-        .arg(state_dir)
-        .args([
-            "--url",
-            &cfg.url,
-            "--database",
-            &cfg.database,
-            "--actor",
-            &cfg.actor,
-            "--client",
-            client,
-            "--token-env",
-            "KEEPER_HQ_LIVE_TOKEN_1",
-        ])
-        .args(verb_args)
-        .output()
-        .expect("run keeper-cli files");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "keeper-cli files {verb_args:?} exited with {:?}\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    serde_json::from_slice(&out.stdout).expect("parse keeper-cli files json")
-}
-
-fn check_ok_at(val: &Value, url: &str, db: &str) -> Result<(), String> {
-    if val.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(format!("expected ok == true, got {val}"));
+fn check_ok_at(val: &Value, url: &str, db: &str) -> Result<(), &'static str> {
+    if val["ok"].as_bool() != Some(true) {
+        return Err("expected ok");
     }
-    let expected_server = url.trim_end_matches('/');
-    let server = val
-        .get("at")
-        .and_then(|at| at.get("server"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing at.server in {val}"))?;
-    if server != expected_server {
-        return Err(format!(
-            "at.server mismatch: expected {expected_server:?}, got {server:?}"
-        ));
+    if val["at"]["server"].as_str() != Some(url.trim_end_matches('/')) {
+        return Err("wrong server");
     }
-    let domain = val
-        .get("at")
-        .and_then(|at| at.get("domain"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing at.domain in {val}"))?;
-    if domain != db {
-        return Err(format!(
-            "at.domain mismatch: expected {db:?}, got {domain:?}"
-        ));
+    if val["at"]["domain"].as_str() != Some(db) {
+        return Err("wrong domain");
     }
     Ok(())
 }
 
-fn check_drives(val: &Value, url: &str, db: &str, drive: &str) -> Result<(), String> {
+fn check_drives(val: &Value, url: &str, db: &str, drive: &str) -> Result<(), &'static str> {
     check_ok_at(val, url, db)?;
-    let drives = val
-        .get("drives")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing drives array in {val}"))?;
-    let found = drives
+    if !val["drives"]
+        .as_array()
+        .ok_or("missing drives")?
         .iter()
-        .any(|item| item.get("name").and_then(Value::as_str) == Some(drive));
-    if !found {
-        return Err(format!("drive {drive:?} not listed in {drives:?}"));
+        .any(|d| d["name"].as_str() == Some(drive))
+    {
+        return Err("drive not listed");
     }
     Ok(())
 }
@@ -178,39 +143,18 @@ fn check_put(
     db: &str,
     expected_cid: &str,
     expected_size: u64,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     check_ok_at(val, url, db)?;
-    let outcome = val
-        .get("outcome")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing outcome in {val}"))?;
-    if outcome != "accepted" {
-        return Err(format!("expected outcome \"accepted\", got {outcome:?}"));
+    if val["outcome"].as_str() != Some("accepted") {
+        return Err("put not accepted");
     }
-    let cid = val
-        .get("content_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing content_id in {val}"))?;
-    if cid != expected_cid {
-        return Err(format!(
-            "content_id mismatch: expected {expected_cid:?}, got {cid:?}"
-        ));
+    if val["content_id"].as_str() != Some(expected_cid)
+        || val["size"].as_u64() != Some(expected_size)
+    {
+        return Err("wrong put content");
     }
-    let size = val
-        .get("size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("missing size in {val}"))?;
-    if size != expected_size {
-        return Err(format!(
-            "size mismatch: expected {expected_size}, got {size}"
-        ));
-    }
-    let entry_id = val
-        .get("entry_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing entry_id in {val}"))?;
-    if entry_id.is_empty() {
-        return Err("entry_id must not be empty".to_owned());
+    if val["entry_id"].as_str().is_none_or(str::is_empty) {
+        return Err("missing entry id");
     }
     Ok(())
 }
@@ -222,33 +166,18 @@ fn check_listed(
     name: &str,
     expected_cid: &str,
     expected_size: u64,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     check_ok_at(val, url, db)?;
-    let entries = val
-        .get("entries")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing entries array in {val}"))?;
-    let entry = entries
+    let entry = val["entries"]
+        .as_array()
+        .ok_or("missing entries")?
         .iter()
-        .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
-        .ok_or_else(|| format!("entry {name:?} not found in {entries:?}"))?;
-    let cid = entry
-        .get("content_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing content_id on entry {entry}"))?;
-    if cid != expected_cid {
-        return Err(format!(
-            "listed content_id mismatch: expected {expected_cid:?}, got {cid:?}"
-        ));
-    }
-    let size = entry
-        .get("size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("missing size on entry {entry}"))?;
-    if size != expected_size {
-        return Err(format!(
-            "listed size mismatch: expected {expected_size}, got {size}"
-        ));
+        .find(|e| e["name"].as_str() == Some(name))
+        .ok_or("entry not listed")?;
+    if entry["content_id"].as_str() != Some(expected_cid)
+        || entry["size"].as_u64() != Some(expected_size)
+    {
+        return Err("wrong listed content");
     }
     Ok(())
 }
@@ -259,19 +188,10 @@ fn check_first_get(
     db: &str,
     expected_cid: &str,
     actual_cid: &str,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     check_ok_at(val, url, db)?;
-    let fetched = val
-        .get("fetched")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("missing fetched in {val}"))?;
-    if !fetched {
-        return Err(format!("expected fetched == true on cold get, got {val}"));
-    }
-    if actual_cid != expected_cid {
-        return Err(format!(
-            "downloaded file sha256 mismatch: expected {expected_cid:?}, got {actual_cid:?}"
-        ));
+    if val["fetched"].as_bool() != Some(true) || actual_cid != expected_cid {
+        return Err("cold get did not fetch expected bytes");
     }
     Ok(())
 }
@@ -282,58 +202,33 @@ fn check_cached_get(
     db: &str,
     expected_cid: &str,
     actual_cid: &str,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     check_ok_at(val, url, db)?;
-    let fetched = val
-        .get("fetched")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("missing fetched in {val}"))?;
-    if fetched {
-        return Err(format!(
-            "expected fetched == false on cached get, got {val}"
-        ));
-    }
-    let grants = val
-        .get("grants")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("missing grants in {val}"))?;
-    if grants != 0 {
-        return Err(format!("expected grants == 0 on cached get, got {grants}"));
-    }
-    let bytes_fetched = val
-        .get("bytes_fetched")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("missing bytes_fetched in {val}"))?;
-    if bytes_fetched != 0 {
-        return Err(format!(
-            "expected bytes_fetched == 0 on cached get, got {bytes_fetched}"
-        ));
-    }
-    if actual_cid != expected_cid {
-        return Err(format!(
-            "cached file sha256 mismatch: expected {expected_cid:?}, got {actual_cid:?}"
-        ));
+    if val["fetched"].as_bool() != Some(false)
+        || val["grants"].as_u64() != Some(0)
+        || val["bytes_fetched"].as_u64() != Some(0)
+        || actual_cid != expected_cid
+    {
+        return Err("cached get did not use expected local bytes");
     }
     Ok(())
 }
 
-fn must_ok(step: &str, result: Result<(), String>) {
+fn must_ok(step: &str, result: Result<(), &'static str>) {
     if let Err(err) = result {
         panic!("{step} failed: {err}");
     }
 }
 
 #[test]
-#[ignore = "needs a real keeper-hq files server (story 116.4, run on delectra at the epic end)"]
+#[ignore = "requires a dedicated disposable files server"]
 fn files_live_drives_put_ls_get() {
-    let Some(cfg) = live() else {
-        return;
-    };
+    let cfg = live();
     let dir = tempfile::tempdir().expect("tempdir");
-    let state_1 = dir.path().join("state-1");
-    let state_2 = dir.path().join("state-2");
+    let editor = scenarios::Device::new(&cfg, "EDITOR");
+    let peer = scenarios::Device::new(&cfg, "PEER");
 
-    let drives_json = run_files_cli(&cfg, &state_1, &cfg.client, &["drives"]);
+    let drives_json = editor.ok(&["drives"]);
     must_ok(
         "drives",
         check_drives(&drives_json, &cfg.url, &cfg.database, &cfg.drive),
@@ -348,12 +243,7 @@ fn files_live_drives_put_ls_get() {
     let (expected_size, expected_cid) = write_live_fixture(&src, nanos);
     let src_str = src.to_str().expect("utf-8 src path");
 
-    let put_json = run_files_cli(
-        &cfg,
-        &state_1,
-        &cfg.client,
-        &["put", "--file", src_str, "--drive", &cfg.drive, &name],
-    );
+    let put_json = editor.ok(&["put", "--file", src_str, "--drive", &cfg.drive, &name]);
     must_ok(
         "put",
         check_put(
@@ -365,7 +255,7 @@ fn files_live_drives_put_ls_get() {
         ),
     );
 
-    let ls_json = run_files_cli(&cfg, &state_1, &cfg.client, &["ls", "--drive", &cfg.drive]);
+    let ls_json = editor.ok(&["ls", "--drive", &cfg.drive]);
     must_ok(
         "ls",
         check_listed(
@@ -378,17 +268,11 @@ fn files_live_drives_put_ls_get() {
         ),
     );
 
-    let get_client = format!("{}.get", cfg.client);
     let out_1 = dir.path().join("out-1.bin");
     let out_1_str = out_1.to_str().expect("utf-8 out-1 path");
-    let first_get_json = run_files_cli(
-        &cfg,
-        &state_2,
-        &get_client,
-        &["get", "--drive", &cfg.drive, &name, "--out", out_1_str],
-    );
+    let first_get_json = peer.ok(&["get", "--drive", &cfg.drive, &name, "--out", out_1_str]);
     let (first_size, first_cid) = hash_file(&out_1);
-    assert_eq!(first_size, expected_size, "first get byte count mismatch");
+    assert!(first_size == expected_size, "first get byte count mismatch");
     must_ok(
         "first get",
         check_first_get(
@@ -402,14 +286,12 @@ fn files_live_drives_put_ls_get() {
 
     let out_2 = dir.path().join("out-2.bin");
     let out_2_str = out_2.to_str().expect("utf-8 out-2 path");
-    let cached_get_json = run_files_cli(
-        &cfg,
-        &state_2,
-        &get_client,
-        &["get", "--drive", &cfg.drive, &name, "--out", out_2_str],
-    );
+    let cached_get_json = peer.ok(&["get", "--drive", &cfg.drive, &name, "--out", out_2_str]);
     let (cached_size, cached_cid) = hash_file(&out_2);
-    assert_eq!(cached_size, expected_size, "cached get byte count mismatch");
+    assert!(
+        cached_size == expected_size,
+        "cached get byte count mismatch"
+    );
     must_ok(
         "cached get",
         check_cached_get(
